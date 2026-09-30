@@ -44,6 +44,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Test DEB packaging architecture checks
+        run: python3 rust/tests/test_build_deb.py
+
       - name: Ensure clippy
         run: rustup component add clippy
 

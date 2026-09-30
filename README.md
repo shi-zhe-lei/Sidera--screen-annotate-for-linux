@@ -81,6 +81,8 @@ sudo dpkg -i sidera_2.6-Geo-stable_arm64.deb
 
 > 底层脚本（上面的一键脚本会调用，也可单独使用）：`rust/build_container.sh <arch>`、`rust/build_deb.sh <arch>`、`cpp/build_container.sh <arch>`、`cpp/build_deb_amd64.sh` / `cpp/build_deb_aarch64.sh`。
 
+Rust 打包需要 `binutils` 提供的 `readelf`。脚本会校验二进制的实际架构；`target/release` 仅在与目标架构匹配时可用，避免把 amd64 程序误装入 arm64 包。在仓库根目录运行 `python3 rust/tests/test_build_deb.py` 可验证打包保护，需要 Linux、Python 3、binutils 和 dpkg-deb，无需编译 Rust 或安装测试包。
+
 #### Rust 版
 
 Rust 版运行时只依赖 `libc6` 与 `libgcc-s1`，无需 Qt、无需 `libX11`（X11/Wayland 协议均由纯 Rust 库直连）。
@@ -221,6 +223,8 @@ cpp/src/
 ---
 
 ## 🤝 贡献指南
+
+项目现状、待解决问题、重构顺序与测试环境请参阅 [完整项目分析](docs/PROJECT_ANALYSIS.md)、[问题清单](docs/ISSUES.md)、[重构计划](docs/REFACTOR_PLAN.md) 和 [测试环境](docs/TEST_ENVIRONMENT.md)（评审基线：2026-09-30，`custom` 分支）。
 
 欢迎提交 Issue 和 Pull Request！
 

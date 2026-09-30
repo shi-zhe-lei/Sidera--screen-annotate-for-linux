@@ -4,9 +4,9 @@
 #   用法: ./build_deb.sh [amd64|aarch64]
 #   产物: <repo>/sidera_3.0-Electro-testing_<amd64|arm64>.deb
 #
-# 依赖：dpkg-deb（Debian/Ubuntu 自带）
+# 依赖：dpkg-deb、readelf（binutils）
 # 前置：先用 ./build_container.sh <arch> 编译出二进制
-#       （或普通 cargo build --release，用 target/release 兜底）
+#       （或普通 cargo build --release，用架构匹配的 target/release 兜底）
 #
 # 与 C++ 版打包脚本的区别：
 #   - 二进制来自 Rust 构建（target/container-<arch>/release/sidera）
@@ -19,8 +19,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"      # .../cpp/rust
 REPO="$(cd "$HERE/.." && pwd)"             # .../cpp
 
 case "$ARG" in
-  amd64)        SRC_ARCH=amd64;  DEB_ARCH=amd64;;
-  aarch64|arm64) SRC_ARCH=aarch64; DEB_ARCH=arm64;;
+  amd64)        SRC_ARCH=amd64;  DEB_ARCH=amd64; ELF_MACHINE='Advanced Micro Devices X86-64';;
+  aarch64|arm64) SRC_ARCH=aarch64; DEB_ARCH=arm64; ELF_MACHINE='AArch64';;
   *) echo "用法: $0 [amd64|aarch64]"; exit 1;;
 esac
 
@@ -34,6 +34,34 @@ BIN="$HERE/target/container-$SRC_ARCH/release/sidera"
 [ -f "$BIN" ] || BIN="$HERE/target/release/sidera"
 if [ ! -f "$BIN" ]; then
   echo "错误: 找不到 $SRC_ARCH 二进制，请先运行: ./build_container.sh $ARG"
+  exit 1
+fi
+
+# 校验实际 ELF，不依赖文件名或宿主架构；失败时保留已有包和暂存目录。
+if ! command -v readelf >/dev/null 2>&1; then
+  echo "错误: 缺少 readelf，请安装 binutils 后再打包。" >&2
+  exit 1
+fi
+if ! ELF_HEADER="$(LC_ALL=C readelf -h "$BIN" 2>/dev/null)"; then
+  echo "错误: 无法读取 ELF 头，不能打包: $BIN" >&2
+  exit 1
+fi
+if ! LC_ALL=C awk -v expected="$ELF_MACHINE" '
+  $1 == "Class:" { elf_class = $2 }
+  $1 == "Data:" { little_endian = /little endian/ }
+  $1 == "Type:" { elf_type = $2 }
+  $1 == "Machine:" {
+    sub(/^[[:space:]]*Machine:[[:space:]]*/, "")
+    sub(/[[:space:]]*$/, "")
+    machine = $0
+  }
+  END {
+    exit !(elf_class == "ELF64" && little_endian && machine == expected &&
+           (elf_type == "EXEC" || elf_type == "DYN"))
+  }
+' <<< "$ELF_HEADER"; then
+  echo "错误: $BIN 与目标 $DEB_ARCH 不匹配；需要 64 位小端 $ELF_MACHINE 可执行文件。" >&2
+  printf '%s\n' "$ELF_HEADER" >&2
   exit 1
 fi
 
