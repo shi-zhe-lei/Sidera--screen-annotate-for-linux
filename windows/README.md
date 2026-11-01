@@ -12,7 +12,8 @@ Windows 10 x64 起步。Windows 平台代码、构建脚本、验收 VM 和打�
 - [x] 鼠标、WM_POINTER 触摸、热键、截图、单实例、系统主题、字体
 - [x] 已通过 Wine 验证 Windows 字体与共享 UI 渲染
 - [x] 托盘菜单（设置/切换/白板/显示/退出）与注册表自启动
-- [ ] 进程扫描、WPS Windows 注册
+- [x] WPS Windows 加载项注册（原生 XML 合并）
+- [ ] Windows 进程扫描
 - [ ] 多显示器 / 混合 DPI、真实触摸设备验收
 - [ ] Win10 VM / 真机验收与安装包签名
 
@@ -87,6 +88,14 @@ target/x86_64-pc-windows-gnu/release/sidera.exe
 - 托盘图标使用 `Shell_NotifyIconW`，左键显示覆盖层，右键菜单：打开设置、切换批注/光标、白板、显示 Sidera、退出；双击打开设置。
 - 自启动写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 的 `Sidera` 值，设置面板的开关直接生效。
 - 调试自启动：`SIDERA_AUTOSTART_TEST=1 wine sidera.exe`，结果写入 `%TEMP%\sidera-win-startup.log`。
+
+## WPS 加载项注册
+
+- 登记位置：`%APPDATA%\kingsoft\wps\jsaddons\publish.xml`（WPSJS 在 Windows 上的标准路径）。
+- Sidera 启动时会检查加载项指纹；首次运行或升级后自动合并 `sidera-bridge` 条目。
+- 设置里的“重新登记 WPS 加载项”会再次合并；关闭 WPS 后重新打开演示生效。
+- 合并逻辑在 Rust/quick-xml 中完成，会保留其他加载项，清理旧名称和旧 URL 条目。
+- 加载项本体随 ZIP 放在 `wps-addin/`，HTTP 桥从 `127.0.0.1:16666` 提供 manifest/ribbon/JS。
 
 ## Windows 覆盖层结构
 

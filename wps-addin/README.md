@@ -62,6 +62,17 @@ WebSocket 模式状态通过同一条连接上报；SSE 回退状态收到成功
 
 HTTP 请求头最多 8 KiB、请求行最多 4 KiB，有读取时限、Host/Origin 和方法校验；只监听回环地址。**sid/seq 和回环地址不是身份认证**，多加载项竞争、完整放映会话及命令 ID/执行确认仍见 [S12](../docs/ISSUES.md#s12--http-会话与资源边界不足)。不要转发端口到外网。
 
+## Windows 版登记
+
+Windows 版由 Sidera 自己完成登记，不依赖 Python、bash 或 PowerShell：
+
+- 登记位置：`%APPDATA%\kingsoft\wps\jsaddons\publish.xml`
+- Sidera 启动时（WPS 联动开启）自动合并 `sidera-bridge` 条目；首次运行或加载项内容升级后写入。
+- 设置中的“重新登记 WPS 加载项”会再次合并；关闭 WPS 后重新打开演示生效。
+- 合并使用 Rust + quick-xml，保留其他加载项，清理旧名称 `screen-annotate-bridge` 和旧 URL 条目，修改前备份。
+- ZIP 包内的 `wps-addin/` 提供 manifest、ribbon、JS 和 `publish.xml`；HTTP 桥从 `127.0.0.1:16666` 提供静态文件。
+- 如果 WPS 没有加载，请确认所用版本支持 JS 加载项（WPS 2019 及以上），并在 WPS 设置中允许加载项；Windows 版不修改 `oem.ini`。
+
 ## 文件与卸载
 
 加载项文件为 manifest.xml、ribbon.xml、main.js、js/bridge.js 和 index.html；publish.xml 是登记模板。登记位置为 `~/.local/share/Kingsoft/wps/jsaddons/publish.xml`。卸载时先关闭 WPS，只删除 sidera-bridge 条目，保留其他项目。

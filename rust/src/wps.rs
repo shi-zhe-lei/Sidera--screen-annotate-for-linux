@@ -133,14 +133,25 @@ fn addin_dir() -> Option<std::path::PathBuf> {
 }
 
 const ADDIN_SCHEMA: &str = "sidera-wps-addin-registration-v2";
-const ADDIN_FILES: [&str; 7] = [
+#[cfg(unix)]
+const ADDIN_FILES: [&str; 8] = [
     "publish.xml",
     "manifest.xml",
     "main.js",
     "js/bridge.js",
     "ribbon.xml",
+    "index.html",
     "install.sh",
     "cleanup-old.sh",
+];
+#[cfg(windows)]
+const ADDIN_FILES: [&str; 6] = [
+    "publish.xml",
+    "manifest.xml",
+    "main.js",
+    "js/bridge.js",
+    "ribbon.xml",
+    "index.html",
 ];
 
 fn addin_fingerprint(dir: &std::path::Path) -> Option<String> {
@@ -160,8 +171,14 @@ fn registration_state_path() -> Option<std::path::PathBuf> {
     dirs::state_dir().map(|path| path.join("sidera/wps-addin-state"))
 }
 
+#[cfg(unix)]
 fn wps_publish_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|home| home.join(".local/share/Kingsoft/wps/jsaddons/publish.xml"))
+}
+
+#[cfg(windows)]
+fn wps_publish_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|path| path.join("kingsoft/wps/jsaddons/publish.xml"))
 }
 
 fn registration_present() -> bool {
@@ -215,6 +232,7 @@ pub fn ensure_addin_registered_if_needed() {
     }
 }
 
+#[cfg(unix)]
 pub fn register_addin() -> Result<String, String> {
     let dir = addin_dir().ok_or_else(|| "未找到 wps-addin 目录".to_string())?;
     let output = run_script(&dir.join("install.sh"), &["--repair"], Duration::from_secs(5))
@@ -229,6 +247,21 @@ pub fn register_addin() -> Result<String, String> {
     }
 }
 
+#[cfg(windows)]
+pub fn register_addin() -> Result<String, String> {
+    let dir = addin_dir().ok_or_else(|| "未找到 wps-addin 目录".to_string())?;
+    let template = std::fs::read(dir.join("publish.xml"))
+        .map_err(|error| format!("读取 WPS 登记模板失败：{error}"))?;
+    let expected = publish_entry_attributes(&template)?;
+    let path = wps_publish_path().ok_or_else(|| "无法确定 WPS 登记目录".to_string())?;
+    let message = rewrite_publish(&path, &expected, false)?;
+    if let Some(fingerprint) = addin_fingerprint(&dir) {
+        mark_registered(&fingerprint);
+    }
+    Ok(message)
+}
+
+#[cfg(unix)]
 pub fn remove_addin_registration() -> Result<String, String> {
     let dir = addin_dir().ok_or_else(|| "未找到 wps-addin 目录".to_string())?;
     let output = run_script(&dir.join("cleanup-old.sh"), &["--remove-current"], Duration::from_secs(5))
@@ -238,6 +271,12 @@ pub fn remove_addin_registration() -> Result<String, String> {
     } else {
         Err(format!("加载项清除失败：{}", String::from_utf8_lossy(&output.stderr).trim()))
     }
+}
+
+#[cfg(windows)]
+pub fn remove_addin_registration() -> Result<String, String> {
+    let path = wps_publish_path().ok_or_else(|| "无法确定 WPS 登记目录".to_string())?;
+    rewrite_publish(&path, &[], true)
 }
 
 #[cfg(unix)]
@@ -264,11 +303,275 @@ fn run_script(script: &std::path::Path, args: &[&str], timeout: Duration) -> std
 }
 
 #[cfg(windows)]
-fn run_script(_script: &std::path::Path, _args: &[&str], _timeout: Duration) -> std::io::Result<std::process::Output> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "Windows WPS 加载项登记尚未实现",
-    ))
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManagedEntry {
+    Current,
+    Legacy,
+    OldBridge,
+}
+
+#[cfg(windows)]
+fn element_attributes(
+    element: &quick_xml::events::BytesStart<'_>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut attrs = Vec::new();
+    for attr in element.attributes().with_checks(false) {
+        let attr = attr.map_err(|error| format!("解析加载项属性失败：{error}"))?;
+        let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+        let value = attr
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .map_err(|error| format!("解析加载项属性失败：{error}"))?
+            .to_string();
+        attrs.push((key, value));
+    }
+    Ok(attrs)
+}
+
+#[cfg(windows)]
+fn publish_entry_attributes(template: &[u8]) -> Result<Vec<(String, String)>, String> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let text = std::str::from_utf8(template)
+        .map_err(|error| format!("加载项模板不是 UTF-8：{error}"))?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut reader = Reader::from_str(text);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) | Ok(Event::Empty(element))
+                if element.name().as_ref() == b"jspluginonline" =>
+            {
+                let attrs = element_attributes(&element)?;
+                if attrs.iter().any(|(key, value)| key == "name" && value == "sidera-bridge") {
+                    return Ok(attrs);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(format!("解析加载项模板失败：{error}")),
+            _ => {}
+        }
+    }
+    Err("安装模板缺少 sidera-bridge 登记".into())
+}
+
+#[cfg(windows)]
+fn managed_entry(attrs: &[(String, String)]) -> Option<ManagedEntry> {
+    let value = |key: &str| {
+        attrs
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("")
+    };
+    let name = value("name");
+    if name == "sidera-bridge" {
+        return Some(ManagedEntry::Current);
+    }
+    if name == "screen-annotate-bridge" {
+        return Some(ManagedEntry::Legacy);
+    }
+    if value("url")
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case("http://127.0.0.1:16666")
+    {
+        return Some(ManagedEntry::OldBridge);
+    }
+    None
+}
+
+#[cfg(windows)]
+fn merged_attributes(
+    existing: &[(String, String)],
+    expected: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut out = existing.to_vec();
+    for (key, value) in expected {
+        if let Some(slot) = out.iter_mut().find(|(existing_key, _)| existing_key == key) {
+            slot.1 = value.clone();
+        } else {
+            out.push((key.clone(), value.clone()));
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
+fn entry_start(attrs: &[(String, String)]) -> quick_xml::events::BytesStart<'static> {
+    let mut element = quick_xml::events::BytesStart::new("jspluginonline");
+    for (key, value) in attrs {
+        let escaped = value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+        element.push_attribute((key.as_str(), escaped.as_str()));
+    }
+    element
+}
+
+#[cfg(windows)]
+fn rewrite_publish(
+    path: &std::path::Path,
+    expected: &[(String, String)],
+    remove_current: bool,
+) -> Result<String, String> {
+    use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
+    use quick_xml::reader::Reader;
+    use quick_xml::writer::Writer;
+
+    let original = match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("读取 WPS 登记失败：{error}")),
+    };
+    if original.is_none() && remove_current {
+        return Ok("未找到 WPS 加载项登记".into());
+    }
+
+    let output = if let Some(bytes) = &original {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| format!("WPS 登记不是 UTF-8：{error}"))?;
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let mut reader = Reader::from_str(text);
+        let mut writer = Writer::new(Vec::new());
+        let mut skip_depth = 0usize;
+        let mut root_seen = false;
+        let mut in_root = false;
+        let mut inserted = false;
+        let mut changed = false;
+        loop {
+            let event = reader
+                .read_event()
+                .map_err(|error| format!("解析 WPS 登记失败：{error}"))?;
+            match event {
+                Event::Eof => break,
+                Event::Start(element) => {
+                    if skip_depth > 0 {
+                        skip_depth += 1;
+                        continue;
+                    }
+                    let is_online = element.name().as_ref() == b"jspluginonline";
+                    let is_root = element.name().as_ref() == b"jsplugins";
+                    if is_online {
+                        let attrs = element_attributes(&element)?;
+                        if let Some(kind) = managed_entry(&attrs) {
+                            changed = true;
+                            if kind == ManagedEntry::Current && !remove_current && !inserted {
+                                let merged = merged_attributes(&attrs, expected);
+                                writer
+                                    .write_event(Event::Empty(entry_start(&merged)))
+                                    .map_err(|error| error.to_string())?;
+                                inserted = true;
+                            }
+                            skip_depth = 1;
+                            continue;
+                        }
+                    } else if is_root && !root_seen {
+                        root_seen = true;
+                        in_root = true;
+                    }
+                    writer
+                        .write_event(Event::Start(element))
+                        .map_err(|error| error.to_string())?;
+                }
+                Event::Empty(element) => {
+                    if skip_depth > 0 {
+                        continue;
+                    }
+                    if element.name().as_ref() == b"jspluginonline" {
+                        let attrs = element_attributes(&element)?;
+                        if let Some(kind) = managed_entry(&attrs) {
+                            changed = true;
+                            if kind == ManagedEntry::Current && !remove_current && !inserted {
+                                let merged = merged_attributes(&attrs, expected);
+                                writer
+                                    .write_event(Event::Empty(entry_start(&merged)))
+                                    .map_err(|error| error.to_string())?;
+                                inserted = true;
+                            }
+                            continue;
+                        }
+                    }
+                    writer
+                        .write_event(Event::Empty(element))
+                        .map_err(|error| error.to_string())?;
+                }
+                Event::End(element) => {
+                    if skip_depth > 0 {
+                        skip_depth -= 1;
+                        continue;
+                    }
+                    if element.name().as_ref() == b"jsplugins" && in_root {
+                        if !remove_current && !inserted {
+                            writer
+                                .write_event(Event::Empty(entry_start(expected)))
+                                .map_err(|error| error.to_string())?;
+                            inserted = true;
+                            changed = true;
+                        }
+                        in_root = false;
+                    }
+                    writer
+                        .write_event(Event::End(element))
+                        .map_err(|error| error.to_string())?;
+                }
+                other => {
+                    writer
+                        .write_event(other)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        if !root_seen {
+            return Err("WPS 登记文件缺少 jsplugins 根节点".into());
+        }
+        if in_root {
+            return Err("WPS 登记文件根节点未闭合".into());
+        }
+        if !changed {
+            return Ok(if remove_current {
+                "没有需要清理的 WPS 登记".into()
+            } else {
+                "登记已是最新".into()
+            });
+        }
+        writer.into_inner()
+    } else {
+        let mut writer = Writer::new(Vec::new());
+        writer
+            .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
+            .map_err(|error| error.to_string())?;
+        writer
+            .write_event(Event::Start(BytesStart::new("jsplugins")))
+            .map_err(|error| error.to_string())?;
+        writer
+            .write_event(Event::Empty(entry_start(expected)))
+            .map_err(|error| error.to_string())?;
+        writer
+            .write_event(Event::End(BytesEnd::new("jsplugins")))
+            .map_err(|error| error.to_string())?;
+        writer.into_inner()
+    };
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("创建 WPS 登记目录失败：{error}"))?;
+    }
+    if let Some(original) = &original {
+        if original == &output {
+            return Ok("登记已是最新".into());
+        }
+        let backup = path.with_file_name(format!("publish.xml.sidera-backup-{}", now_ms()));
+        std::fs::copy(path, &backup)
+            .map_err(|error| format!("备份 WPS 登记失败：{error}"))?;
+    }
+    crate::persistence::atomic_write(path, &output)
+        .map_err(|error| format!("写入 WPS 登记失败：{error}"))?;
+    Ok(if remove_current {
+        "已清理本项目 WPS 登记".into()
+    } else {
+        format!("已更新本项目登记：{}", path.display())
+    })
 }
 
 fn percent_decode(s: &str) -> String {
@@ -1375,6 +1678,63 @@ mod tests {
         bridge.shared.lock().unwrap().last_seen -= 4000;
         assert!(!bridge.start_available());
         assert!(!bridge.enqueue("START"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_registration_tests {
+    use super::*;
+
+    fn expected() -> Vec<(String, String)> {
+        vec![
+            ("name".into(), "sidera-bridge".into()),
+            ("type".into(), "wpp".into()),
+            ("url".into(), "http://127.0.0.1:16666/".into()),
+            ("debug".into(), "".into()),
+            ("enable".into(), "enable".into()),
+            ("install".into(), "null".into()),
+        ]
+    }
+
+    #[test]
+    fn merge_preserves_other_entries_and_removes_legacy() {
+        let dir = std::env::temp_dir().join(format!(
+            "sidera-wps-register-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("publish.xml");
+        std::fs::write(
+            &path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<jsplugins>
+  <jspluginonline name="other" url="https://example.test/"/>
+  <jspluginonline name="screen-annotate-bridge" url="http://127.0.0.1:16666/"/>
+</jsplugins>
+"#,
+        )
+        .unwrap();
+
+        let first = rewrite_publish(&path, &expected(), false).unwrap();
+        assert!(first.contains("已更新"), "{first}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("name=\"other\""), "{text}");
+        assert!(text.contains("name=\"sidera-bridge\""), "{text}");
+        assert!(!text.contains("screen-annotate-bridge"), "{text}");
+        assert_eq!(text.matches("name=\"sidera-bridge\"").count(), 1);
+
+        rewrite_publish(&path, &expected(), false).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("name=\"sidera-bridge\"").count(), 1);
+
+        let removed = rewrite_publish(&path, &[], true).unwrap();
+        assert!(removed.contains("已清理"), "{removed}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("sidera-bridge"), "{text}");
+        assert!(text.contains("name=\"other\""), "{text}");
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 

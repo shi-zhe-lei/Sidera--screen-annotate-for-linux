@@ -18,6 +18,15 @@ fi
 if [ -f "$HERE/assets/sidera.ico" ]; then
   cp -f "$HERE/assets/sidera.ico" "$DIST/sidera.ico"
 fi
+ADDIN="$HERE/../wps-addin"
+if [ -d "$ADDIN" ]; then
+  rm -rf "$DIST/wps-addin"
+  mkdir -p "$DIST/wps-addin/js"
+  for f in publish.xml manifest.xml main.js index.html ribbon.xml; do
+    cp -f "$ADDIN/$f" "$DIST/wps-addin/"
+  done
+  cp -f "$ADDIN/js/bridge.js" "$DIST/wps-addin/js/"
+fi
 
 DIST="$DIST" python3 - <<'PY'
 import os, zipfile
@@ -32,6 +41,12 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
     icon = os.path.join(dist, "sidera.ico")
     if os.path.exists(icon):
         z.write(icon, "sidera.ico")
+    addin = os.path.join(dist, "wps-addin")
+    if os.path.isdir(addin):
+        for root, _, files in os.walk(addin):
+            for name in files:
+                full = os.path.join(root, name)
+                z.write(full, os.path.relpath(full, dist))
 print(out)
 PY
 

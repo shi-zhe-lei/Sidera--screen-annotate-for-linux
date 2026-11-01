@@ -134,6 +134,9 @@ fn run() -> Result<(), String> {
     win32::refresh_theme();
     app.update_system_theme(win32::dark());
     app.hotkey_ok = true;
+    if app.wps_debug {
+        sidera_core::wps::ensure_addin_registered_if_needed();
+    }
 
     log("app initialized");
     let fonts = Fonts::load();

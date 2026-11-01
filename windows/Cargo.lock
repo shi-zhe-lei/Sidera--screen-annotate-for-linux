@@ -1666,6 +1666,7 @@ dependencies = [
  "image",
  "libc",
  "log",
+ "quick-xml",
  "serde_json",
  "sha1",
  "smithay-client-toolkit",
