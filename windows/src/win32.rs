@@ -25,6 +25,9 @@ use windows_sys::Win32::Graphics::Gdi::{
     HGDIOBJ, RGN_OR, ReleaseDC, SRCCOPY, SelectObject, SetWindowRgn, ValidateRect,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Shell::{
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+};
 use windows_sys::Win32::System::Registry::{
     HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW,
 };
@@ -41,21 +44,36 @@ use windows_sys::Win32::UI::Input::Pointer::{
     GetPointerInfo, GetPointerTouchInfo, POINTER_FLAG_INCONTACT, POINTER_INFO, POINTER_TOUCH_INFO,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-    GetSystemMetrics, GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW,
-    LoadCursorW, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SetCursorPos,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetSystemMetrics,
+    GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDI_APPLICATION,
+    LoadCursorW, LoadIconW, LoadImageW, MF_STRING, MSG, PM_REMOVE, PeekMessageW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetCursorPos, SetForegroundWindow,
+    TrackPopupMenu, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
     SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
     ULW_ALPHA, UpdateLayeredWindow, WNDCLASSW, LWA_ALPHA,
     WM_DESTROY, WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_CONTEXTMENU, WM_LBUTTONDBLCLK,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    WS_POPUP, WS_VISIBLE, HICON, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE,
 };
 
 const HOTKEY_TOGGLE: i32 = 1;
 const HOTKEY_QUIT: i32 = 2;
+const WM_APP_TRAY: u32 = 0x8001;
+const TRAY_ID: u32 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrayAction {
+    Settings,
+    Toggle,
+    Whiteboard,
+    Show,
+    Quit,
+}
 
 #[derive(Clone)]
 pub enum WinEvent {
@@ -65,6 +83,7 @@ pub enum WinEvent {
     Wheel(i32, i32, f64),
     Touch { id: i32, kind: TouchKind, x: i32, y: i32, diameter: f64 },
     ToggleMode,
+    Tray(TrayAction),
     Quit,
     ThemeChanged,
     DisplayChanged,
@@ -89,6 +108,8 @@ pub struct Win32Plat {
     dirty: Cell<bool>,
     update_failed: Cell<bool>,
     last_topmost: Cell<Instant>,
+    tray_icon: HICON,
+    tray_icon_owned: bool,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -259,6 +280,7 @@ impl Win32Plat {
             let old_bitmap = SelectObject(hdc_mem, dib);
             std::ptr::write_bytes(bits as *mut u8, 0, (vw * vh * 4) as usize);
 
+            let (tray_icon, tray_icon_owned) = load_tray_icon();
             let plat = Box::new(Win32Plat {
                 visual_hwnd: visual,
                 input_hwnd: input,
@@ -278,6 +300,8 @@ impl Win32Plat {
                 dirty: Cell::new(true),
                 update_failed: Cell::new(false),
                 last_topmost: Cell::new(Instant::now()),
+                tray_icon,
+                tray_icon_owned,
             });
 
             let ptr = &*plat as *const Win32Plat as isize;
@@ -296,6 +320,7 @@ impl Win32Plat {
                 MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
                 'Q' as u32,
             );
+            tray_add(input, tray_icon);
 
             SetWindowPos(
                 visual,
@@ -339,6 +364,75 @@ impl Win32Plat {
 
     pub fn scale(&self) -> f64 {
         self.scale
+    }
+
+    pub fn show(&self) {
+        unsafe {
+            ShowWindow(self.visual_hwnd, SW_SHOWNOACTIVATE);
+            ShowWindow(self.input_hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                self.visual_hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            SetWindowPos(
+                self.input_hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+    }
+
+    unsafe fn show_tray_menu(&self, hwnd: HWND) {
+        log::info!("tray menu open");
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return;
+        }
+        let items: [(usize, &str); 5] = [
+            (1, "打开设置"),
+            (2, "切换批注/光标"),
+            (3, "白板"),
+            (4, "显示 Sidera"),
+            (5, "退出"),
+        ];
+        for (id, label) in items {
+            let text = wide(label);
+            AppendMenuW(menu, MF_STRING, id, text.as_ptr());
+        }
+        let mut point = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut point);
+        SetForegroundWindow(hwnd);
+        let command = TrackPopupMenu(
+            menu,
+            TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+            point.x,
+            point.y,
+            0,
+            hwnd,
+            null(),
+        );
+        DestroyMenu(menu);
+        PostMessageW(hwnd, 0, 0, 0);
+        let action = match command {
+            1 => Some(TrayAction::Settings),
+            2 => Some(TrayAction::Toggle),
+            3 => Some(TrayAction::Whiteboard),
+            4 => Some(TrayAction::Show),
+            5 => Some(TrayAction::Quit),
+            _ => None,
+        };
+        if let Some(action) = action {
+            self.enqueue(WinEvent::Tray(action));
+        }
     }
 
     pub fn dump_png(&self, path: &str) -> Result<(), String> {
@@ -456,6 +550,20 @@ impl Win32Plat {
                 }
                 Some(0)
             }
+            WM_APP_TRAY => {
+                let action = (lparam as u32) & 0xffff;
+                match action {
+                    WM_LBUTTONUP | 0x0400 | 0x0401 => {
+                        self.enqueue(WinEvent::Tray(TrayAction::Show));
+                    }
+                    WM_LBUTTONDBLCLK => {
+                        self.enqueue(WinEvent::Tray(TrayAction::Settings));
+                    }
+                    WM_RBUTTONUP | WM_CONTEXTMENU => self.show_tray_menu(hwnd),
+                    _ => {}
+                }
+                Some(0)
+            }
             WM_SETTINGCHANGE => {
                 self.enqueue(WinEvent::ThemeChanged);
                 Some(0)
@@ -534,6 +642,10 @@ impl Drop for Win32Plat {
         unsafe {
             UnregisterHotKey(self.input_hwnd, HOTKEY_TOGGLE);
             UnregisterHotKey(self.input_hwnd, HOTKEY_QUIT);
+            tray_delete(self.input_hwnd);
+            if self.tray_icon_owned && !self.tray_icon.is_null() {
+                DestroyIcon(self.tray_icon);
+            }
             SetWindowLongPtrW(self.input_hwnd, GWLP_USERDATA, 0);
             SetWindowLongPtrW(self.visual_hwnd, GWLP_USERDATA, 0);
             if !self.hdc_mem.is_null() && !self.old_bitmap.is_null() {
@@ -856,6 +968,54 @@ unsafe fn send_mouse(flags: u32) {
         },
     };
     SendInput(1, &input, size_of::<INPUT>() as i32);
+}
+
+unsafe fn load_tray_icon() -> (HICON, bool) {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in ["sidera.ico", "assets/sidera.ico"] {
+                let path = dir.join(name);
+                if path.is_file() {
+                    let text = wide(&path.to_string_lossy());
+                    let icon = LoadImageW(
+                        null_mut(),
+                        text.as_ptr(),
+                        IMAGE_ICON,
+                        0,
+                        0,
+                        LR_LOADFROMFILE | LR_DEFAULTSIZE,
+                    );
+                    if !icon.is_null() {
+                        return (icon as HICON, true);
+                    }
+                }
+            }
+        }
+    }
+    (LoadIconW(null_mut(), IDI_APPLICATION), false)
+}
+
+unsafe fn tray_add(hwnd: HWND, icon: HICON) {
+    let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+    nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = TRAY_ID;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_APP_TRAY;
+    nid.hIcon = icon;
+    let tip = wide("Sidera");
+    for (index, unit) in tip.iter().take(127).enumerate() {
+        nid.szTip[index] = *unit;
+    }
+    Shell_NotifyIconW(NIM_ADD, &nid);
+}
+
+unsafe fn tray_delete(hwnd: HWND) {
+    let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+    nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = TRAY_ID;
+    Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
 unsafe extern "system" fn wndproc(

@@ -15,6 +15,9 @@ cp -f "$EXE" "$DIST/sidera.exe"
 if [ -f "$HERE/assets/README.txt" ]; then
   cp -f "$HERE/assets/README.txt" "$DIST/README.txt"
 fi
+if [ -f "$HERE/assets/sidera.ico" ]; then
+  cp -f "$HERE/assets/sidera.ico" "$DIST/sidera.ico"
+fi
 
 DIST="$DIST" python3 - <<'PY'
 import os, zipfile
@@ -26,6 +29,9 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
     readme = os.path.join(dist, "README.txt")
     if os.path.exists(readme):
         z.write(readme, "README.txt")
+    icon = os.path.join(dist, "sidera.ico")
+    if os.path.exists(icon):
+        z.write(icon, "sidera.ico")
 print(out)
 PY
 

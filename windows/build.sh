@@ -27,7 +27,9 @@ export CARGO_NET_OFFLINE="${CARGO_NET_OFFLINE:-true}"
 
 cd "$HERE"
 echo "==> 交叉编译 sidera.exe ..."
-cargo build --release --target x86_64-pc-windows-gnu "$@"
+cargo build --release --locked --target x86_64-pc-windows-gnu "$@"
+
+cp -f "$HERE/assets/sidera.ico" "$(dirname "$OUT")/" 2>/dev/null || true
 
 echo ""
 echo "==> 产物: $OUT"

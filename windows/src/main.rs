@@ -10,9 +10,10 @@ use sidera_core::text::Fonts;
 use sidera_core::ui;
 use sidera_core::wps::WpsBridge;
 use sidera_core::{
-    apply_input_shape, begin_launch, handle_touch, on_motion, on_press, on_release, on_scroll,
-    switch_to_cursor, switch_to_draw, tick, Ip, Rt, Timers,
+    apply_input_shape, begin_launch, handle_btn, handle_touch, on_motion, on_press, on_release,
+    on_scroll, open_settings, switch_to_cursor, switch_to_draw, tick, Ip, Rt, Timers,
 };
+use sidera_core::ui::Btn;
 use tiny_skia::Pixmap;
 
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, SetLastError};
@@ -21,7 +22,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MB_ICONERROR, MB_OK, MessageBoxW,
 };
 
-use win32::{Win32Plat, WinEvent};
+use win32::{TrayAction, Win32Plat, WinEvent};
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -112,6 +113,14 @@ fn run() -> Result<(), String> {
         None => return Ok(()),
     };
     log("run start");
+    if std::env::var("SIDERA_AUTOSTART_TEST").is_ok() {
+        log(&format!("autostart before={}", ui::is_autostart()));
+        ui::set_autostart(true);
+        log(&format!("autostart set={}", ui::is_autostart()));
+        ui::set_autostart(false);
+        log(&format!("autostart cleared={}", ui::is_autostart()));
+        return Ok(());
+    }
     let plat = Win32Plat::create()?;
     log("window created");
     let (logical_w, logical_h) = plat.logical_size();
@@ -211,6 +220,27 @@ fn run() -> Result<(), String> {
                         switch_to_cursor(&rt, &mut app);
                     }
                 }
+                WinEvent::Tray(action) => {
+                    log(&format!("tray {action:?}"));
+                    match action {
+                    TrayAction::Settings => open_settings(&rt, &mut app),
+                    TrayAction::Toggle => {
+                        if app.mode == 0 {
+                            switch_to_draw(&rt, &mut app, 1);
+                        } else {
+                            switch_to_cursor(&rt, &mut app);
+                        }
+                    }
+                    TrayAction::Whiteboard => {
+                        handle_btn(&rt, &mut app, wps_bridge.as_ref(), Btn::Whiteboard, false)
+                    }
+                    TrayAction::Show => {
+                        plat.show();
+                        rt.redraw_full(&app);
+                    }
+                    TrayAction::Quit => return Ok(()),
+                    }
+                },
                 WinEvent::ThemeChanged => {
                     win32::refresh_theme();
                     if app.update_system_theme(win32::dark()) {

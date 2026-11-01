@@ -1292,16 +1292,19 @@ pub fn draw_input_group_prompt(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
 }
 
 // ---------------- 设置面板用到的外部状态 ----------------
+#[cfg(unix)]
 pub fn autostart_path() -> std::path::PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("autostart/sidera.desktop")
 }
 
+#[cfg(unix)]
 pub fn is_autostart() -> bool {
     autostart_path().exists()
 }
 
+#[cfg(unix)]
 fn autostart_icon() -> String {
     for path in ["/usr/share/pixmaps/sidera.png",
                  "/usr/share/icons/hicolor/256x256/apps/sidera.png",
@@ -1313,6 +1316,7 @@ fn autostart_icon() -> String {
     "sidera".to_string()
 }
 
+#[cfg(unix)]
 pub fn set_autostart(on: bool) {
     let p = autostart_path();
     if on {
@@ -1325,6 +1329,57 @@ pub fn set_autostart(on: bool) {
         let _ = std::fs::write(p, entry);
     } else {
         let _ = std::fs::remove_file(p);
+    }
+}
+
+#[cfg(windows)]
+fn wide_autostart(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+pub fn is_autostart() -> bool {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW};
+    let subkey = wide_autostart(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    let value = wide_autostart("Sidera");
+    let mut data = [0u16; 1024];
+    let mut size = (data.len() * 2) as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            data.as_mut_ptr() as *mut std::ffi::c_void,
+            &mut size,
+        )
+    };
+    status == 0 && size > 2
+}
+
+#[cfg(windows)]
+pub fn set_autostart(on: bool) {
+    use windows_sys::Win32::System::Registry::{
+        HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW,
+    };
+    let subkey = wide_autostart(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    let value = wide_autostart("Sidera");
+    unsafe {
+        if on {
+            let exe = std::env::current_exe().unwrap_or_default();
+            let data = wide_autostart(&format!("\"{}\"", exe.display()));
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                REG_SZ,
+                data.as_ptr() as *const std::ffi::c_void,
+                (data.len() * 2) as u32,
+            );
+        } else {
+            RegDeleteKeyValueW(HKEY_CURRENT_USER, subkey.as_ptr(), value.as_ptr());
+        }
     }
 }
 

@@ -43,6 +43,10 @@ futures-lite = "2"
 
 [target.'cfg(windows)'.dependencies]
 arboard = "3"
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_System_Registry",
+] }
 
 [profile.release]
 opt-level = 2

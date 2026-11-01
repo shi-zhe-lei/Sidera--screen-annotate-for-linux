@@ -1676,6 +1676,7 @@ dependencies = [
  "wayland-protocols",
  "wayland-protocols-wlr",
  "wayland-scanner",
+ "windows-sys 0.61.2",
  "x11rb",
  "zbus",
 ]
@@ -1686,6 +1687,7 @@ version = "3.1.0"
 dependencies = [
  "env_logger",
  "image",
+ "log",
  "sidera",
  "tiny-skia",
  "windows-sys 0.61.2",
