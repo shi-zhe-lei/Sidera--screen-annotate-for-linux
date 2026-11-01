@@ -111,6 +111,24 @@ fn background_wps_does_not_enter_presentation_or_switch_pages() {
 }
 
 #[test]
+fn esc_control_does_not_start_a_slideshow_from_a_background_wps_window() {
+    let (rt, mut app, keys) = fixture_with_foreground(false, Some(false));
+    app.wps_debug = true;
+    app.wps_test_mode = false;
+    let bridge = WpsBridge::from_listener(std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap());
+    {
+        let mut s = bridge.shared.lock().unwrap();
+        s.connected = true;
+        s.last_seen = now_ms();
+        s.real_pos = -1;
+        s.can_start = true;
+    }
+    exit_presentation(&rt, &mut app, Some(&bridge));
+    assert_eq!(keys.get(), 0, "Esc must not inject Shift+F5 when WPS is behind another window");
+    assert!(bridge.shared.lock().unwrap().queue.is_empty());
+}
+
+#[test]
 fn default_wps_mode_uses_shift_f5_to_start_and_escape_to_exit() {
     let (rt, mut app, keys) = fixture(false);
     app.wps_test_mode = false;

@@ -19,6 +19,9 @@ pub const DEFAULT_SB_SCALE: f64 = 1.0;
 pub const DEFAULT_SIDEBAR_ALPHA: u8 = 80;
 pub const DEFAULT_LARGE_TOUCH_THRESHOLD: f64 = 64.0;
 pub const DEFAULT_LARGE_ERASE_SCALE10: i32 = 12;
+pub const DEFAULT_STARTUP_DELAY: u32 = 10;
+pub const MIN_STARTUP_DELAY: u32 = 5;
+pub const MAX_STARTUP_DELAY: u32 = 20;
 pub const MAX_UNDO: usize = 12;
 /// 撤回瓦片边长（像素）；内存与笔迹覆盖面积成正比，而非整张画布
 pub const UNDO_TILE: i32 = 128;
@@ -144,6 +147,7 @@ pub struct App {
     pub wps_fullscreen: bool,
     pub wps_debug: bool,
     pub wps_test_mode: bool,
+    pub startup_delay: u32,
     pub wps_start_sent_until: i64,
     pub wps_connected: bool,
     pub wps_real_pos: i32,
@@ -278,6 +282,7 @@ impl App {
             wps_fullscreen: false,
             wps_debug: true,
             wps_test_mode: true,
+            startup_delay: DEFAULT_STARTUP_DELAY,
             wps_start_sent_until: 0,
             wps_connected: false,
             wps_real_pos: -1,
@@ -749,19 +754,64 @@ fn config_file() -> Option<std::path::PathBuf> {
     dirs::config_dir().filter(|p| p.is_absolute()).map(|p| p.join("sidera/config"))
 }
 
+pub fn config_path() -> Option<std::path::PathBuf> {
+    config_file()
+}
+
+pub fn launched_by_autostart() -> bool {
+    std::env::args().any(|arg| arg == "--autostart")
+        || std::env::var("SIDERA_AUTOSTART").as_deref() == Ok("1")
+}
+
+pub fn load_startup_delay() -> u32 {
+    let path = config_file();
+    let legacy = dirs::home_dir().map(|home| home.join(".config/sidera/config"));
+    let content = path
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .or_else(|| legacy.and_then(|path| std::fs::read_to_string(path).ok()));
+    let Some(content) = content else { return DEFAULT_STARTUP_DELAY; };
+    for line in content.lines() {
+        if let Some(value) = line.trim().strip_prefix("startupDelay=") {
+            if let Ok(n) = value.trim().parse::<u32>() {
+                return n.clamp(MIN_STARTUP_DELAY, MAX_STARTUP_DELAY);
+            }
+        }
+    }
+    DEFAULT_STARTUP_DELAY
+}
+
 pub fn load_settings(app: &mut App) {
-    let Some(path) = config_file() else { return };
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
+    let Some(path) = config_file() else {
+        crate::diag_log::warn("设置未加载：无法确定配置目录");
+        return;
+    };
+    let (content, loaded_path) = match std::fs::read_to_string(&path) {
+        Ok(content) => (content, path.clone()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Migrate on the next save without deleting the previous user's file.
-            let Some(legacy) = dirs::home_dir().map(|p| p.join(".config/sidera/config")) else { return };
-            let Ok(content) = std::fs::read_to_string(legacy) else { return };
-            content
+            let Some(legacy) = dirs::home_dir().map(|p| p.join(".config/sidera/config")) else {
+                crate::diag_log::info("设置未加载：配置文件不存在");
+                return;
+            };
+            let Ok(content) = std::fs::read_to_string(&legacy) else {
+                crate::diag_log::info("设置未加载：配置文件不存在");
+                return;
+            };
+            (content, legacy)
         }
-        Err(e) => { log::warn!("读取设置失败：{e}"); return; }
+        Err(e) => {
+            log::warn!("读取设置失败：{e}");
+            crate::diag_log::warn(&format!("读取设置失败：{}：{e}", path.display()));
+            return;
+        }
     };
     parse_settings(app, &content);
+    crate::diag_log::info(&format!(
+        "设置已加载：{}（theme={} accent={}）",
+        loaded_path.display(),
+        app.theme.preference.key(),
+        app.theme.accent.key()
+    ));
 }
 
 fn parse_settings(app: &mut App, content: &str) {
@@ -781,6 +831,11 @@ fn parse_settings(app: &mut App, content: &str) {
                 if let Some(accent) = crate::ui_theme::Accent::parse(v) { app.theme.accent = accent; }
             }
             "wpsTestMode" => app.wps_test_mode = true,
+            "startupDelay" => {
+                if let Ok(n) = v.parse::<u32>() {
+                    app.startup_delay = n.clamp(MIN_STARTUP_DELAY, MAX_STARTUP_DELAY);
+                }
+            }
             "sbScale" => {
                 if let Ok(f) = v.parse::<f64>() {
                     if f.is_finite() { app.sb_scale = f.clamp(0.6, 1.4); }
@@ -822,17 +877,27 @@ fn parse_settings(app: &mut App, content: &str) {
 }
 
 pub fn save_settings(app: &App) {
-    let Some(path) = config_file() else { log::warn!("无法确定设置目录"); return };
+    // Unit tests exercise the real settings handlers; never let `cargo test`
+    // rewrite the developer's live ~/.config/sidera/config (which previously
+    // reset the saved theme accent).
+    if cfg!(test) { return; }
+    let Some(path) = config_file() else {
+        log::warn!("无法确定设置目录");
+        crate::diag_log::warn("保存设置失败：无法确定配置目录");
+        return;
+    };
     if let Err(e) = crate::persistence::atomic_write(&path, serialize_settings(app).as_bytes()) {
         log::warn!("保存设置失败：{e}");
+        crate::diag_log::warn(&format!("保存设置失败：{}：{e}", path.display()));
     }
 }
 
 fn serialize_settings(app: &App) -> String {
     format!(
-        "wpsDebug={}\nwpsTestMode={}\nsbScale={:.2}\nsidebarAlpha={}\nrightClickCursor={}\nwhiteboardDots={}\nwhiteboardDotSize={}\nprocessBlock={}\npenColor={}\npenSize={}\neraserSize={}\nlargeTouchThreshold={}\nlargeEraseScale10={}\ntheme={}\nthemeAccent={}\n",
+        "wpsDebug={}\nwpsTestMode={}\nstartupDelay={}\nsbScale={:.2}\nsidebarAlpha={}\nrightClickCursor={}\nwhiteboardDots={}\nwhiteboardDotSize={}\nprocessBlock={}\npenColor={}\npenSize={}\neraserSize={}\nlargeTouchThreshold={}\nlargeEraseScale10={}\ntheme={}\nthemeAccent={}\n",
         if app.wps_debug { 1 } else { 0 },
         1,
+        app.startup_delay,
         app.sb_scale,
         app.sidebar_alpha,
         if app.right_click_cursor_on { 1 } else { 0 },
@@ -1209,6 +1274,20 @@ mod theme_tests {
         assert_eq!(loaded.cur_color, 5);
         assert_eq!(loaded.cur_pen, 2);
         assert_eq!(loaded.cur_eraser, 0);
+    }
+
+    #[test]
+    fn startup_delay_roundtrips_and_clamps() {
+        let mut source = App::new(Pixmap::new(10, 10).unwrap(), 10, 10);
+        source.startup_delay = 15;
+        let mut loaded = App::new(Pixmap::new(10, 10).unwrap(), 10, 10);
+        parse_settings(&mut loaded, &serialize_settings(&source));
+        assert_eq!(loaded.startup_delay, 15);
+        for (value, expected) in [("1", 5), ("5", 5), ("10", 10), ("20", 20), ("30", 20), ("bad", 10)] {
+            let mut app = App::new(Pixmap::new(10, 10).unwrap(), 10, 10);
+            parse_settings(&mut app, &format!("startupDelay={value}\n"));
+            assert_eq!(app.startup_delay, expected, "startupDelay={value}");
+        }
     }
 
     #[test]

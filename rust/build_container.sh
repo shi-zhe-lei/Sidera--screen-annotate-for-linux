@@ -57,7 +57,7 @@ echo "==> 在 $ARCH 容器内编译（离线，可能较慢）..."
 bwrap \
   --ro-bind "$SYSROOT" / \
   --bind "$REPO" /mnt \
-  --dev /dev --proc /proc \
+  --dev /dev --proc /proc --tmpfs /tmp \
   "${RUN[@]}" \
   --bind "$HOST_CARGO" /mnt/rust/target/.cargo-home \
   --ro-bind "$HOST_RUSTUP" /mnt/rust/target/.rustup-home \

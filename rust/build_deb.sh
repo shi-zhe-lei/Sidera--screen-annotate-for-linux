@@ -91,6 +91,11 @@ mkdir -p "$PKG_DIR/DEBIAN" \
 # ---------- 二进制 ----------
 install -m 755 "$BIN" "$PKG_DIR/usr/bin/sidera"
 
+# ---------- systemd 用户服务（由应用在启用进程屏蔽时启动，不默认 enable）----------
+mkdir -p "$PKG_DIR/usr/lib/systemd/user"
+install -m 644 "$REPO/rust/systemd/sidera-blocker.service" \
+  "$PKG_DIR/usr/lib/systemd/user/sidera-blocker.service"
+
 # ---------- WPS 加载项（放到固定路径，Rust 版会自动从 /usr/share/sidera/wps-addin 读取）----------
 cp -r "$REPO/wps-addin/." "$PKG_DIR/usr/share/sidera/wps-addin/"
 chmod 755 "$PKG_DIR/usr/share/sidera/wps-addin/install.sh" \

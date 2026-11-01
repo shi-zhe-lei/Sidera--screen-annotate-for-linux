@@ -37,6 +37,7 @@ package() {
   cd "${pkgname}"
 
   install -Dm755 rust/target/release/sidera "${pkgdir}/usr/bin/sidera"
+  install -Dm644 rust/systemd/sidera-blocker.service "${pkgdir}/usr/lib/systemd/user/sidera-blocker.service"
 
   # WPS 加载项
   install -d "${pkgdir}/usr/share/sidera/wps-addin"

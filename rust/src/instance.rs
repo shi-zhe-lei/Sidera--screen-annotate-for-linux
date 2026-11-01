@@ -12,11 +12,31 @@ pub struct Instance { listener: UnixListener, path: PathBuf, _lock: File }
 impl Deref for Instance { type Target = UnixListener; fn deref(&self) -> &UnixListener { &self.listener } }
 impl Drop for Instance { fn drop(&mut self) { let _ = fs::remove_file(&self.path); } }
 
-pub fn acquire(command: &[u8]) -> io::Result<Option<Instance>> {
+pub fn runtime_directory() -> PathBuf {
     let uid = unsafe { libc::geteuid() };
-    let directory = dirs::runtime_dir().filter(|p| p.is_absolute())
-        .unwrap_or_else(|| PathBuf::from(format!("/tmp/sidera-{uid}")));
-    acquire_in(&directory, command)
+    dirs::runtime_dir()
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/sidera-{uid}")))
+}
+
+/// Check the GUI lock without connecting to the single-instance socket.
+/// Connecting would be accepted as a "show" command by the running instance.
+pub fn running() -> bool {
+    let lock_path = runtime_directory().join("sidera.lock");
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(lock_path) else {
+        return false;
+    };
+    let fd = file.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
+        false
+    } else {
+        io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
+    }
+}
+
+pub fn acquire(command: &[u8]) -> io::Result<Option<Instance>> {
+    acquire_in(&runtime_directory(), command)
 }
 
 fn acquire_in(directory: &Path, command: &[u8]) -> io::Result<Option<Instance>> {

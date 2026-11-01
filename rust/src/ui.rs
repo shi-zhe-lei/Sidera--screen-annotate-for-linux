@@ -78,6 +78,7 @@ pub enum SetHit {
 pub enum SliderId {
     Alpha,
     Scale,
+    StartupDelay,
     Threshold,
     EraseScale,
 }
@@ -87,6 +88,7 @@ impl SliderId {
         match self {
             Self::Alpha => crate::app::DEFAULT_SIDEBAR_ALPHA as f32,
             Self::Scale => crate::app::DEFAULT_SB_SCALE as f32,
+            Self::StartupDelay => crate::app::DEFAULT_STARTUP_DELAY as f32,
             Self::Threshold => crate::app::DEFAULT_LARGE_TOUCH_THRESHOLD as f32,
             Self::EraseScale => crate::app::DEFAULT_LARGE_ERASE_SCALE10 as f32 / 10.0,
         }
@@ -938,7 +940,7 @@ fn settings_row_y(app: &App, row: i32) -> i32 {
 }
 
 fn settings_accent_row(_app: &App) -> i32 {
-    10
+    11
 }
 
 fn settings_action_start(app: &App) -> i32 {
@@ -988,11 +990,12 @@ pub fn settings_sliders(app: &App) -> Vec<SliderDef> {
         mk(SliderId::Alpha, 0, 30.0, 255.0, app.sidebar_alpha as f32, 1.0, "侧边栏透明度", false),
         mk(SliderId::Scale, 1, 0.6, 1.4, app.sb_scale as f32, 0.01, "侧边栏大小", true),
     ];
-    v.push(mk(SliderId::Threshold, 5, 20.0, 260.0, app.large_touch_threshold as f32, 10.0, "大触点阈值", false));
-    v.push(mk(SliderId::EraseScale, 6, 0.8, 2.5, app.large_erase_scale10 as f32 / 10.0, 0.1, "大触点橡皮倍率", true));
+    v.push(mk(SliderId::StartupDelay, 2, 5.0, 20.0, app.startup_delay as f32, 1.0, "自动启动延迟 (秒)", false));
+    v.push(mk(SliderId::Threshold, 6, 20.0, 260.0, app.large_touch_threshold as f32, 10.0, "大触点阈值", false));
+    v.push(mk(SliderId::EraseScale, 7, 0.8, 2.5, app.large_erase_scale10 as f32 / 10.0, 0.1, "大触点橡皮倍率", true));
     v.retain(|s| settings_row_visible(app, match s.id {
-        SliderId::Alpha => 0, SliderId::Scale => 1,
-        SliderId::Threshold => 5, SliderId::EraseScale => 6,
+        SliderId::Alpha => 0, SliderId::Scale => 1, SliderId::StartupDelay => 2,
+        SliderId::Threshold => 6, SliderId::EraseScale => 7,
     }));
     v
 }
@@ -1012,22 +1015,22 @@ pub fn settings_controls(app: &App) -> Vec<(SetHit, R)> {
     let a = settings_action_start(app);
     let accent_row = settings_accent_row(app);
     let mut controls = vec![
-        (SetHit::Autostart, full(2)),
-        (SetHit::WpsDebug, full(3)),
-        (SetHit::WpsRemove, full(7)),
-        (SetHit::WpsRegister, full(8)),
-        (SetHit::ProcessBlock, full(9)),
+        (SetHit::Autostart, full(3)),
+        (SetHit::WpsDebug, full(4)),
+        (SetHit::WpsRemove, full(8)),
+        (SetHit::WpsRegister, full(9)),
+        (SetHit::ProcessBlock, full(10)),
         (SetHit::ThemeAccent, full(accent_row)),
-        (SetHit::RightClick, full(4)),
+        (SetHit::RightClick, full(5)),
         (SetHit::ClearLog, full(a)),
         (SetHit::SysInfo, full(a + 1)),
         (SetHit::Quit, full(a + 2)),
     ];
     controls.retain(|(hit, _)| settings_row_visible(app, match hit {
-        SetHit::Autostart => 2, SetHit::WpsDebug => 3,
-        SetHit::WpsRemove => 7, SetHit::WpsRegister => 8, SetHit::ProcessBlock => 9,
+        SetHit::Autostart => 3, SetHit::WpsDebug => 4,
+        SetHit::WpsRemove => 8, SetHit::WpsRegister => 9, SetHit::ProcessBlock => 10,
         SetHit::ThemeAccent => accent_row,
-        SetHit::RightClick => 4,
+        SetHit::RightClick => 5,
         SetHit::ClearLog => a, SetHit::SysInfo => a + 1,
         SetHit::Quit => a + 2, _ => unreachable!(),
     }));
@@ -1324,11 +1327,24 @@ pub fn set_autostart(on: bool) {
             let _ = std::fs::create_dir_all(parent);
         }
         let entry = format!(
-            "[Desktop Entry]\nType=Application\nName=Sidera\nComment=Sidera软件\nExec=sidera\nIcon={}\nTerminal=false\n",
+            "[Desktop Entry]\nType=Application\nName=Sidera\nComment=Sidera软件\nExec=sidera --autostart\nIcon={}\nTerminal=false\n",
             autostart_icon());
         let _ = std::fs::write(p, entry);
     } else {
         let _ = std::fs::remove_file(p);
+    }
+}
+
+#[cfg(unix)]
+pub fn ensure_autostart_flag() {
+    let path = autostart_path();
+    let Ok(mut content) = std::fs::read_to_string(&path) else { return; };
+    if content.contains("--autostart") { return; }
+    if content.lines().any(|line| line.trim() == "Exec=sidera") {
+        content = content.replace("Exec=sidera", "Exec=sidera --autostart");
+        if let Err(error) = crate::persistence::atomic_write(&path, content.as_bytes()) {
+            log::warn!("更新自启动参数失败：{error}");
+        }
     }
 }
 
@@ -1368,7 +1384,7 @@ pub fn set_autostart(on: bool) {
     unsafe {
         if on {
             let exe = std::env::current_exe().unwrap_or_default();
-            let data = wide_autostart(&format!("\"{}\"", exe.display()));
+            let data = wide_autostart(&format!("\"{}\" --autostart", exe.display()));
             RegSetKeyValueW(
                 HKEY_CURRENT_USER,
                 subkey.as_ptr(),
@@ -2226,7 +2242,8 @@ fn draw_settings(app: &App, fonts: &Fonts, ctx: &mut Ctx, icon: Option<&Pixmap>)
     for s in &settings_sliders(app) {
         let ry = s.hit.y;
         let label = match s.id {
-            SliderId::Alpha => "工具栏不透明度", SliderId::Scale => "工具栏大小", _ => s.label,
+            SliderId::Alpha => "工具栏不透明度", SliderId::Scale => "工具栏大小",
+            SliderId::StartupDelay => "自动启动延迟 (秒)", _ => s.label,
         };
         let baseline = ry + if p.w < 420 { -4 } else { 27 };
         ctx.text(fonts, label, (p.x + 26) as f32, baseline as f32, 22.0, c(palette.text));
@@ -2244,6 +2261,7 @@ fn draw_settings(app: &App, fonts: &Fonts, ctx: &mut Ctx, icon: Option<&Pixmap>)
         let value = match s.id {
             SliderId::Alpha => format!("{:.0}%", s.value / 255.0 * 100.0),
             SliderId::Scale => format!("{:.0}%", s.value * 100.0),
+            SliderId::StartupDelay => format!("{:.0}s", s.value),
             SliderId::EraseScale | SliderId::Threshold => {
                 let number = if s.signed { format!("{:.1}", s.value) } else { format!("{:.0}", s.value) };
                 if s.id == SliderId::EraseScale { format!("{number}×") } else { number }
@@ -2396,7 +2414,7 @@ mod tests {
                     SetHit::ClearLog, SetHit::SysInfo, SetHit::Quit, SetHit::Done] {
                     assert!(reached.contains(&expected), "unreachable {expected:?} at {w}x{h}");
                 }
-                assert_eq!(sliders.len(), 4);
+                assert_eq!(sliders.len(), 5);
                 for id in sliders { assert!(reached.contains(&SetHit::ResetSlider(id))); }
                 assert!(!settings_change_page(&mut a, i32::MAX));
                 settings_change_page(&mut a, i32::MIN);

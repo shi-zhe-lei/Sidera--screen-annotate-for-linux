@@ -645,6 +645,30 @@ pub fn go_next(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>) {
     rt.redraw_full(app);
 }
 
+fn presentation_action_for(
+    rt: &Rt,
+    app: &App,
+    wps: Option<&WpsBridge>,
+) -> ui::PresentationAction {
+    let visible = rt.wps_foreground() != Some(false);
+    let showing = app.wps_debug && wps.is_some_and(WpsBridge::showing);
+    if showing && visible {
+        return ui::PresentationAction::End;
+    }
+    let start_ready = app.wps_debug
+        && visible
+        && if app.wps_test_mode {
+            wps.is_some_and(WpsBridge::start_available)
+        } else {
+            wps.is_some_and(WpsBridge::connected)
+        };
+    if start_ready {
+        ui::PresentationAction::Start
+    } else {
+        ui::PresentationAction::Escape
+    }
+}
+
 pub fn exit_presentation(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>) {
     if app.whiteboard {
         app.whiteboard_bg_index = (app.whiteboard_bg_index + 1) % app::WHITEBOARD_COLORS.len() as i32;
@@ -654,30 +678,50 @@ pub fn exit_presentation(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>) {
     if app.mode != 0 {
         switch_to_cursor(rt, app);
     }
-    if app.wps_debug && !app.wps_test_mode {
-        // Default mode deliberately avoids the WPS command queue for entering
-        // or leaving a show. Keyboard shortcuts still work when the add-in is
-        // slow or its API is blocked.
-        if wps.is_some_and(|w| w.showing()) {
-            rt.fake_key(Key::Escape);
-        } else if now_ms() >= app.wps_start_sent_until {
-            if !rt.backend.start_presentation() {
-                crate::diag_log::warn("WPS 默认模式无法注入 Shift+F5，开始放映失败");
-            } else {
-                app.wps_start_sent_until = now_ms() + 2500;
-                crate::diag_log::info("WPS 默认模式已发送 Shift+F5 开始放映");
+    // Recompute instead of trusting the last tick: the WPS window may have
+    // dropped behind another window since the label was painted. Esc must never
+    // turn into a presentation-start shortcut.
+    match presentation_action_for(rt, app, wps) {
+        ui::PresentationAction::Start => {
+            if app.wps_debug && !app.wps_test_mode {
+                // Default mode deliberately avoids the WPS command queue for entering
+                // or leaving a show. Keyboard shortcuts still work when the add-in is
+                // slow or its API is blocked.
+                if now_ms() >= app.wps_start_sent_until {
+                    if !rt.backend.start_presentation() {
+                        crate::diag_log::warn("WPS 默认模式无法注入 Shift+F5，开始放映失败");
+                    } else {
+                        app.wps_start_sent_until = now_ms() + 2500;
+                        crate::diag_log::info("WPS 默认模式已发送 Shift+F5 开始放映");
+                    }
+                }
+            } else if app.wps_debug && wps.is_some_and(WpsBridge::start_available) {
+                // START has its own guard against duplicate taps; never send Esc here.
+                if let Some(w) = wps { w.enqueue("START"); }
             }
+            rt.redraw_full(app);
         }
-        rt.redraw_full(app);
-        return;
+        ui::PresentationAction::End => {
+            if app.wps_debug && !app.wps_test_mode {
+                if wps.is_some_and(WpsBridge::showing) {
+                    rt.fake_key(Key::Escape);
+                }
+            } else {
+                external_navigation(rt, app, wps, "EXIT", Key::Escape);
+            }
+            rt.redraw_full(app);
+        }
+        ui::PresentationAction::Escape => {
+            // No WPS show is active and the office window is not foreground.
+            // Keep the direct-key fallback for truly disconnected desktops,
+            // but never start a presentation from the Esc control.
+            let linked = app.wps_debug && wps.is_some_and(WpsBridge::connected);
+            if !linked {
+                external_navigation(rt, app, wps, "EXIT", Key::Escape);
+            }
+            rt.redraw_full(app);
+        }
     }
-    if app.wps_debug && wps.is_some_and(|w| w.start_available()) {
-        // START has its own guard against duplicate taps; never send Esc here.
-        if let Some(w) = wps { w.enqueue("START"); }
-        rt.redraw_full(app);
-        return;
-    }
-    external_navigation(rt, app, wps, "EXIT", Key::Escape);
 }
 
 pub fn do_screenshot(rt: &Rt) {
@@ -766,6 +810,15 @@ pub fn collect_system_info(rt: &Rt, app: &App) -> String {
     s.push_str(&format!("WPS 全屏: {}\n", app.wps_fullscreen));
     s.push_str(&format!("WPS 已连接: {}\n", app.wps_connected));
     s.push_str(&format!("WPS 模式: {}\n", if app.wps_test_mode { "测试（页码/跳页/开始）" } else { "默认（API 翻页 + 快捷键）" }));
+    if let Some(path) = app::config_path() {
+        s.push_str(&format!("设置文件: {}\n", path.display()));
+    }
+    s.push_str(&format!(
+        "主题: {} / {}\n启动延迟: {} 秒\n",
+        app.theme.preference.label(),
+        app.theme.accent.label(),
+        app.startup_delay
+    ));
     if let Some(path) = diag_log::path() {
         s.push_str(&format!("诊断日志: {}\n", path.display()));
     }
@@ -809,6 +862,7 @@ fn handle_process_hit(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
         ui::ProcessHit::Enable => {
             app.process_block_enabled = !app.process_block_enabled;
             app::save_settings(app);
+            process_block::set_daemon_enabled(app.process_block_enabled);
         }
         ui::ProcessHit::Input => set_process_keyboard(rt, app, true),
         ui::ProcessHit::Add => add_process_input(app),
@@ -880,6 +934,12 @@ fn apply_slider(app: &mut App, id: ui::SliderId, v: f32) {
         ui::SliderId::Scale => {
             // Keep exact percent steps stable across pixel rounding and saved settings.
             app.sb_scale = (f64::from(v) * 100.0).round().clamp(60.0, 140.0) / 100.0;
+        }
+        ui::SliderId::StartupDelay => {
+            app.startup_delay = (v.round() as i32).clamp(
+                app::MIN_STARTUP_DELAY as i32,
+                app::MAX_STARTUP_DELAY as i32,
+            ) as u32;
         }
         ui::SliderId::Threshold => {
             app.large_touch_threshold = (v as f64).clamp(20.0, 260.0);
@@ -1049,7 +1109,10 @@ fn activate_press(
     if app.confirm_quit {
         if let Some(h) = ui::confirm_hit(app, x, y) {
             match h {
-                ui::ConfirmHit::Yes => std::process::exit(0),
+                ui::ConfirmHit::Yes => {
+                    process_block::stop_daemon();
+                    std::process::exit(0);
+                }
                 ui::ConfirmHit::No => {
                     app.confirm_quit = false;
                     apply_input_shape(rt, app);

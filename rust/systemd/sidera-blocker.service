@@ -1,0 +1,11 @@
+[Unit]
+Description=Sidera process suspend helper
+Documentation=https://github.com/offduckling4825/Sidera--screen-annotate-for-linux
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sidera --blocker
+Restart=no
+TimeoutStopSec=5
+KillSignal=SIGTERM

@@ -29,10 +29,24 @@ fn write_temporary(path: &Path, temporary: &Path, content: &[u8]) -> io::Result<
     // create_new also refuses symlinks and concurrent writers using the same name.
     let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(temporary)?;
     file.write_all(content)?;
-    file.set_permissions(fs::Permissions::from_mode(permissions))?;
-    file.sync_all()?;
+    if let Err(error) = file.set_permissions(fs::Permissions::from_mode(permissions)) {
+        // FAT/exFAT and some network shares do not implement chmod. The data is
+        // still valid; do not discard settings just because metadata is limited.
+        log::warn!("无法保留设置文件权限：{error}");
+    }
+    if let Err(error) = file.sync_all() {
+        log::warn!("无法同步设置文件：{error}");
+    }
     fs::rename(temporary, path)?;
-    fs::File::open(temporary.parent().unwrap_or(Path::new(".")))?.sync_all()
+    match fs::File::open(temporary.parent().unwrap_or(Path::new("."))) {
+        Ok(directory) => {
+            if let Err(error) = directory.sync_all() {
+                log::warn!("无法同步设置目录：{error}");
+            }
+        }
+        Err(error) => log::warn!("无法打开设置目录：{error}"),
+    }
+    Ok(())
 }
 
 #[cfg(windows)]

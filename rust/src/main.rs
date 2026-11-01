@@ -306,6 +306,15 @@ fn run_application() -> Result<(), Box<dyn std::error::Error>> {
     let backend = startup::detect_backend()?;
     diag_log::info(&format!("Sidera {} 启动，后端：{:?}", app::VERSION, backend));
 
+    ui::ensure_autostart_flag();
+    if app::launched_by_autostart() {
+        let delay = app::load_startup_delay();
+        if delay > 0 {
+            diag_log::info(&format!("自动启动延迟 {delay} 秒，等待系统侧边栏就绪"));
+            std::thread::sleep(Duration::from_secs(u64::from(delay)));
+        }
+    }
+
     let single = single_instance()?;
     if single.is_none() {
         return Ok(());
@@ -421,12 +430,7 @@ fn run_application() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("WPS_API_DEBUG") {
         app.wps_debug = v == "1";
     }
-    if app.process_block_enabled {
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_secs(1));
-            process_block::run_configured();
-        });
-    }
+    process_block::set_daemon_enabled(app.process_block_enabled);
 
     let rt = Rt {
         backend: Box::new(x11::X11Plat::new(x11, win, gc)
@@ -739,7 +743,10 @@ fn run_application() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = x11.conn.flush();
                     rt.redraw_full(&app);
                 }
-                tray::TrayAction::Quit => std::process::exit(0),
+                tray::TrayAction::Quit => {
+                    process_block::stop_daemon();
+                    std::process::exit(0);
+                }
             }
         }
 
@@ -771,6 +778,11 @@ fn run_application() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(unix)]
 fn main() -> std::process::ExitCode {
+    if std::env::args().any(|arg| arg == "--blocker") {
+        return std::process::ExitCode::from(
+            sidera_core::process_block::run_blocker() as u8,
+        );
+    }
     linux::run()
 }
 

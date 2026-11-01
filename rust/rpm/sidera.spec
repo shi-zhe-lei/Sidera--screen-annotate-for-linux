@@ -40,6 +40,7 @@ tar xf %{SOURCE0} -C %{buildroot}
 /usr/share/pixmaps/sidera.svg
 /usr/share/pixmaps/sidera.png
 /usr/share/pixmaps/sidera-*.png
+/usr/lib/systemd/user/sidera-blocker.service
 /usr/lib/udev/rules.d/70-sidera-uinput.rules
 /usr/lib/udev/rules.d/70-sidera-input.rules
 /etc/modules-load.d/sidera-uinput.conf

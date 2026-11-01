@@ -177,12 +177,7 @@ impl Desktop {
         app::load_settings(&mut app);
         app.update_system_theme(crate::system_theme::dark());
         if let Ok(value) = std::env::var("WPS_API_DEBUG") { app.wps_debug = value == "1"; }
-        if app.process_block_enabled {
-            std::thread::spawn(|| {
-                std::thread::sleep(Duration::from_secs(1));
-                crate::process_block::run_configured();
-            });
-        }
+        crate::process_block::set_daemon_enabled(app.process_block_enabled);
         Self { outputs: BTreeMap::new(), wps: None, controls: Controls::read(&app),
             detached: VecDeque::new(), fonts, icon, icon_big, single, starting: true }
     }
@@ -353,7 +348,10 @@ impl Desktop {
                     }
                 }
                 crate::tray::TrayAction::Show => (),
-                crate::tray::TrayAction::Quit => std::process::exit(0),
+                crate::tray::TrayAction::Quit => {
+                    crate::process_block::stop_daemon();
+                    std::process::exit(0);
+                }
             }
         }
         let mut toggle = false;

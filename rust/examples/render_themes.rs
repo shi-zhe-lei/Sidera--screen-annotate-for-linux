@@ -4,6 +4,10 @@
 #[path = "../src/app.rs"] mod app;
 #[path = "../src/persistence.rs"] mod persistence;
 #[path = "../src/process_block.rs"] mod process_block;
+#[cfg(unix)]
+#[path = "../src/instance.rs"] mod instance;
+#[cfg(not(unix))]
+mod instance {}
 #[path = "../src/page_cache.rs"] mod page_cache;
 #[path = "../src/clear_history.rs"] mod clear_history;
 #[path = "../src/paint.rs"] mod paint;
