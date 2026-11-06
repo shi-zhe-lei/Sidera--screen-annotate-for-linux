@@ -527,10 +527,13 @@ class Manager:
         if result:
             raise RuntimeError("Sidera 已在运行（{}）。请先保存批注并正常退出，再切换版本；工具不会强制结束它。".format(", ".join(result)))
 
-    def run(self, executable, env, label, profile=None):
+    def run(self, executable, env, label, profile=None, autostart=False):
         self.log("启动：" + label)
+        args = [str(executable)]
+        if autostart:
+            args.append("--autostart")
         with (self.report / "app-output.log").open("ab") as output:
-            child = subprocess.Popen([str(executable)], env=env, cwd=str(executable.parent),
+            child = subprocess.Popen(args, env=env, cwd=str(executable.parent),
                                      stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
             self.log("程序进程 {} 已建立；是否可正常操作需人工确认。".format(child.pid))
             previous = self.autostart.enabled()
@@ -570,7 +573,7 @@ class Manager:
         code = self.run(binary, dict(os.environ), "原版 Sidera")
         self.result = "原版正常退出" if code == 0 else "原版启动/运行失败，退出码 " + str(code)
 
-    def launch(self):
+    def launch(self, autostart=False):
         self.busy()
         if not os.environ.get("DISPLAY"):
             raise RuntimeError("请在本机图形桌面内运行；当前没有 DISPLAY")
@@ -598,7 +601,7 @@ class Manager:
             for name in list(env):
                 if name.startswith("SIDERA_DEBUG") or name in ("SIDERA_SMOKE", "SIDERA_TEST_XTEST"):
                     env.pop(name)
-            code = self.run(directory / "bin/sidera", env, "课堂新版 " + state["version"], profile)
+            code = self.run(directory / "bin/sidera", env, "课堂新版 " + state["version"], profile, autostart)
             if code == 0:
                 self.result = "新版正常退出；功能验收由用户完成"
                 return
@@ -754,7 +757,7 @@ def main():
             if manager.autostart.recovered:
                 manager.original_launch()
             elif manager.autostart.enabled():
-                manager.launch()
+                manager.launch(autostart=True)
             else:
                 manager.result = "自启动未启用；未启动任何应用"
         else:

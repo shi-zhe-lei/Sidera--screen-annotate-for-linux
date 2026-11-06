@@ -62,12 +62,11 @@ pub enum SetHit {
     ResetSlider(SliderId),
     Autostart,
     WpsDebug,
-    WpsTest,
     WpsRemove,
     WpsRegister,
+    ProcessBlock,
     ThemeAccent,
     RightClick,
-    EraseTrig,
     ClearLog,
     SysInfo,
     Quit,
@@ -79,6 +78,7 @@ pub enum SetHit {
 pub enum SliderId {
     Alpha,
     Scale,
+    StartupDelay,
     Threshold,
     EraseScale,
 }
@@ -88,6 +88,7 @@ impl SliderId {
         match self {
             Self::Alpha => crate::app::DEFAULT_SIDEBAR_ALPHA as f32,
             Self::Scale => crate::app::DEFAULT_SB_SCALE as f32,
+            Self::StartupDelay => crate::app::DEFAULT_STARTUP_DELAY as f32,
             Self::Threshold => crate::app::DEFAULT_LARGE_TOUCH_THRESHOLD as f32,
             Self::EraseScale => crate::app::DEFAULT_LARGE_ERASE_SCALE10 as f32 / 10.0,
         }
@@ -100,10 +101,15 @@ pub use crate::toolbar::PresentationAction;
 pub enum PagePickerHit { Wheel, Cancel, Jump }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WhiteboardControl {
+    Dots,
+    DotSize,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Control {
     Sidebar(Btn, bool), Popup(PopupHit), More(MoreHit), Setting(SetHit),
     Slider(SliderId), Confirm(ConfirmHit), DiagClose,
-    PageCount(bool), PagePicker(PagePickerHit),
+    PageCount(bool), PagePicker(PagePickerHit), Whiteboard(WhiteboardControl),
 }
 
 pub fn control_enabled(app: &App, control: Control) -> bool {
@@ -153,6 +159,9 @@ pub fn control_at(app: &App, x: i32, y: i32) -> Option<Control> {
             .or_else(|| settings_hit(app, x, y).map(Control::Setting));
     }
     if app.more_menu_open { return more_menu_hit(app, x, y).map(Control::More); }
+    if app.whiteboard {
+        if let Some(hit) = whiteboard_control_hit(app, x, y) { return Some(Control::Whiteboard(hit)); }
+    }
     if app.page_picker.is_some() && page_picker_rect(app).contains(x, y) {
         return page_picker_hit(app, x, y).map(Control::PagePicker);
     }
@@ -181,6 +190,8 @@ pub fn control_rect(app: &App, control: Control) -> Option<R> {
             let offset = if hit == MoreHit::Screenshot { 0 } else { 48 };
             Some(R { x: m.x, y: m.y + offset, w: m.w, h: if offset == 0 { 48 } else { m.h - 48 } })
         }
+        Control::Whiteboard(WhiteboardControl::Dots) if app.whiteboard => Some(whiteboard_dots_toggle_rect(app)),
+        Control::Whiteboard(WhiteboardControl::DotSize) if app.whiteboard && app.whiteboard_dots => Some(whiteboard_dot_slider_rect(app)),
         Control::Popup(PopupHit::Color(i)) if app.pen_popup_visible && i < 10 => {
             let p = pen_popup_rect(app);
             Some(R { x: p.x + 16 + (i % 4) as i32 * 48, y: p.y + 46 + (i / 4) as i32 * 48, w: 38, h: 38 })
@@ -580,7 +591,7 @@ pub fn eraser_popup_rect(app: &App) -> R {
 pub fn more_menu_rect(app: &App) -> R {
     let sb = sidebar_rect(app, app.popup_on_right);
     let w = 170;
-    let h = 104;
+    let h = if app.more_settings_entry { 104 } else { 56 };
     let x = if app.popup_on_right {
         sb.x - w - 8
     } else {
@@ -662,9 +673,226 @@ pub fn more_menu_hit(app: &App, x: i32, y: i32) -> Option<MoreHit> {
     }
     if y < m.y + 48 {
         Some(MoreHit::Screenshot)
-    } else {
+    } else if app.more_settings_entry {
         Some(MoreHit::Settings)
+    } else {
+        None
     }
+}
+
+pub fn whiteboard_bar_rect(app: &App) -> R {
+    let w = 340.min((app.screen_w - 96).max(240));
+    R {
+        x: (app.screen_w - w) / 2,
+        y: app.screen_h - 66,
+        w,
+        h: 54,
+    }
+}
+
+pub fn whiteboard_dots_toggle_rect(app: &App) -> R {
+    let b = whiteboard_bar_rect(app);
+    R {
+        x: b.x + 12,
+        y: b.y + 8,
+        w: 116,
+        h: 38,
+    }
+}
+
+pub fn whiteboard_dot_slider_rect(app: &App) -> R {
+    let b = whiteboard_bar_rect(app);
+    R {
+        x: b.x + 142,
+        y: b.y + 14,
+        w: (b.w - 158).max(80),
+        h: 26,
+    }
+}
+
+pub fn whiteboard_control_hit(app: &App, x: i32, y: i32) -> Option<WhiteboardControl> {
+    if !app.whiteboard || !whiteboard_bar_rect(app).contains(x, y) {
+        return None;
+    }
+    if whiteboard_dots_toggle_rect(app).contains(x, y) {
+        return Some(WhiteboardControl::Dots);
+    }
+    if app.whiteboard_dots && whiteboard_dot_slider_rect(app).contains(x, y) {
+        return Some(WhiteboardControl::DotSize);
+    }
+    None
+}
+
+pub fn whiteboard_dot_size_at(app: &App, x: i32) -> i32 {
+    let r = whiteboard_dot_slider_rect(app);
+    let t = ((x - r.x) as f32 / r.w.max(1) as f32).clamp(0.0, 1.0);
+    (1.0 + t * 9.0).round() as i32
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ProcessHit {
+    Enable,
+    Input,
+    Add,
+    Paste,
+    Scan,
+    Done,
+    ScrollUp,
+    ScrollDown,
+    Rule(usize),
+    Proc(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ProcessRow {
+    Rule(usize),
+    Proc(usize),
+}
+
+
+pub fn process_block_rect(app: &App) -> R {
+    let w = 620.min((app.screen_w - 24).max(320));
+    let h = 560.min((app.screen_h - 24).max(320));
+    R {
+        x: (app.screen_w - w) / 2,
+        y: (app.screen_h - h) / 2,
+        w,
+        h,
+    }
+}
+
+fn process_row_height() -> i32 {
+    34
+}
+
+pub fn process_visible_rows(app: &App) -> usize {
+    ((process_block_rect(app).h - 304) / process_row_height()).max(1) as usize
+}
+
+pub fn process_rows(app: &App) -> Vec<(ProcessRow, String, String)> {
+    let mut rows = Vec::new();
+    for (index, rule) in app.process_rules.iter().enumerate() {
+        rows.push((ProcessRow::Rule(index), rule.clone(), "点击移除".into()));
+    }
+    for (index, proc) in app.process_scan.iter().enumerate() {
+        let added = app
+            .process_rules
+            .iter()
+            .any(|rule| crate::process_block::matches(rule, proc));
+        let detail = if added {
+            format!("已添加 · {}", proc.exe)
+        } else {
+            format!("pid {} · {}", proc.pid, proc.exe)
+        };
+        rows.push((ProcessRow::Proc(index), proc.name.clone(), detail));
+    }
+    rows
+}
+
+pub fn process_block_controls(app: &App) -> Vec<(ProcessHit, R)> {
+    let p = process_block_rect(app);
+    let mut controls = vec![
+        (
+            ProcessHit::Enable,
+            R {
+                x: p.x + 20,
+                y: p.y + 60,
+                w: 220,
+                h: 36,
+            },
+        ),
+        (
+            ProcessHit::Input,
+            R {
+                x: p.x + 20,
+                y: p.y + 110,
+                w: p.w - 190,
+                h: 38,
+            },
+        ),
+        (
+            ProcessHit::Add,
+            R {
+                x: p.x + p.w - 158,
+                y: p.y + 110,
+                w: 64,
+                h: 38,
+            },
+        ),
+        (
+            ProcessHit::Paste,
+            R {
+                x: p.x + p.w - 88,
+                y: p.y + 110,
+                w: 68,
+                h: 38,
+            },
+        ),
+        (
+            ProcessHit::Scan,
+            R {
+                x: p.x + 20,
+                y: p.y + 160,
+                w: 112,
+                h: 34,
+            },
+        ),
+        (
+            ProcessHit::ScrollUp,
+            R {
+                x: p.x + p.w - 126,
+                y: p.y + 160,
+                w: 48,
+                h: 34,
+            },
+        ),
+        (
+            ProcessHit::ScrollDown,
+            R {
+                x: p.x + p.w - 72,
+                y: p.y + 160,
+                w: 52,
+                h: 34,
+            },
+        ),
+        (
+            ProcessHit::Done,
+            R {
+                x: p.x + p.w - 118,
+                y: p.y + p.h - 54,
+                w: 98,
+                h: 36,
+            },
+        ),
+    ];
+    let rows = process_rows(app);
+    let start = app.process_scroll.min(rows.len().saturating_sub(1));
+    let visible = process_visible_rows(app);
+    for (offset, (row, _, _)) in rows.iter().enumerate().skip(start).take(visible) {
+        let hit = match row {
+            ProcessRow::Rule(i) => ProcessHit::Rule(*i),
+            ProcessRow::Proc(i) => ProcessHit::Proc(*i),
+        };
+        controls.push((
+            hit,
+            R {
+                x: p.x + 20,
+                y: p.y + 206 + (offset - start) as i32 * process_row_height(),
+                w: p.w - 40,
+                h: process_row_height() - 4,
+            },
+        ));
+    }
+    controls
+}
+
+pub fn process_block_hit(app: &App, x: i32, y: i32) -> Option<ProcessHit> {
+    if !app.process_block_open || !process_block_rect(app).contains(x, y) {
+        return None;
+    }
+    process_block_controls(app)
+        .into_iter()
+        .find_map(|(hit, rect)| rect.contains(x, y).then_some(hit))
 }
 
 pub fn settings_rect(app: &App) -> R {
@@ -711,13 +939,8 @@ fn settings_row_y(app: &App, row: i32) -> i32 {
     settings_rect(app).y + 84 + (row - (l.page * l.rows) as i32) * l.stride
 }
 
-fn settings_wps_test_row(app: &App) -> i32 {
-    if app.erase_by_finger { 6 } else { 8 }
-}
-
-/// 大触点相关行起始（手背模式才有阈值/倍率，动作键随之移位）
-fn settings_accent_row(app: &App) -> i32 {
-    settings_wps_test_row(app) + 3
+fn settings_accent_row(_app: &App) -> i32 {
+    11
 }
 
 fn settings_action_start(app: &App) -> i32 {
@@ -767,12 +990,11 @@ pub fn settings_sliders(app: &App) -> Vec<SliderDef> {
         mk(SliderId::Alpha, 0, 30.0, 255.0, app.sidebar_alpha as f32, 1.0, "侧边栏透明度", false),
         mk(SliderId::Scale, 1, 0.6, 1.4, app.sb_scale as f32, 0.01, "侧边栏大小", true),
     ];
-    if !app.erase_by_finger {
-        v.push(mk(SliderId::Threshold, 6, 20.0, 260.0, app.large_touch_threshold as f32, 10.0, "大触点阈值", false));
-        v.push(mk(SliderId::EraseScale, 7, 0.8, 2.5, app.large_erase_scale10 as f32 / 10.0, 0.1, "大触点橡皮倍率", true));
-    }
+    v.push(mk(SliderId::StartupDelay, 2, 5.0, 20.0, app.startup_delay as f32, 1.0, "自动启动延迟 (秒)", false));
+    v.push(mk(SliderId::Threshold, 6, 20.0, 260.0, app.large_touch_threshold as f32, 10.0, "大触点阈值", false));
+    v.push(mk(SliderId::EraseScale, 7, 0.8, 2.5, app.large_erase_scale10 as f32 / 10.0, 0.1, "大触点橡皮倍率", true));
     v.retain(|s| settings_row_visible(app, match s.id {
-        SliderId::Alpha => 0, SliderId::Scale => 1,
+        SliderId::Alpha => 0, SliderId::Scale => 1, SliderId::StartupDelay => 2,
         SliderId::Threshold => 6, SliderId::EraseScale => 7,
     }));
     v
@@ -792,25 +1014,23 @@ pub fn settings_controls(app: &App) -> Vec<(SetHit, R)> {
     };
     let a = settings_action_start(app);
     let accent_row = settings_accent_row(app);
-    let test_row = settings_wps_test_row(app);
     let mut controls = vec![
-        (SetHit::Autostart, full(2)),
-        (SetHit::WpsDebug, full(3)),
-        (SetHit::WpsTest, full(test_row)),
-        (SetHit::WpsRemove, full(test_row + 1)),
-        (SetHit::WpsRegister, full(test_row + 2)),
+        (SetHit::Autostart, full(3)),
+        (SetHit::WpsDebug, full(4)),
+        (SetHit::WpsRemove, full(8)),
+        (SetHit::WpsRegister, full(9)),
+        (SetHit::ProcessBlock, full(10)),
         (SetHit::ThemeAccent, full(accent_row)),
-        (SetHit::RightClick, full(4)),
-        (SetHit::EraseTrig, full(5)),
+        (SetHit::RightClick, full(5)),
         (SetHit::ClearLog, full(a)),
         (SetHit::SysInfo, full(a + 1)),
         (SetHit::Quit, full(a + 2)),
     ];
     controls.retain(|(hit, _)| settings_row_visible(app, match hit {
-        SetHit::Autostart => 2, SetHit::WpsDebug => 3, SetHit::WpsTest => test_row,
-        SetHit::WpsRemove => test_row + 1, SetHit::WpsRegister => test_row + 2,
+        SetHit::Autostart => 3, SetHit::WpsDebug => 4,
+        SetHit::WpsRemove => 8, SetHit::WpsRegister => 9, SetHit::ProcessBlock => 10,
         SetHit::ThemeAccent => accent_row,
-        SetHit::RightClick => 4, SetHit::EraseTrig => 5,
+        SetHit::RightClick => 5,
         SetHit::ClearLog => a, SetHit::SysInfo => a + 1,
         SetHit::Quit => a + 2, _ => unreachable!(),
     }));
@@ -1075,16 +1295,19 @@ pub fn draw_input_group_prompt(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
 }
 
 // ---------------- 设置面板用到的外部状态 ----------------
+#[cfg(unix)]
 pub fn autostart_path() -> std::path::PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("autostart/sidera.desktop")
 }
 
+#[cfg(unix)]
 pub fn is_autostart() -> bool {
     autostart_path().exists()
 }
 
+#[cfg(unix)]
 fn autostart_icon() -> String {
     for path in ["/usr/share/pixmaps/sidera.png",
                  "/usr/share/icons/hicolor/256x256/apps/sidera.png",
@@ -1096,6 +1319,7 @@ fn autostart_icon() -> String {
     "sidera".to_string()
 }
 
+#[cfg(unix)]
 pub fn set_autostart(on: bool) {
     let p = autostart_path();
     if on {
@@ -1103,7 +1327,7 @@ pub fn set_autostart(on: bool) {
             let _ = std::fs::create_dir_all(parent);
         }
         let entry = format!(
-            "[Desktop Entry]\nType=Application\nName=Sidera\nComment=Sidera软件\nExec=sidera\nIcon={}\nTerminal=false\n",
+            "[Desktop Entry]\nType=Application\nName=Sidera\nComment=Sidera软件\nExec=sidera --autostart\nIcon={}\nTerminal=false\n",
             autostart_icon());
         let _ = std::fs::write(p, entry);
     } else {
@@ -1111,7 +1335,107 @@ pub fn set_autostart(on: bool) {
     }
 }
 
+#[cfg(unix)]
+pub fn ensure_autostart_flag() {
+    let path = autostart_path();
+    let Ok(mut content) = std::fs::read_to_string(&path) else { return; };
+    if content.contains("--autostart") { return; }
+    if content.lines().any(|line| line.trim() == "Exec=sidera") {
+        content = content.replace("Exec=sidera", "Exec=sidera --autostart");
+        if let Err(error) = crate::persistence::atomic_write(&path, content.as_bytes()) {
+            log::warn!("更新自启动参数失败：{error}");
+        }
+    }
+}
+
+#[cfg(windows)]
+fn wide_autostart(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+pub fn is_autostart() -> bool {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW};
+    let subkey = wide_autostart(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    let value = wide_autostart("Sidera");
+    let mut data = [0u16; 1024];
+    let mut size = (data.len() * 2) as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            data.as_mut_ptr() as *mut std::ffi::c_void,
+            &mut size,
+        )
+    };
+    status == 0 && size > 2
+}
+
+#[cfg(windows)]
+pub fn set_autostart(on: bool) {
+    use windows_sys::Win32::System::Registry::{
+        HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW,
+    };
+    let subkey = wide_autostart(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    let value = wide_autostart("Sidera");
+    unsafe {
+        if on {
+            let exe = std::env::current_exe().unwrap_or_default();
+            let data = wide_autostart(&format!("\"{}\" --autostart", exe.display()));
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                REG_SZ,
+                data.as_ptr() as *const std::ffi::c_void,
+                (data.len() * 2) as u32,
+            );
+        } else {
+            RegDeleteKeyValueW(HKEY_CURRENT_USER, subkey.as_ptr(), value.as_ptr());
+        }
+    }
+}
+
 // ---------------- 绘制 ----------------
+// ---------------- 绘制 ----------------
+fn draw_whiteboard_dots(
+    pm: &mut Pixmap,
+    app: &App,
+    x: i32,
+    y: i32,
+    x2: i32,
+    y2: i32,
+    tr: Transform,
+) {
+    let pitch = crate::app::WHITEBOARD_DOT_PITCH.max(4);
+    let radius = app.whiteboard_dot_size.clamp(1, 10) as f32;
+    let mut dot = theme::on_color(app.whiteboard_bg_color());
+    dot.set_alpha(0.20);
+    let paint = Paint {
+        shader: Shader::SolidColor(dot),
+        anti_alias: true,
+        ..Default::default()
+    };
+    let sx = (x / pitch) * pitch;
+    let sy = (y / pitch) * pitch;
+    let mut path = PathBuilder::new();
+    let mut gy = sy;
+    while gy <= y2 {
+        let mut gx = sx;
+        while gx <= x2 {
+            path.push_circle(gx as f32, gy as f32, radius);
+            gx += pitch;
+        }
+        gy += pitch;
+    }
+    if let Some(path) = path.finish() {
+        pm.fill_path(&path, &paint, FillRule::Winding, tr, None);
+    }
+}
+
 pub fn render_region(
     app: &App,
     fonts: &Fonts,
@@ -1141,6 +1465,7 @@ pub fn render_region(
     // 背景
     if app.whiteboard {
         pm.fill(app.whiteboard_bg_color());
+        if app.whiteboard_dots { draw_whiteboard_dots(&mut pm, app, x, y, x2, y2, tr); }
     }
 
     // 画布（本身已是物理分辨率，按逻辑原点换算后 1:1 贴入）
@@ -1234,6 +1559,8 @@ pub fn render_region(
             }
         }
 
+        if app.whiteboard { draw_whiteboard_controls(app, fonts, &mut ctx); }
+
         let sidebar_progress = app.sidebar_retract();
         draw_sidebar(app, fonts, &mut ctx, false, sidebar_progress);
         draw_sidebar(app, fonts, &mut ctx, true, sidebar_progress);
@@ -1250,6 +1577,9 @@ pub fn render_region(
         }
         if app.settings_open {
             draw_settings(app, fonts, &mut ctx, icon);
+        }
+        if app.process_block_open {
+            draw_process_block(app, fonts, &mut ctx);
         }
         if app.confirm_quit {
             draw_confirm(app, fonts, &mut ctx);
@@ -1601,14 +1931,14 @@ fn draw_eraser_popup(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
     panel(ctx, p, 16.0, t);
     if t < 0.02 { return; }
     ctx.text(fonts, "橡皮大小", (p.x + 16) as f32, (p.y + 32) as f32, 21.0, c(palette.text));
-    let size = [21.0, 24.0, 27.0][app.cur_eraser.min(2)];
+    let size = [22.0, 27.0, 32.0][app.cur_eraser.min(2)];
     icons::draw(ctx, Glyph::Eraser, p.x as f32 + p.w as f32 - 30.0 - size / 2.0,
         p.y as f32 + 24.0 - size / 2.0, size, c(palette.text), c(palette.eraser));
     let bw = (p.w - 52) / 3;
-    for (i, label) in ["小 12", "中 24", "大 48"].iter().enumerate() {
+    for (i, label) in ["小 30", "中 60", "大 80"].iter().enumerate() {
         let r = R { x: p.x + 16 + i as i32 * (bw + 10), y: p.y + 46, w: bw, h: 48 };
         choice(ctx, r, i == app.cur_eraser);
-        let size = [18.0, 21.0, 24.0][i];
+        let size = [20.0, 25.0, 30.0][i];
         icons::draw(ctx, Glyph::Eraser, r.x as f32 + 19.0 - size / 2.0, r.y as f32 + 24.0 - size / 2.0,
             size, c(palette.text), c(palette.eraser));
         ctx.text_center(fonts, R { x: r.x + 33, w: r.w - 37, ..r }, label, 18.0, c(palette.text));
@@ -1624,12 +1954,261 @@ fn draw_more_menu(fonts: &Fonts, ctx: &mut Ctx, app: &App) {
     let t = anim_t(app);
     panel(ctx, m, 14.0, t);
     if t < 0.02 { return; }
-    ctx.stroke_line(((m.x + 14) as f32, (m.y + 48) as f32),
-        ((m.x + m.w - 14) as f32, (m.y + 48) as f32), c(palette.border), 1.0);
-    for (row, glyph, label) in [(0, Glyph::Camera, "截图"), (1, Glyph::Settings, "设置")] {
+    let mut rows = vec![(0, Glyph::Camera, "截图")];
+    if app.more_settings_entry { rows.push((1, Glyph::Settings, "设置")); }
+    if rows.len() > 1 {
+        ctx.stroke_line(((m.x + 14) as f32, (m.y + 48) as f32),
+            ((m.x + m.w - 14) as f32, (m.y + 48) as f32), c(palette.border), 1.0);
+    }
+    for (row, glyph, label) in rows {
         let y = m.y + row * 48;
         icons::draw(ctx, glyph, (m.x + 18) as f32, (y + 12) as f32, 24.0, c(palette.accent), c(palette.accent));
         ctx.text(fonts, label, (m.x + 58) as f32, (y + 31) as f32, 21.0, c(palette.text));
+    }
+}
+
+fn draw_whiteboard_controls(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
+    let palette = ctx.palette;
+    let bar = whiteboard_bar_rect(app);
+    panel(ctx, bar, 12.0, 1.0);
+    let toggle = whiteboard_dots_toggle_rect(app);
+    ctx.text(
+        fonts,
+        "点阵",
+        (toggle.x + 4) as f32,
+        (toggle.y + 25) as f32,
+        19.0,
+        c(palette.text),
+    );
+    let sw = R {
+        x: toggle.x + toggle.w - 52,
+        y: toggle.y + 8,
+        w: 44,
+        h: 22,
+    };
+    ctx.fill_round(
+        sw,
+        11.0,
+        c(if app.whiteboard_dots {
+            palette.accent
+        } else {
+            palette.muted
+        }),
+    );
+    let cx = sw.x + if app.whiteboard_dots { 33 } else { 11 };
+    ctx.fill_circle(cx as f32, (sw.y + 11) as f32, 8.0, c(palette.on_accent));
+    if app.whiteboard_dots {
+        let r = whiteboard_dot_slider_rect(app);
+        let t = ((app.whiteboard_dot_size - 1) as f32 / 9.0).clamp(0.0, 1.0);
+        ctx.fill_round(r, 13.0, c(palette.accent_light));
+        let knob = R {
+            x: r.x + ((r.w - 22) as f32 * t) as i32,
+            y: r.y,
+            w: 22,
+            h: r.h,
+        };
+        ctx.fill_round(knob, 11.0, c(palette.accent));
+        ctx.text_center(
+            fonts,
+            R {
+                x: r.x,
+                y: r.y - 2,
+                w: r.w,
+                h: r.h,
+            },
+            &format!("点大小 {}", app.whiteboard_dot_size),
+            15.0,
+            c(palette.text),
+        );
+    }
+}
+
+fn draw_process_block(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
+    let palette = ctx.palette;
+    let p = process_block_rect(app);
+    panel(ctx, p, 18.0, 1.0);
+    ctx.text(
+        fonts,
+        "进程屏蔽",
+        (p.x + 22) as f32,
+        (p.y + 38) as f32,
+        26.0,
+        c(palette.text),
+    );
+    ctx.text(
+        fonts,
+        "启动 Sidera 后结束匹配的当前用户进程",
+        (p.x + 150) as f32,
+        (p.y + 37) as f32,
+        15.0,
+        c(palette.muted),
+    );
+    let enable = process_block_controls(app)
+        .into_iter()
+        .find(|(hit, _)| *hit == ProcessHit::Enable)
+        .unwrap()
+        .1;
+    ctx.text(
+        fonts,
+        "启用进程屏蔽",
+        (enable.x + 4) as f32,
+        (enable.y + 25) as f32,
+        19.0,
+        c(palette.text),
+    );
+    let sw = R {
+        x: enable.x + enable.w - 52,
+        y: enable.y + 7,
+        w: 44,
+        h: 22,
+    };
+    ctx.fill_round(
+        sw,
+        11.0,
+        c(if app.process_block_enabled {
+            palette.accent
+        } else {
+            palette.muted
+        }),
+    );
+    let cx = sw.x + if app.process_block_enabled { 33 } else { 11 };
+    ctx.fill_circle(cx as f32, (sw.y + 11) as f32, 8.0, c(palette.on_accent));
+
+    let input = process_block_controls(app)
+        .into_iter()
+        .find(|(hit, _)| *hit == ProcessHit::Input)
+        .unwrap()
+        .1;
+    surface(
+        ctx,
+        input,
+        8.0,
+        c(palette.paper),
+        c(if app.process_input_active {
+            palette.accent
+        } else {
+            palette.border
+        }),
+    );
+    let shown: String = app.process_input.chars().take(42).collect();
+    let text = if shown.is_empty() && !app.process_input_active {
+        "输入进程名或可执行文件路径".to_string()
+    } else {
+        shown
+    };
+    ctx.text(
+        fonts,
+        &text,
+        (input.x + 10) as f32,
+        (input.y + 26) as f32,
+        18.0,
+        c(
+            if app.process_input.is_empty() && !app.process_input_active {
+                palette.muted
+            } else {
+                palette.text
+            },
+        ),
+    );
+
+    for (hit, r) in process_block_controls(app) {
+        match hit {
+            ProcessHit::Add
+            | ProcessHit::Paste
+            | ProcessHit::Scan
+            | ProcessHit::ScrollUp
+            | ProcessHit::ScrollDown
+            | ProcessHit::Done => {
+                let (label, accent) = match hit {
+                    ProcessHit::Add => ("添加", true),
+                    ProcessHit::Paste => ("粘贴", false),
+                    ProcessHit::Scan => ("扫描进程", false),
+                    ProcessHit::ScrollUp => ("上翻", false),
+                    ProcessHit::ScrollDown => ("下翻", false),
+                    _ => ("完成", true),
+                };
+                surface(
+                    ctx,
+                    r,
+                    8.0,
+                    c(if accent {
+                        palette.accent_light
+                    } else {
+                        palette.surface
+                    }),
+                    c(if accent {
+                        palette.accent_line
+                    } else {
+                        palette.border
+                    }),
+                );
+                ctx.text_center(
+                    fonts,
+                    r,
+                    label,
+                    18.0,
+                    c(if accent { palette.accent } else { palette.text }),
+                );
+            }
+            ProcessHit::Rule(_) | ProcessHit::Proc(_) => {
+                let rows = process_rows(app);
+                let index = match hit {
+                    ProcessHit::Rule(i) => i,
+                    ProcessHit::Proc(i) => app.process_rules.len() + i,
+                    _ => continue,
+                };
+                let Some((_, label, detail)) = rows.get(index) else {
+                    continue;
+                };
+                let active = matches!(hit, ProcessHit::Rule(_));
+                surface(
+                    ctx,
+                    r,
+                    8.0,
+                    c(if active {
+                        palette.danger_light
+                    } else {
+                        palette.surface
+                    }),
+                    if active {
+                        alpha(palette.danger, 70)
+                    } else {
+                        c(palette.border)
+                    },
+                );
+                ctx.text(
+                    fonts,
+                    label,
+                    (r.x + 12) as f32,
+                    (r.y + 21) as f32,
+                    17.0,
+                    c(palette.text),
+                );
+                ctx.text(
+                    fonts,
+                    detail,
+                    (r.x + r.w - 220) as f32,
+                    (r.y + 21) as f32,
+                    14.0,
+                    c(palette.muted),
+                );
+            }
+            _ => {}
+        }
+    }
+    if process_rows(app).is_empty() {
+        ctx.text_center(
+            fonts,
+            R {
+                x: p.x + 20,
+                y: p.y + 250,
+                w: p.w - 40,
+                h: 60,
+            },
+            "暂无规则，输入进程名或点击“扫描进程”",
+            17.0,
+            c(palette.muted),
+        );
     }
 }
 
@@ -1663,7 +2242,8 @@ fn draw_settings(app: &App, fonts: &Fonts, ctx: &mut Ctx, icon: Option<&Pixmap>)
     for s in &settings_sliders(app) {
         let ry = s.hit.y;
         let label = match s.id {
-            SliderId::Alpha => "工具栏不透明度", SliderId::Scale => "工具栏大小", _ => s.label,
+            SliderId::Alpha => "工具栏不透明度", SliderId::Scale => "工具栏大小",
+            SliderId::StartupDelay => "自动启动延迟 (秒)", _ => s.label,
         };
         let baseline = ry + if p.w < 420 { -4 } else { 27 };
         ctx.text(fonts, label, (p.x + 26) as f32, baseline as f32, 22.0, c(palette.text));
@@ -1681,6 +2261,7 @@ fn draw_settings(app: &App, fonts: &Fonts, ctx: &mut Ctx, icon: Option<&Pixmap>)
         let value = match s.id {
             SliderId::Alpha => format!("{:.0}%", s.value / 255.0 * 100.0),
             SliderId::Scale => format!("{:.0}%", s.value * 100.0),
+            SliderId::StartupDelay => format!("{:.0}s", s.value),
             SliderId::EraseScale | SliderId::Threshold => {
                 let number = if s.signed { format!("{:.1}", s.value) } else { format!("{:.0}", s.value) };
                 if s.id == SliderId::EraseScale { format!("{number}×") } else { number }
@@ -1704,11 +2285,10 @@ fn draw_settings(app: &App, fonts: &Fonts, ctx: &mut Ctx, icon: Option<&Pixmap>)
                 surface(ctx, r, 8.0, c(palette.paper), c(palette.accent_line));
                 ctx.text_center(fonts, r, "默认", 18.0, c(palette.accent));
             }
-            SetHit::Autostart | SetHit::WpsDebug | SetHit::WpsTest | SetHit::RightClick => {
+            SetHit::Autostart | SetHit::WpsDebug | SetHit::RightClick => {
                 let (label, on) = match hit {
                     SetHit::Autostart => ("开机自启动", is_autostart()),
                     SetHit::WpsDebug => ("WPS 联动", app.wps_debug),
-                    SetHit::WpsTest => ("WPS 测试模式", app.wps_test_mode),
                     _ => ("右键切回光标", app.right_click_cursor_on),
                 };
                 ctx.text(fonts, label, (r.x + 14) as f32, (r.y + 27) as f32, 22.0, c(palette.text));
@@ -1729,6 +2309,13 @@ fn draw_settings(app: &App, fonts: &Fonts, ctx: &mut Ctx, icon: Option<&Pixmap>)
                 ctx.text(fonts, "重新登记 WPS 加载项", (r.x + 14) as f32, (r.y + 27) as f32,
                     22.0, c(palette.accent));
             }
+            SetHit::ProcessBlock => {
+                ctx.text(fonts, "进程屏蔽", (r.x + 14) as f32, (r.y + 27) as f32, 22.0, c(palette.text));
+                let badge = R { x: r.x + r.w - 88, y: r.y + 5, w: 74, h: 28 };
+                ctx.fill_round(badge, 8.0, c(if app.process_block_enabled { palette.accent_light } else { palette.surface }));
+                ctx.text_center(fonts, badge, if app.process_block_enabled { "已启用" } else { "未启用" }, 17.0,
+                    c(if app.process_block_enabled { palette.accent } else { palette.muted }));
+            }
             SetHit::ThemeAccent => {
                 ctx.text(fonts, "主题强调色", (r.x + 14) as f32, (r.y + 27) as f32,
                     22.0, c(palette.text));
@@ -1737,12 +2324,6 @@ fn draw_settings(app: &App, fonts: &Fonts, ctx: &mut Ctx, icon: Option<&Pixmap>)
                 ctx.fill_circle((badge.x + 16) as f32, (badge.y + 14) as f32, 8.0, c(palette.accent));
                 ctx.text(fonts, app.theme.accent.label(), (badge.x + 30) as f32,
                     (badge.y + 20) as f32, 17.0, c(palette.accent));
-            }
-            SetHit::EraseTrig => {
-                ctx.text(fonts, "橡皮触发方式", (r.x + 14) as f32, (r.y + 27) as f32, 22.0, c(palette.text));
-                let badge = R { x: r.x + r.w - 88, y: r.y + 5, w: 74, h: 28 };
-                ctx.fill_round(badge, 8.0, c(palette.accent_light));
-                ctx.text_center(fonts, badge, if app.erase_by_finger { "多指" } else { "手背" }, 18.0, c(palette.accent));
             }
             SetHit::ClearLog | SetHit::SysInfo => {
                 let label = if hit == SetHit::SysInfo { "诊断信息 / 日志" }
@@ -1799,10 +2380,9 @@ mod tests {
     fn small_settings_reach_every_control_without_overlap_or_offscreen_targets() {
         for (w, h) in [(320, 240), (360, 640), (480, 270), (640, 360), (980, 512),
             (1024, 600), (1280, 720), (1920, 1080)] {
-            for fingers in [false, true] {
+            {
                 let mut a = App::new(Pixmap::new(w, h).unwrap(), w as i32, h as i32);
                 a.settings_open = true;
-                a.erase_by_finger = fingers;
                 let mut reached = Vec::new();
                 let mut sliders = Vec::new();
                 let panel = settings_rect(&a);
@@ -1828,13 +2408,13 @@ mod tests {
                         if !sliders.contains(&s.id) { sliders.push(s.id); }
                     }
                 }
-                for expected in [SetHit::Autostart, SetHit::WpsDebug, SetHit::WpsTest,
-                    SetHit::WpsRemove, SetHit::WpsRegister, SetHit::ThemeAccent,
-                    SetHit::RightClick, SetHit::EraseTrig,
+                for expected in [SetHit::Autostart, SetHit::WpsDebug,
+                    SetHit::WpsRemove, SetHit::WpsRegister, SetHit::ProcessBlock, SetHit::ThemeAccent,
+                    SetHit::RightClick,
                     SetHit::ClearLog, SetHit::SysInfo, SetHit::Quit, SetHit::Done] {
                     assert!(reached.contains(&expected), "unreachable {expected:?} at {w}x{h}");
                 }
-                assert_eq!(sliders.len(), if fingers { 2 } else { 4 });
+                assert_eq!(sliders.len(), 5);
                 for id in sliders { assert!(reached.contains(&SetHit::ResetSlider(id))); }
                 assert!(!settings_change_page(&mut a, i32::MAX));
                 settings_change_page(&mut a, i32::MIN);
@@ -1845,10 +2425,9 @@ mod tests {
     }
 
     #[test]
-    fn settings_page_clamps_after_resize_or_removing_touch_rows() {
+    fn settings_page_clamps_after_resize() {
         let mut a = App::new(Pixmap::new(640, 360).unwrap(), 640, 360);
         a.settings_page = usize::MAX;
-        a.erase_by_finger = true;
         assert!(settings_layout(&a).page < settings_layout(&a).pages);
         assert!(settings_controls(&a).iter().any(|(hit, _)| *hit == SetHit::Quit));
         a.screen_h = 1080;
@@ -1885,8 +2464,7 @@ mod tests {
     fn settings_controls_are_hittable() {
         let mut app = app();
         app.settings_open = true;
-        for fingers in [false, true] {
-            app.erase_by_finger = fingers;
+        {
             for (hit, r) in settings_controls(&app) {
                 if matches!(hit, SetHit::Theme(_)) {
                     assert!(r.h >= 32 && r.w >= 80);
@@ -1938,6 +2516,9 @@ mod tests {
             more_menu_hit(&app, m.x + m.w / 2, m.y + 18),
             Some(MoreHit::Screenshot)
         );
+        assert_eq!(more_menu_hit(&app, m.x + m.w / 2, m.y + 54), None);
+        app.more_settings_entry = true;
+        let m = more_menu_rect(&app);
         assert_eq!(
             more_menu_hit(&app, m.x + m.w / 2, m.y + 54),
             Some(MoreHit::Settings)
@@ -1987,3 +2568,26 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod whiteboard_dot_tests {
+    use super::*;
+    use crate::text::Fonts;
+    use tiny_skia::{Color, Pixmap};
+
+    #[test]
+    fn dots_render_behind_ink_only_when_enabled() {
+        let fonts = Fonts::load();
+        let mut app = App::new(Pixmap::new(128, 128).unwrap(), 128, 128);
+        app.whiteboard = true;
+        app.whiteboard_bg_index = 1;
+        app.whiteboard_dots = false;
+        let plain = render_region(&app, &fonts, None, 0, 0, 64, 64).unwrap();
+        app.whiteboard_dots = true;
+        app.whiteboard_dot_size = 4;
+        let dotted = render_region(&app, &fonts, None, 0, 0, 64, 64).unwrap();
+        assert!(plain.data() != dotted.data());
+        assert!(app.canvas.data().iter().all(|byte| *byte == 0));
+        let _ = Color::WHITE;
+    }
+}

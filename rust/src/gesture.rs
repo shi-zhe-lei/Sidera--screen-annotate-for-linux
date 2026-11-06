@@ -77,28 +77,33 @@ pub fn touch_event(
         app.last_pen_w = app.timed_pen_width();
     }
 
-    let n = now.len().max(app.touch_frame_contacts);
     let any_large = diameter >= app.large_touch_threshold;
-    // 手背模式只认接触面积；多指只在“多指橡皮”模式下生效。
-    let large_trigger = (!app.erase_by_finger) && any_large;
-    let multi_trigger = app.erase_by_finger && n >= 2;
-    if large_trigger || multi_trigger {
+    // 大接触面积（手背/手掌）临时作为橡皮；所有小触点都可以同时绘画。
+    if any_large {
         app.t_palm_latched = true;
     }
-    if large_trigger {
+    if any_large {
         app.palm_erase_w = ((diameter * app.large_erase_scale10 as f64 / 10.0).round() as i32)
             .clamp(PALM_ERASE_WIDTH, 1024);
     } else {
         app.palm_erase_w = PALM_ERASE_WIDTH;
     }
     if app.t_begin_role == 0 && !now.is_empty() {
-        app.t_begin_role = if mode_erase_only || app.t_palm_latched { 2 } else { 1 };
+        app.t_begin_role = if mode_erase_only || app.t_palm_latched {
+            2
+        } else {
+            1
+        };
         let bp = app.t_begin_pos;
         if app.t_begin_role == 1 {
             stroke_tapered(app, bp, bp, app.last_pen_w, app.last_pen_w);
             dirty = Some(dirty_of(bp, bp, app.last_pen_w));
         } else {
-            let w = if mode == 2 { app.eraser_width() } else { app.palm_erase_w };
+            let w = if mode == 2 {
+                app.eraser_width()
+            } else {
+                app.palm_erase_w
+            };
             stroke_segment(app, bp, bp, true, w);
             dirty = Some(dirty_of(bp, bp, w));
         }
@@ -106,20 +111,13 @@ pub fn touch_event(
 
     let mut ids: Vec<i32> = now.keys().cloned().collect();
     ids.sort_unstable();
-    let pen_id = if !mode_erase_only && !app.t_palm_latched && !ids.is_empty() {
-        ids[0]
-    } else {
-        -1
-    };
 
     let mut role_map = std::collections::HashMap::new();
     for &i in &ids {
         let role = if mode_erase_only || app.t_palm_latched {
             2
-        } else if i == pen_id {
-            1
         } else {
-            0
+            1
         };
         role_map.insert(i, role);
     }
@@ -130,10 +128,25 @@ pub fn touch_event(
         let have_old = app.t_prev_pos.contains_key(&i);
         let old_role = app.t_prev_role.get(&i).copied().unwrap_or(-1);
         let old_pos = app.t_prev_pos.get(&i).copied().unwrap_or(cur);
-        if !have_old || cur_role != old_role {
+        if !have_old {
+            // 新触点：先落一个点，后续移动再形成独立笔迹。
+            let w = if cur_role == 1 {
+                app.timed_pen_width()
+            } else if mode == 2 {
+                app.eraser_width()
+            } else {
+                app.palm_erase_w
+            };
+            if cur_role == 1 {
+                stroke_tapered(app, cur, cur, w, w);
+            } else {
+                stroke_segment(app, cur, cur, true, w);
+            }
+            app.last_pen_w = w;
+            dirty = Some(union(dirty, dirty_of(cur, cur, w)));
             continue;
         }
-        if old_pos == cur || cur_role == 0 {
+        if cur_role != old_role || old_pos == cur {
             continue;
         }
         let w = if cur_role == 1 {
@@ -163,7 +176,11 @@ pub fn touch_event(
     }
     if !prev_preview.is_empty() || !app.palm_erase_preview.is_empty() {
         for p in prev_preview.iter().chain(app.palm_erase_preview.iter()) {
-            let pad = if mode == 2 { app.eraser_width() } else { app.palm_erase_w } + 8;
+            let pad = if mode == 2 {
+                app.eraser_width()
+            } else {
+                app.palm_erase_w
+            } + 8;
             dirty = Some(union(
                 dirty,
                 R {
@@ -188,7 +205,11 @@ pub fn touch_event(
                 let w = app.timed_pen_width();
                 stroke_segment(app, bp, bp, false, w);
             } else {
-                let w = if mode == 2 { app.eraser_width() } else { app.palm_erase_w };
+                let w = if mode == 2 {
+                    app.eraser_width()
+                } else {
+                    app.palm_erase_w
+                };
                 stroke_segment(app, bp, bp, true, w);
             }
         }
@@ -209,34 +230,35 @@ mod tests {
     use super::*;
     use tiny_skia::Pixmap;
 
-    fn app(erase_by_finger: bool) -> App {
+    fn app() -> App {
         let mut app = App::new(Pixmap::new(200, 200).unwrap(), 200, 200);
         app.mode = 1;
         app.large_touch_threshold = 64.0;
-        app.erase_by_finger = erase_by_finger;
         app
     }
 
     #[test]
-    fn palm_mode_ignores_two_small_contacts_but_finger_mode_erases() {
-        let mut palm = app(false);
-        touch_event(&mut palm, 1, 50, 50, TouchKind::Begin, 10.0);
-        touch_event(&mut palm, 2, 100, 100, TouchKind::Begin, 10.0);
-        assert!(!palm.t_palm_latched, "small multi-touch must not latch palm erase");
-        assert!(palm.palm_erase_preview.is_empty());
-
-        let mut fingers = app(true);
-        touch_event(&mut fingers, 1, 50, 50, TouchKind::Begin, 10.0);
-        touch_event(&mut fingers, 2, 100, 100, TouchKind::Begin, 10.0);
-        assert!(fingers.t_palm_latched, "multi-finger mode still erases with two contacts");
-        assert_eq!(fingers.palm_erase_preview.len(), 2);
+    fn two_small_contacts_draw_independently_without_latching_erase() {
+        let mut app = app();
+        touch_event(&mut app, 1, 50, 50, TouchKind::Begin, 10.0);
+        touch_event(&mut app, 2, 100, 100, TouchKind::Begin, 10.0);
+        assert!(
+            !app.t_palm_latched,
+            "small multi-touch must not latch palm erase"
+        );
+        assert!(app.palm_erase_preview.is_empty());
+        touch_event(&mut app, 1, 60, 60, TouchKind::Update, 10.0);
+        touch_event(&mut app, 2, 110, 110, TouchKind::Update, 10.0);
+        assert!(app.page_has_ink);
+        assert_eq!(app.t_prev_role.get(&1), Some(&1));
+        assert_eq!(app.t_prev_role.get(&2), Some(&1));
     }
 
     #[test]
-    fn palm_mode_still_erases_a_large_contact() {
-        let mut palm = app(false);
-        touch_event(&mut palm, 1, 50, 50, TouchKind::Begin, 80.0);
-        assert!(palm.t_palm_latched);
-        assert_eq!(palm.palm_erase_preview, vec![(50, 50)]);
+    fn a_large_contact_still_latches_palm_erase() {
+        let mut app = app();
+        touch_event(&mut app, 1, 50, 50, TouchKind::Begin, 80.0);
+        assert!(app.t_palm_latched);
+        assert_eq!(app.palm_erase_preview, vec![(50, 50)]);
     }
 }

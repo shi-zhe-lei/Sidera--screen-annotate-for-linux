@@ -395,6 +395,15 @@ impl Backend for WlPlat {
         self.input_dirty.set(false);
         self.forward_click();
     }
+    fn set_text_input(&self, on: bool) {
+        self.layer.set_keyboard_interactivity(if on {
+            KeyboardInteractivity::Exclusive
+        } else {
+            KeyboardInteractivity::None
+        });
+        self.input_dirty.set(true);
+    }
+
     fn set_input_region(&self, rects: &[IRect], full: bool) {
         if full {
             self.layer.set_input_region(None);

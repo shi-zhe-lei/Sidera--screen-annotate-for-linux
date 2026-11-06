@@ -115,7 +115,7 @@ struct Controls {
     mode: i32, saved_mode: i32, collapsed: bool, whiteboard: bool, whiteboard_bg: i32,
     drawing_tools: bool, saved_drawing_tools: bool,
     page: i32, color: usize, pen: usize, eraser: usize, wps: bool, wps_test: bool, linked_show: bool,
-    alpha: u8, scale: f64, right_click: bool, fingers: bool,
+    alpha: u8, scale: f64, right_click: bool,
     threshold: f64, erase_scale: i32,
     theme: crate::ui_theme::Theme,
 }
@@ -127,7 +127,7 @@ impl Controls {
             color: app.cur_color, pen: app.cur_pen, eraser: app.cur_eraser,
             wps: app.wps_debug, wps_test: app.wps_test_mode, alpha: app.sidebar_alpha, scale: app.sb_scale,
             linked_show: app.wps_debug && app.wps_connected && app.wps_real_pos > 0,
-            right_click: app.right_click_cursor_on, fingers: app.erase_by_finger,
+            right_click: app.right_click_cursor_on,
             theme: app.theme,
             threshold: app.large_touch_threshold, erase_scale: app.large_erase_scale10 }
     }
@@ -152,7 +152,7 @@ impl Controls {
         a.cur_color = self.color; a.cur_pen = self.pen; a.cur_eraser = self.eraser;
         a.wps_debug = self.wps; a.wps_test_mode = self.wps_test;
         a.sidebar_alpha = self.alpha; a.sb_scale = self.scale;
-        a.right_click_cursor_on = self.right_click; a.erase_by_finger = self.fingers;
+        a.right_click_cursor_on = self.right_click;
         a.large_touch_threshold = self.threshold; a.large_erase_scale10 = self.erase_scale;
         crate::apply_input_shape(&output.rt, a);
         output.rt.redraw_full(a);
@@ -177,6 +177,7 @@ impl Desktop {
         app::load_settings(&mut app);
         app.update_system_theme(crate::system_theme::dark());
         if let Ok(value) = std::env::var("WPS_API_DEBUG") { app.wps_debug = value == "1"; }
+        crate::process_block::set_daemon_enabled(app.process_block_enabled);
         Self { outputs: BTreeMap::new(), wps: None, controls: Controls::read(&app),
             detached: VecDeque::new(), fonts, icon, icon_big, single, starting: true }
     }
@@ -199,7 +200,7 @@ impl Desktop {
             };
             if connected && position > 0 {
                 let update = crate::WpsUpdate { connected: true, events: vec![crate::WpsEvent::RealPos(position)] };
-                crate::tick_shared(&output.rt, &mut output.app, &mut output.ip, Some(bridge), &update, &mut output.timers);
+                crate::tick_shared(&output.rt, &mut output.app, &mut output.ip, Some(bridge), &update, &mut output.timers, crate::system_theme::dark());
             }
         }
         self.outputs.insert(id, output);
@@ -320,13 +321,38 @@ impl Desktop {
         if self.outputs.values().any(|o| !o.launch_pending && o.app.canvas.width() > 1) { self.starting = false; }
         let update = crate::poll_wps(self.controls.wps, self.controls.whiteboard, self.controls.wps_test, &mut self.wps);
         for output in self.outputs.values_mut() {
-            crate::tick_shared(&output.rt, &mut output.app, &mut output.ip, self.wps.as_ref(), &update, &mut output.timers);
+            crate::tick_shared(&output.rt, &mut output.app, &mut output.ip, self.wps.as_ref(), &update, &mut output.timers, crate::system_theme::dark());
         }
         if let Some(output) = self.outputs.values().next() { self.controls = Controls::read(&output.app); }
         self.resolve_drawing_tools_auto_update();
         for output in self.outputs.values_mut() {
             output.rt.flush_dirty(&output.app);
             output.rt.backend.flush();
+        }
+        while let Some(action) = crate::tray::poll() {
+            match action {
+                crate::tray::TrayAction::Settings => {
+                    if let Some(output) = self.outputs.values_mut().next() {
+                        crate::open_settings(&output.rt, &mut output.app);
+                    }
+                }
+                crate::tray::TrayAction::Toggle => self.toggle(),
+                crate::tray::TrayAction::Whiteboard => {
+                    let id = self.outputs.keys().next().cloned();
+                    if let Some(id) = id {
+                        if let Some(output) = self.outputs.get_mut(&id) {
+                            crate::handle_btn(&output.rt, &mut output.app, self.wps.as_ref(),
+                                crate::ui::Btn::Whiteboard, false);
+                        }
+                        self.synchronize(&id);
+                    }
+                }
+                crate::tray::TrayAction::Show => (),
+                crate::tray::TrayAction::Quit => {
+                    crate::process_block::stop_daemon();
+                    std::process::exit(0);
+                }
+            }
         }
         let mut toggle = false;
         if let Some(listener) = self.single.as_ref() {

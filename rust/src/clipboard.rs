@@ -29,3 +29,8 @@ pub fn copy_image(bytes: Vec<u8>, width: u32, height: u32) {
         log::warn!("截图已保存，剪贴板仍在处理上一张图片：{error}");
     }
 }
+
+pub fn get_text() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    clipboard.get_text().ok()
+}

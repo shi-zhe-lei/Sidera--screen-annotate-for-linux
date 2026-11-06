@@ -9,7 +9,7 @@ use crate::page_cache::PageCache;
 use tiny_skia::{Color, Pixmap};
 
 // ---------------- 常量（与原 C++ app.h 对齐） ----------------
-pub const VERSION: &str = "3.1-Electro-testing";
+pub const VERSION: &str = "3.1-Electro-stable";
 // 侧边栏基准尺寸（与 C++ 版对齐：56/34/24/19；可在设置里用「侧边栏大小」缩放）
 pub const SB_BASE_W: f64 = 56.0;
 pub const SB_BASE_BTN: f64 = 34.0;
@@ -19,6 +19,9 @@ pub const DEFAULT_SB_SCALE: f64 = 1.0;
 pub const DEFAULT_SIDEBAR_ALPHA: u8 = 80;
 pub const DEFAULT_LARGE_TOUCH_THRESHOLD: f64 = 64.0;
 pub const DEFAULT_LARGE_ERASE_SCALE10: i32 = 12;
+pub const DEFAULT_STARTUP_DELAY: u32 = 10;
+pub const MIN_STARTUP_DELAY: u32 = 5;
+pub const MAX_STARTUP_DELAY: u32 = 20;
 pub const MAX_UNDO: usize = 12;
 /// 撤回瓦片边长（像素）；内存与笔迹覆盖面积成正比，而非整张画布
 pub const UNDO_TILE: i32 = 128;
@@ -28,6 +31,8 @@ pub const STROKE_RAMP_MS: i64 = 600;
 pub const STROKE_MIN_SCALE: f64 = 0.85;
 
 pub const WHITEBOARD_COLORS: [(u8, u8, u8); 2] = [(0x0F, 0x3D, 0x2E), (255, 255, 255)];
+pub const WHITEBOARD_DOT_PITCH: i32 = 32;
+pub const DEFAULT_WHITEBOARD_DOT_SIZE: i32 = 3;
 
 pub const COLORS: [(u8, u8, u8); 10] = [
     (255, 40, 40),
@@ -42,7 +47,7 @@ pub const COLORS: [(u8, u8, u8); 10] = [
     (0x79, 0x55, 0x48),
 ];
 pub const PEN_SIZES: [i32; 3] = [3, 5, 10];
-pub const ERASER_SIZES: [i32; 3] = [12, 24, 48];
+pub const ERASER_SIZES: [i32; 3] = [30, 60, 80];
 
 pub fn now_ms() -> i64 {
     use std::sync::OnceLock;
@@ -78,6 +83,14 @@ pub struct App {
     pub pen_popup_visible: bool,
     pub eraser_popup_visible: bool,
     pub more_menu_open: bool,
+    pub more_settings_entry: bool,
+    pub process_block_open: bool,
+    pub process_block_enabled: bool,
+    pub process_rules: Vec<String>,
+    pub process_scan: Vec<crate::process_block::ProcInfo>,
+    pub process_input: String,
+    pub process_input_active: bool,
+    pub process_scroll: usize,
     pub page_picker: Option<crate::page_picker::PagePicker>,
     pub settings_open: bool,
     pub settings_page: usize,
@@ -96,6 +109,8 @@ pub struct App {
     // 白板
     pub whiteboard: bool,
     pub whiteboard_bg_index: i32,
+    pub whiteboard_dots: bool,
+    pub whiteboard_dot_size: i32,
     pub saved_mode: i32, // 退出白板时恢复进入前的工具。
     pub saved_drawing_tools: bool,
 
@@ -132,6 +147,7 @@ pub struct App {
     pub wps_fullscreen: bool,
     pub wps_debug: bool,
     pub wps_test_mode: bool,
+    pub startup_delay: u32,
     pub wps_start_sent_until: i64,
     pub wps_connected: bool,
     pub wps_real_pos: i32,
@@ -158,7 +174,6 @@ pub struct App {
     pub palm_erase_preview: Vec<(i32, i32)>,
     pub palm_erase_w: i32,
     pub right_click_cursor_on: bool,
-    pub erase_by_finger: bool,
     pub large_touch_threshold: f64,
     pub large_erase_scale10: i32,
 
@@ -220,6 +235,14 @@ impl App {
             pen_popup_visible: false,
             eraser_popup_visible: false,
             more_menu_open: false,
+            more_settings_entry: false,
+            process_block_open: false,
+            process_block_enabled: false,
+            process_rules: Vec::new(),
+            process_scan: Vec::new(),
+            process_input: String::new(),
+            process_input_active: false,
+            process_scroll: 0,
             page_picker: None,
             settings_open: false,
             settings_page: 0,
@@ -233,6 +256,8 @@ impl App {
             input_group_state: 0,
             whiteboard: false,
             whiteboard_bg_index: 1,
+            whiteboard_dots: false,
+            whiteboard_dot_size: DEFAULT_WHITEBOARD_DOT_SIZE,
             saved_mode: 0,
             launch: crate::launch::Launch::default(),
             collapsed: false,
@@ -256,7 +281,8 @@ impl App {
             hotkey_ok: false,
             wps_fullscreen: false,
             wps_debug: true,
-            wps_test_mode: false,
+            wps_test_mode: true,
+            startup_delay: DEFAULT_STARTUP_DELAY,
             wps_start_sent_until: 0,
             wps_connected: false,
             wps_real_pos: -1,
@@ -278,7 +304,6 @@ impl App {
             palm_erase_preview: Vec::new(),
             palm_erase_w: PALM_ERASE_WIDTH,
             right_click_cursor_on: true,
-            erase_by_finger: false,
             large_touch_threshold: DEFAULT_LARGE_TOUCH_THRESHOLD,
             large_erase_scale10: DEFAULT_LARGE_ERASE_SCALE10,
             t_prev_pos: HashMap::new(),
@@ -729,19 +754,64 @@ fn config_file() -> Option<std::path::PathBuf> {
     dirs::config_dir().filter(|p| p.is_absolute()).map(|p| p.join("sidera/config"))
 }
 
+pub fn config_path() -> Option<std::path::PathBuf> {
+    config_file()
+}
+
+pub fn launched_by_autostart() -> bool {
+    std::env::args().any(|arg| arg == "--autostart")
+        || std::env::var("SIDERA_AUTOSTART").as_deref() == Ok("1")
+}
+
+pub fn load_startup_delay() -> u32 {
+    let path = config_file();
+    let legacy = dirs::home_dir().map(|home| home.join(".config/sidera/config"));
+    let content = path
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .or_else(|| legacy.and_then(|path| std::fs::read_to_string(path).ok()));
+    let Some(content) = content else { return DEFAULT_STARTUP_DELAY; };
+    for line in content.lines() {
+        if let Some(value) = line.trim().strip_prefix("startupDelay=") {
+            if let Ok(n) = value.trim().parse::<u32>() {
+                return n.clamp(MIN_STARTUP_DELAY, MAX_STARTUP_DELAY);
+            }
+        }
+    }
+    DEFAULT_STARTUP_DELAY
+}
+
 pub fn load_settings(app: &mut App) {
-    let Some(path) = config_file() else { return };
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
+    let Some(path) = config_file() else {
+        crate::diag_log::warn("设置未加载：无法确定配置目录");
+        return;
+    };
+    let (content, loaded_path) = match std::fs::read_to_string(&path) {
+        Ok(content) => (content, path.clone()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Migrate on the next save without deleting the previous user's file.
-            let Some(legacy) = dirs::home_dir().map(|p| p.join(".config/sidera/config")) else { return };
-            let Ok(content) = std::fs::read_to_string(legacy) else { return };
-            content
+            let Some(legacy) = dirs::home_dir().map(|p| p.join(".config/sidera/config")) else {
+                crate::diag_log::info("设置未加载：配置文件不存在");
+                return;
+            };
+            let Ok(content) = std::fs::read_to_string(&legacy) else {
+                crate::diag_log::info("设置未加载：配置文件不存在");
+                return;
+            };
+            (content, legacy)
         }
-        Err(e) => { log::warn!("读取设置失败：{e}"); return; }
+        Err(e) => {
+            log::warn!("读取设置失败：{e}");
+            crate::diag_log::warn(&format!("读取设置失败：{}：{e}", path.display()));
+            return;
+        }
     };
     parse_settings(app, &content);
+    crate::diag_log::info(&format!(
+        "设置已加载：{}（theme={} accent={}）",
+        loaded_path.display(),
+        app.theme.preference.key(),
+        app.theme.accent.key()
+    ));
 }
 
 fn parse_settings(app: &mut App, content: &str) {
@@ -760,7 +830,12 @@ fn parse_settings(app: &mut App, content: &str) {
             "themeAccent" => {
                 if let Some(accent) = crate::ui_theme::Accent::parse(v) { app.theme.accent = accent; }
             }
-            "wpsTestMode" => app.wps_test_mode = v == "1",
+            "wpsTestMode" => app.wps_test_mode = true,
+            "startupDelay" => {
+                if let Ok(n) = v.parse::<u32>() {
+                    app.startup_delay = n.clamp(MIN_STARTUP_DELAY, MAX_STARTUP_DELAY);
+                }
+            }
             "sbScale" => {
                 if let Ok(f) = v.parse::<f64>() {
                     if f.is_finite() { app.sb_scale = f.clamp(0.6, 1.4); }
@@ -772,7 +847,20 @@ fn parse_settings(app: &mut App, content: &str) {
                 }
             }
             "rightClickCursor" => app.right_click_cursor_on = v == "1",
-            "eraseByFinger" => app.erase_by_finger = v == "1",
+            "whiteboardDots" => app.whiteboard_dots = v == "1",
+            "whiteboardDotSize" => {
+                if let Ok(n) = v.parse::<i32>() { app.whiteboard_dot_size = n.clamp(1, 10); }
+            }
+            "processBlock" => app.process_block_enabled = v == "1",
+            "penColor" => {
+                if let Ok(n) = v.parse::<usize>() { app.cur_color = n.min(COLORS.len() - 1); }
+            }
+            "penSize" => {
+                if let Ok(n) = v.parse::<usize>() { app.cur_pen = n.min(PEN_SIZES.len() - 1); }
+            }
+            "eraserSize" => {
+                if let Ok(n) = v.parse::<usize>() { app.cur_eraser = n.min(ERASER_SIZES.len() - 1); }
+            }
             "largeTouchThreshold" => {
                 if let Ok(n) = v.parse::<i32>() {
                     app.large_touch_threshold = n.clamp(20, 260) as f64;
@@ -789,21 +877,36 @@ fn parse_settings(app: &mut App, content: &str) {
 }
 
 pub fn save_settings(app: &App) {
-    let Some(path) = config_file() else { log::warn!("无法确定设置目录"); return };
+    // Unit tests exercise the real settings handlers; never let `cargo test`
+    // rewrite the developer's live ~/.config/sidera/config (which previously
+    // reset the saved theme accent).
+    if cfg!(test) { return; }
+    let Some(path) = config_file() else {
+        log::warn!("无法确定设置目录");
+        crate::diag_log::warn("保存设置失败：无法确定配置目录");
+        return;
+    };
     if let Err(e) = crate::persistence::atomic_write(&path, serialize_settings(app).as_bytes()) {
         log::warn!("保存设置失败：{e}");
+        crate::diag_log::warn(&format!("保存设置失败：{}：{e}", path.display()));
     }
 }
 
 fn serialize_settings(app: &App) -> String {
     format!(
-        "wpsDebug={}\nwpsTestMode={}\nsbScale={:.2}\nsidebarAlpha={}\nrightClickCursor={}\neraseByFinger={}\nlargeTouchThreshold={}\nlargeEraseScale10={}\ntheme={}\nthemeAccent={}\n",
+        "wpsDebug={}\nwpsTestMode={}\nstartupDelay={}\nsbScale={:.2}\nsidebarAlpha={}\nrightClickCursor={}\nwhiteboardDots={}\nwhiteboardDotSize={}\nprocessBlock={}\npenColor={}\npenSize={}\neraserSize={}\nlargeTouchThreshold={}\nlargeEraseScale10={}\ntheme={}\nthemeAccent={}\n",
         if app.wps_debug { 1 } else { 0 },
-        if app.wps_test_mode { 1 } else { 0 },
+        1,
+        app.startup_delay,
         app.sb_scale,
         app.sidebar_alpha,
         if app.right_click_cursor_on { 1 } else { 0 },
-        if app.erase_by_finger { 1 } else { 0 },
+        if app.whiteboard_dots { 1 } else { 0 },
+        app.whiteboard_dot_size,
+        if app.process_block_enabled { 1 } else { 0 },
+        app.cur_color,
+        app.cur_pen,
+        app.cur_eraser,
         app.large_touch_threshold as i32,
         app.large_erase_scale10,
         app.theme.preference.key(),
@@ -1157,6 +1260,51 @@ mod theme_tests {
                     assert_eq!(loaded.whiteboard_bg_index, background);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn paint_tool_choices_roundtrip_through_settings() {
+        let mut source = App::new(Pixmap::new(10, 10).unwrap(), 10, 10);
+        source.cur_color = 5;
+        source.cur_pen = 2;
+        source.cur_eraser = 0;
+        let mut loaded = App::new(Pixmap::new(10, 10).unwrap(), 10, 10);
+        parse_settings(&mut loaded, &serialize_settings(&source));
+        assert_eq!(loaded.cur_color, 5);
+        assert_eq!(loaded.cur_pen, 2);
+        assert_eq!(loaded.cur_eraser, 0);
+    }
+
+    #[test]
+    fn startup_delay_roundtrips_and_clamps() {
+        let mut source = App::new(Pixmap::new(10, 10).unwrap(), 10, 10);
+        source.startup_delay = 15;
+        let mut loaded = App::new(Pixmap::new(10, 10).unwrap(), 10, 10);
+        parse_settings(&mut loaded, &serialize_settings(&source));
+        assert_eq!(loaded.startup_delay, 15);
+        for (value, expected) in [("1", 5), ("5", 5), ("10", 10), ("20", 20), ("30", 20), ("bad", 10)] {
+            let mut app = App::new(Pixmap::new(10, 10).unwrap(), 10, 10);
+            parse_settings(&mut app, &format!("startupDelay={value}\n"));
+            assert_eq!(app.startup_delay, expected, "startupDelay={value}");
+        }
+    }
+
+    #[test]
+    fn theme_accent_roundtrips_through_settings() {
+        for accent in [
+            crate::ui_theme::Accent::Teal,
+            crate::ui_theme::Accent::Blue,
+            crate::ui_theme::Accent::Green,
+            crate::ui_theme::Accent::Amber,
+            crate::ui_theme::Accent::Violet,
+            crate::ui_theme::Accent::Rose,
+        ] {
+            let mut source = App::new(Pixmap::new(10, 10).unwrap(), 10, 10);
+            source.theme.accent = accent;
+            let mut loaded = App::new(Pixmap::new(10, 10).unwrap(), 10, 10);
+            parse_settings(&mut loaded, &serialize_settings(&source));
+            assert_eq!(loaded.theme.accent, accent);
         }
     }
 

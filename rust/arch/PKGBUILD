@@ -9,7 +9,7 @@
 #       若要部署到较老的发行版（如 Ubuntu 20.04），仍请用 rust/build_*.sh 的容器交叉构建。
 
 pkgname=sidera
-pkgver=3.1_electro_testing
+pkgver=3.1_electro_stable
 pkgrel=1
 pkgdesc="Linux 屏幕批注与教学演示工具（Rust，X11/Wayland，WPS 联动）"
 arch=('x86_64' 'aarch64')
@@ -37,6 +37,7 @@ package() {
   cd "${pkgname}"
 
   install -Dm755 rust/target/release/sidera "${pkgdir}/usr/bin/sidera"
+  install -Dm644 rust/systemd/sidera-blocker.service "${pkgdir}/usr/lib/systemd/user/sidera-blocker.service"
 
   # WPS 加载项
   install -d "${pkgdir}/usr/share/sidera/wps-addin"

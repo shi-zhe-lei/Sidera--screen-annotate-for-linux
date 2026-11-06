@@ -1,6 +1,6 @@
 Name:           sidera
 Version:        3.1
-Release:        Electro_testing
+Release:        Electro_stable
 Summary:        Linux 屏幕批注与教学演示工具（Rust，X11/Wayland，WPS 联动）
 
 License:        GPL-3.0-only
@@ -40,6 +40,7 @@ tar xf %{SOURCE0} -C %{buildroot}
 /usr/share/pixmaps/sidera.svg
 /usr/share/pixmaps/sidera.png
 /usr/share/pixmaps/sidera-*.png
+/usr/lib/systemd/user/sidera-blocker.service
 /usr/lib/udev/rules.d/70-sidera-uinput.rules
 /usr/lib/udev/rules.d/70-sidera-input.rules
 /etc/modules-load.d/sidera-uinput.conf
@@ -72,4 +73,4 @@ udevadm control --reload-rules 2>/dev/null || :
 
 %changelog
 * Thu Oct 29 2026 Carl_Jin <user@localhost> - 3.1-1
-- Rust 版（Electro testing）
+- Rust 版（Electro stable）

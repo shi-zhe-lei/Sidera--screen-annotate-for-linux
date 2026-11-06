@@ -11,6 +11,7 @@ stage_files() {
   local bin="$1" root="$2"
 
   install -Dm755 "$bin" "$root/usr/bin/sidera"
+  install -Dm644 "$REPO/rust/systemd/sidera-blocker.service" "$root/usr/lib/systemd/user/sidera-blocker.service"
   install -Dm755 "$REPO/wps-addin/install.sh" "$root/usr/bin/sidera-wps-addin-install"
   install -Dm755 "$REPO/wps-addin/cleanup-old.sh" "$root/usr/bin/sidera-wps-addin-cleanup"
 

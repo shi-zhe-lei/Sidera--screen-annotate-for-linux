@@ -3,6 +3,11 @@
 #![allow(dead_code)]
 #[path = "../src/app.rs"] mod app;
 #[path = "../src/persistence.rs"] mod persistence;
+#[path = "../src/process_block.rs"] mod process_block;
+#[cfg(unix)]
+#[path = "../src/instance.rs"] mod instance;
+#[cfg(not(unix))]
+mod instance {}
 #[path = "../src/page_cache.rs"] mod page_cache;
 #[path = "../src/clear_history.rs"] mod clear_history;
 #[path = "../src/paint.rs"] mod paint;
@@ -15,6 +20,7 @@
 #[path = "../src/splash_paint.rs"] mod splash_paint;
 #[path = "../src/launch.rs"] mod launch;
 mod wps { pub fn wps_log(_: &str) {} }
+mod diag_log { pub fn info(_: &str) {} pub fn warn(_: &str) {} }
 
 use std::{path::Path, time::{Duration, Instant}};
 use tiny_skia::{Pixmap, PixmapPaint, Transform};

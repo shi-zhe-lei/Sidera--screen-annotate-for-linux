@@ -7,7 +7,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::shape::{self, SK, SO};
 use x11rb::protocol::xproto::{
     self, Atom, AtomEnum, Colormap, ColormapAlloc, ConfigureWindowAux, CreateGCAux,
-    CreateWindowAux, Drawable, EventMask, Gcontext, ImageFormat, Keycode, ModMask, Rectangle,
+    CreateWindowAux, Drawable, EventMask, Gcontext, GrabMode, ImageFormat, Keycode, ModMask, Rectangle,
     VisualClass, Window, WindowClass,
 };
 use x11rb::protocol::xinput::{self, DeviceClassData, Fp3232};
@@ -24,6 +24,8 @@ pub const XK_DOWN: u32 = 0xff54;
 pub const XK_D: u32 = 0x0064;
 pub const XK_F5: u32 = 0xffc2;
 pub const XK_SHIFT_L: u32 = 0xffe1;
+pub const XK_BACKSPACE: u32 = 0xff08;
+pub const XK_RETURN: u32 = 0xff0d;
 
 pub struct X11 {
     pub conn: RustConnection,
@@ -351,6 +353,45 @@ impl X11 {
         let mode = if accept { xinput::EventMode::ACCEPT_TOUCH } else { xinput::EventMode::REJECT_TOUCH };
         let _ = xinput::xi_allow_events(&self.conn, 0u32, deviceid, mode, touchid, window);
         let _ = self.conn.flush();
+    }
+
+    pub fn keycode_to_char(&self, keycode: Keycode, shift: bool) -> Option<char> {
+        if keycode == 0 {
+            return None;
+        }
+        let reply = xproto::get_keyboard_mapping(&self.conn, keycode, 1)
+            .ok()?
+            .reply()
+            .ok()?;
+        let per = reply.keysyms_per_keycode as usize;
+        if per == 0 {
+            return None;
+        }
+        let index = if shift { 1.min(per - 1) } else { 0 };
+        let keysym = *reply.keysyms.get(index)?;
+        let ch = char::from_u32(keysym)?;
+        if ch.is_control() {
+            None
+        } else {
+            Some(ch)
+        }
+    }
+
+    pub fn keycode_is(&self, keycode: Keycode, keysym: u32) -> bool {
+        if keycode == 0 {
+            return false;
+        }
+        let Ok(cookie) = xproto::get_keyboard_mapping(&self.conn, keycode, 1) else {
+            return false;
+        };
+        let Ok(reply) = cookie.reply() else {
+            return false;
+        };
+        reply
+            .keysyms
+            .iter()
+            .take(reply.keysyms_per_keycode as usize)
+            .any(|value| *value == keysym)
     }
 
     pub fn fake_key(&self, keycode: Keycode) {
@@ -711,6 +752,33 @@ struct TouchAxis {
 }
 
 impl X11Plat {
+    pub fn grab_text_keyboard(&self) -> bool {
+        xproto::grab_keyboard(
+            &self.x11.conn,
+            false,
+            self.win,
+            0u32,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .is_some()
+    }
+
+    pub fn ungrab_text_keyboard(&self) {
+        let _ = xproto::ungrab_keyboard(&self.x11.conn, 0u32);
+        let _ = self.x11.conn.flush();
+    }
+
+    pub fn keycode_to_char(&self, keycode: Keycode, shift: bool) -> Option<char> {
+        self.x11.keycode_to_char(keycode, shift)
+    }
+
+    pub fn keycode_is(&self, keycode: Keycode, keysym: u32) -> bool {
+        self.x11.keycode_is(keycode, keysym)
+    }
+
     pub fn new(x11: X11, win: Window, gc: Gcontext) -> XResult<Self> {
         let refresh_input_regions = x11.uses_mutter_xwayland();
         let (render_win, render_gc) = if refresh_input_regions {
@@ -985,6 +1053,15 @@ impl crate::backend::Backend for X11Plat {
                 self.input_refresh_pending.set(self.refresh_input_regions);
             }
             Err(error) => log::warn!("[WARN] 更新 X11 点击区域失败: {error}"),
+        }
+    }
+    fn set_text_input(&self, on: bool) {
+        if on {
+            if !self.grab_text_keyboard() {
+                log::warn!("无法抓取键盘，进程名可先复制后用“粘贴”");
+            }
+        } else {
+            self.ungrab_text_keyboard();
         }
     }
     fn fake_key(&self, key: crate::backend::Key) {

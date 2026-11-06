@@ -1,0 +1,30 @@
+[package]
+name = "sidera-windows"
+version = "3.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Sidera Windows port - Win32 overlay backend (work in progress)"
+
+[[bin]]
+name = "sidera"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+sidera-core = { package = "sidera", path = "../rust" }
+tiny-skia = "0.11"
+image = { version = "0.25", default-features = false, features = ["png"] }
+env_logger = "0.11"
+log = "0.4"
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Input_Pointer",
+  "Win32_UI_HiDpi",
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_Security",
+] }

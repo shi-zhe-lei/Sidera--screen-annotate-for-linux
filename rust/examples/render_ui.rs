@@ -3,6 +3,11 @@
 #![allow(dead_code)]
 #[path = "../src/app.rs"] mod app;
 #[path = "../src/persistence.rs"] mod persistence;
+#[path = "../src/process_block.rs"] mod process_block;
+#[cfg(unix)]
+#[path = "../src/instance.rs"] mod instance;
+#[cfg(not(unix))]
+mod instance {}
 #[path = "../src/page_cache.rs"] mod page_cache;
 #[path = "../src/clear_history.rs"] mod clear_history;
 #[path = "../src/paint.rs"] mod paint;
@@ -15,6 +20,7 @@
 #[path = "../src/splash_paint.rs"] mod splash_paint;
 #[path = "../src/launch.rs"] mod launch;
 mod wps { pub fn wps_log(_: &str) {} }
+mod diag_log { pub fn info(_: &str) {} pub fn warn(_: &str) {} }
 
 use std::path::Path;
 use tiny_skia::{Pixmap, PixmapPaint, Transform};
@@ -334,8 +340,6 @@ fn main() {
     paste(&mut board, &crop(&a, &fonts, icon.as_ref(), ui::settings_rect(&a)), 908.0, 174.0, 1.0);
     a.set_scale(1.5);
     crop(&a, &fonts, icon.as_ref(), ui::settings_rect(&a)).save_png(out.join("classroom-settings.png")).unwrap();
-    a.erase_by_finger = true;
-    crop(&a, &fonts, icon.as_ref(), ui::settings_rect(&a)).save_png(out.join("classroom-settings-fingers.png")).unwrap();
     let large_icon = self::icon(84);
     let start = std::time::Instant::now();
     let mut intro = launch::Launch::begin("GNOME 原生 Wayland · 1280 × 900".into(), true, true, start);

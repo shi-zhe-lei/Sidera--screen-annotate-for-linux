@@ -9,14 +9,14 @@ pub fn path() -> Option<PathBuf> {
 fn write(level: &str, message: &str) {
     if cfg!(test) { return; }
     let Some(path) = path() else { return };
-    use std::os::unix::fs::OpenOptionsExt;
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-    else { return };
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let Ok(mut file) = options.open(&path) else { return };
     if file.metadata().map(|m| m.len() > 1024 * 1024).unwrap_or(false) {
         let _ = file.set_len(0);
     }

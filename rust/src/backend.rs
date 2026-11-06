@@ -34,6 +34,8 @@ pub trait Backend: 'static {
     fn present(&self, pm: &Pixmap, x: i32, y: i32);
     /// 设置输入区域；full=true 表示整屏可输入
     fn set_input_region(&self, rects: &[IRect], full: bool);
+    /// 临时请求/释放文本键盘焦点（进程屏蔽输入框使用）。
+    fn set_text_input(&self, _on: bool) {}
     /// 注入一次按键（翻页/退出）
     fn fake_key(&self, key: Key);
     /// 用演示软件快捷键从当前页开始放映。false 表示当前后端无法注入。

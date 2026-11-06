@@ -40,7 +40,8 @@ pub fn draw(fonts: &Fonts, icon: Option<&Pixmap>, launch: &Launch, w: u32, h: u3
     ctx.fill_round(R { x: 18, y: 18, w: 524, h: 183 }, 19.0, c(palette.splash_header));
     ctx.text(fonts, "课堂批注", 32.0, 41.0, 15.0, c(palette.muted));
     ctx.fill_round(R { x: 459, y: 26, w: 67, h: 23 }, 11.0, c(palette.paper));
-    ctx.text_center(fonts, R { x: 459, y: 26, w: 67, h: 23 }, "3.0", 14.0, c(palette.muted));
+    let short_version = crate::app::VERSION.split('-').next().unwrap_or(crate::app::VERSION);
+    ctx.text_center(fonts, R { x: 459, y: 26, w: 67, h: 23 }, short_version, 14.0, c(palette.muted));
     if let Some(icon) = icon {
         ctx.fill_round(R { x: 237, y: 38, w: 86, h: 86 }, 21.0, c(palette.paper));
         ctx.pm.draw_pixmap(0, 0, icon.as_ref(), &PixmapPaint {

@@ -19,6 +19,17 @@ qrc_*.cpp
 
 # ===== Rust 编译产物 =====
 rust/target/
+windows/target/
+windows/dist/
+
+# ===== 项目内 Rust 工具链（Windows 交叉编译）=====
+.toolchains/
+
+# ===== 本地 Windows 安装包 / 测试镜像（不入库）=====
+/WPS_Setup_*.exe
+/kms/
+*.iso
+*.log
 
 # ===== Wayland 协议绑定生成物（wayland-scanner 输出，构建时落在 build/）=====
 # protocols/ 下的 .xml 为源文件，需要入库；生成的头/源文件一律忽略。
@@ -32,6 +43,10 @@ rust/target/
 rust/dist/
 screen-annotate_*/
 sidera_*/
+
+# ===== Python 缓存 =====
+__pycache__/
+*.pyc
 
 # ===== 编辑器 / 系统杂项 =====
 *.swp

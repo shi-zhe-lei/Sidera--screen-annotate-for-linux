@@ -2,7 +2,6 @@
 //! A storage error keeps the snapshot in memory; page-count limits never discard ink.
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use image::ImageEncoder;
@@ -75,7 +74,14 @@ impl PageCache {
         if let Some(path) = &self.directory { return Ok(path.clone()); }
         for _ in 0..100 {
             let path = std::env::temp_dir().join(format!("sidera-pages-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-            match fs::DirBuilder::new().mode(0o700).create(&path) {
+            #[allow(unused_mut)]
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&path) {
                 Ok(()) => { self.directory = Some(path.clone()); return Ok(path); }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
@@ -120,6 +126,7 @@ mod tests {
         let directory = cache.directory.clone().unwrap();
         drop(cache); assert!(!directory.exists());
     }
+    #[cfg(unix)]
     #[test]
     fn unavailable_spill_directory_keeps_ink_in_memory() {
         let mut cache = PageCache::default();

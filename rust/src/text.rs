@@ -14,6 +14,9 @@ pub struct Fonts {
 fn score(path: &str) -> i32 {
     let s = path.to_lowercase();
     let mut v = 0;
+    if s.contains("msyh") || s.contains("microsoft yahei") || s.contains("simhei") || s.contains("simsun") || s.contains("dengxian") {
+        v += 1000;
+    }
     if s.contains("cjk")
         || s.contains("wqy")
         || s.contains("sourcehan")
@@ -88,6 +91,15 @@ impl Fonts {
         let mut files: Vec<PathBuf> = Vec::new();
         collect(Path::new("/usr/share/fonts"), &mut files, 0);
         collect(Path::new("/usr/local/share/fonts"), &mut files, 0);
+        #[cfg(windows)]
+        {
+            if let Ok(windir) = std::env::var("WINDIR") {
+                collect(&Path::new(&windir).join("Fonts"), &mut files, 0);
+            }
+            if let Some(d) = dirs::data_local_dir() {
+                collect(&d.join("Microsoft").join("Windows").join("Fonts"), &mut files, 0);
+            }
+        }
         if let Some(d) = dirs::data_dir() {
             collect(&d.join("fonts"), &mut files, 0);
         }
