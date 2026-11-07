@@ -25,6 +25,18 @@ mod instance {}
 mod wps { pub fn wps_log(_: &str) {} }
 mod diag_log { pub fn info(_: &str) {} pub fn warn(_: &str) {} }
 
+// Preview examples do not create native settings windows.
+#[cfg(unix)]
+mod settings_window {
+    pub(crate) struct Window;
+
+    impl Window {
+        pub(crate) fn logical_size(&self) -> (i32, i32) {
+            unreachable!("preview examples do not create native settings windows")
+        }
+    }
+}
+
 use std::path::Path;
 use tiny_skia::{Pixmap, PixmapPaint, Transform};
 use app::App;
