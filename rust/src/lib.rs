@@ -5,6 +5,9 @@
 // Copyright (C) 2026 Carl_Jin   GNU GPL v3
 
 pub mod app;
+pub mod settings_state;
+pub mod settings_panel;
+pub mod value_input;
 pub mod backend;
 pub mod bridge_http;
 pub mod bridge_ws;
@@ -30,6 +33,8 @@ pub mod wps;
 #[cfg(unix)] pub mod gnome;
 #[cfg(unix)] pub mod instance;
 #[cfg(unix)] pub mod portal;
+#[cfg(unix)] mod settings_window;
+#[cfg(unix)] mod settings_wayland;
 #[cfg(unix)] pub mod startup;
 #[cfg(unix)] pub mod system_theme;
 #[cfg(unix)] pub mod touch_evdev;
@@ -123,6 +128,10 @@ pub struct Ip {
     // 正在拖动的设置滑条
     pub slider: Option<ui::SliderId>,
     pub dot_slider: bool,
+    dot_value_press_x: i32,
+    pub picker_drag: Option<settings_state::PickerHit>,
+    // Start y, initial row/page, and whether motion cancelled the pending tap.
+    pub panel_scroll: Option<(i32, usize, bool)>,
     // 每个触点的接触尺寸（直径，逻辑像素）：X11 由 raw touch 填，Wayland 由 wl_touch.shape 填
     pub touch_shape: HashMap<i32, f64>,
     // 画笔中断：当前笔画是否刚经过 UI 区域（用于从侧栏出来时断开续画）
@@ -152,6 +161,9 @@ impl Default for Ip {
             touch_over_ui: HashMap::new(),
             slider: None,
             dot_slider: false,
+            dot_value_press_x: 0,
+            picker_drag: None,
+            panel_scroll: None,
             touch_shape: HashMap::new(),
             stroke_skipped: false,
             last_touch_ms: 0,
@@ -195,6 +207,39 @@ impl Rt {
     }
     /// 请求重绘一个区域：批处理模式下只登记脏区，否则立即渲染
     pub fn redraw(&self, app: &App, r: R) {
+        #[cfg(unix)]
+        if let Some(window) = &app.settings_ui.window {
+            let full = r.x == 0 && r.y == 0 && r.w >= app.screen_w && r.h >= app.screen_h;
+            if full {
+                self.redraw_overlay(app, r);
+            }
+            self.redraw_settings_window(app, window, !full);
+            return;
+        }
+        self.redraw_overlay(app, r);
+    }
+    #[cfg(unix)]
+    fn redraw_settings_window(&self, app: &App, window: &settings_window::Window, sidebar_preview_dirty: bool) {
+        window.invalidate();
+        if sidebar_preview_dirty {
+            for right in [false, true] {
+                self.redraw_overlay(app, ui::sidebar_preview_strip(app, right));
+            }
+        }
+        if !self.batching.get() {
+            window.paint(self, app);
+        }
+    }
+    fn redraw_preferences(&self, app: &App, sidebar_preview_dirty: bool) {
+        #[cfg(unix)]
+        if let Some(window) = &app.settings_ui.window {
+            self.redraw_settings_window(app, window, sidebar_preview_dirty);
+            return;
+        }
+        let _ = sidebar_preview_dirty;
+        self.redraw_full(app);
+    }
+    fn redraw_overlay(&self, app: &App, r: R) {
         if self.batching.get() {
             let x = r.x.max(0);
             let y = r.y.max(0);
@@ -230,6 +275,10 @@ impl Rt {
     }
     /// 合并相交脏区；左右工具栏分别刷新，避免动画重绘整屏宽度。
     pub fn flush_dirty(&self, app: &App) {
+        #[cfg(unix)]
+        if let Some(window) = &app.settings_ui.window {
+            window.paint(self, app);
+        }
         let rects: Vec<R> = std::mem::take(&mut *self.dirty.borrow_mut());
         for r in merge_redraw_regions(rects) { self.render(app, r); }
     }
@@ -261,6 +310,13 @@ impl Rt {
     }
     pub fn set_input_region(&self, rects: &[IRect], full: bool) {
         self.backend.set_input_region(rects, full);
+    }
+
+    fn set_text_input(&self, app: &App, active: bool) {
+        // Managed windows already receive keys through normal desktop focus.
+        if app.settings_ui.window_size().is_none() {
+            self.backend.set_text_input(active);
+        }
     }
 }
 
@@ -297,6 +353,10 @@ fn rect_of(app: &App, r: R, pad: i32) -> Option<IRect> {
 }
 
 pub fn apply_input_shape(rt: &Rt, app: &App) {
+    if app.settings_ui.window_size().is_some() {
+        rt.set_input_region(&[], false);
+        return;
+    }
     if app.launch.active() {
         let mut rects = Vec::new();
         if app.launch.panel_alpha() > 0.0 { rects.extend(rect_of(app, ui::launch_rect(app), 0)); }
@@ -308,7 +368,7 @@ pub fn apply_input_shape(rt: &Rt, app: &App) {
         rt.set_input_region(&rects, false);
         return;
     }
-    if app.confirm_quit || app.show_diag || app.show_input_group_prompt {
+    if app.settings_ui.modal() || app.confirm_quit || app.show_diag || app.show_input_group_prompt {
         rt.set_input_region(&[], true);
         return;
     }
@@ -363,6 +423,10 @@ pub fn close_all_popups(rt: &Rt, app: &mut App) {
     app.eraser_popup_visible = false;
     app.more_menu_open = false;
     if app.page_picker.take().is_some() {
+        if app.settings_ui.editor.as_ref().is_some_and(|e|e.target==value_input::Target::Page) {
+            app.settings_ui.editor=None;
+            rt.backend.set_text_input(app.process_input_active);
+        }
         for right in [false, true] { rt.redraw(app, ui::sidebar_page_rect(app, right)); }
     }
     app.open_anim = 0;
@@ -375,6 +439,8 @@ pub fn close_all_popups(rt: &Rt, app: &mut App) {
 /// 当前点是否落在任何 UI 元素上（侧栏/弹窗/更多菜单/设置面板）。
 /// 画笔/橡皮进入这些区域应中断，避免把墨迹画到侧栏底下（半透明侧栏会透出来）。
 pub fn over_ui(app: &App, x: i32, y: i32) -> bool {
+    if app.show_input_group_prompt { return true; }
+    if app.settings_ui.modal() || app.process_block_open { return true; }
     if app.confirm_quit || app.show_diag { return true; }
     if app.page_picker.is_some() && ui::page_picker_rect(app).contains(x, y) { return true; }
     for right in [false, true] {
@@ -415,7 +481,10 @@ pub fn dismiss_capture(app: &App) -> bool {
 /// 该逻辑坐标是否属于覆盖层“可交互”区域（与 apply_input_shape 一致）。
 /// evdev 是全局读取，需要用它模拟输入区域，实现光标模式下的点击穿透。
 pub fn point_input_ok(app: &App, x: i32, y: i32) -> bool {
-    if app.confirm_quit || app.show_diag || app.show_input_group_prompt || app.whiteboard {
+    if app.settings_ui.window_size().is_some() {
+        return false;
+    }
+    if app.settings_ui.modal() || app.confirm_quit || app.show_diag || app.show_input_group_prompt || app.whiteboard {
         return true;
     }
     if app.process_block_open {
@@ -523,6 +592,11 @@ fn external_navigation(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>, cmd: &st
         apply_input_shape(rt, app);
         rt.redraw_full(app);
     }
+    if connected && rt.wps_foreground() == Some(false) {
+        app.wps_navigation_ready = false;
+        rt.redraw_full(app);
+        return false;
+    }
     match navigation_route(app.wps_debug && wps.is_some_and(|w| w.showing()),
                            wps.is_some_and(|w| w.ready()),
                            rt.backend.can_inject_keys_without_prompt()) {
@@ -566,6 +640,9 @@ pub fn go_prev(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>) {
 
 fn open_page_picker(rt: &Rt, app: &mut App, right: bool) {
     let Some((page, total, source)) = app.page_picker_context() else { return };
+    if matches!(source, page_picker::Source::Wps(_)) && rt.wps_foreground() == Some(false) {
+        return;
+    }
     close_all_popups(rt, app);
     app.popup_on_right = right;
     app.page_picker = Some(page_picker::PagePicker::new(page, total, source));
@@ -592,14 +669,22 @@ fn commit_page_picker(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>) {
         page_picker::Source::Wps(epoch) => {
             // A single absolute command; real WPS state moves the ink cache.
             // Never approximate a jump with repeated next/previous keystrokes.
-            if let Some(bridge) = wps { bridge.enqueue_jump(page, epoch); }
+            if rt.wps_foreground() != Some(false) {
+                if let Some(bridge) = wps { bridge.enqueue_jump(page, epoch); }
+            }
         }
     }
 }
 
 pub fn on_scroll(rt: &Rt, app: &mut App, ip: &Ip, x: i32, y: i32, pages: f64) {
-    if app.confirm_quit || app.show_diag || ip.pending_ui.is_some()
-        || ip.slider.is_some() || ip.dragging { return; }
+    if app.show_input_group_prompt || app.settings_ui.modal() || app.confirm_quit || ip.pending_ui.is_some()
+        || ip.slider.is_some() || ip.dragging || ip.panel_scroll.is_some() || ip.picker_drag.is_some() { return; }
+    if app.show_diag {
+        if pages.is_finite() && pages != 0.0 && ui::diag_rect(app).contains(x,y) {
+            handle_settings_hit(rt, app, SetHit::InspectorPage(if pages>0.0 {1} else {-1}));
+        }
+        return;
+    }
     if app.process_block_open {
         if pages.is_finite() && pages != 0.0 && ui::process_block_rect(app).contains(x, y) {
             let step = if pages > 0.0 { 1 } else { -1 };
@@ -814,22 +899,23 @@ pub fn collect_system_info(rt: &Rt, app: &App) -> String {
         s.push_str(&format!("设置文件: {}\n", path.display()));
     }
     s.push_str(&format!(
-        "主题: {} / {}\n启动延迟: {} 秒\n",
+        "主题: {} / {}（{}）\n启动延迟: {} 秒\n工具栏自动展开: {} 分钟\n",
         app.theme.preference.label(),
         app.theme.accent.label(),
-        app.startup_delay
+        app.theme.accent.key(),
+        app.startup_delay,
+        app.sidebar_expand_minutes
     ));
     if let Some(path) = diag_log::path() {
         s.push_str(&format!("诊断日志: {}\n", path.display()));
     }
-    s.push_str("\n最近日志：\n");
-    for line in diag_log::tail(10) { s.push_str(&line); s.push('\n'); }
+
     s
 }
 
 pub fn set_process_keyboard(rt: &Rt, app: &mut App, on: bool) {
     app.process_input_active = on;
-    rt.backend.set_text_input(on);
+    rt.set_text_input(app, on);
 }
 
 fn save_process_rules(app: &App) {
@@ -844,13 +930,17 @@ pub fn add_process_input(app: &mut App) {
         return;
     }
     if !app.process_rules.iter().any(|rule| rule == &value) {
-        app.process_rules.push(value);
+        if app.process_rules.len()>=64 {return;}
+        app.process_rules.push(value.clone());
         if app.process_rules.len() > 64 {
             app.process_rules.truncate(64);
         }
         save_process_rules(app);
     }
     app.process_input.clear();
+    app.settings_ui.process_view=settings_state::ProcessView::Rules;
+    app.process_scroll=app.process_rules.iter().position(|rule|rule==&value).unwrap_or(0)
+        .saturating_sub(ui::process_visible_rows(app).saturating_sub(1));
 }
 
 fn handle_process_hit(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
@@ -859,7 +949,13 @@ fn handle_process_hit(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
         return;
     };
     match hit {
+        ui::ProcessHit::View(view)=>{
+            set_process_keyboard(rt,app,false);
+            app.settings_ui.process_view=view;
+            app.process_scroll=0;
+        }
         ui::ProcessHit::Enable => {
+            app.settings_ui.begin_toggle(ui::Control::Process(ui::ProcessHit::Enable), app.process_block_enabled);
             app.process_block_enabled = !app.process_block_enabled;
             app::save_settings(app);
             process_block::set_daemon_enabled(app.process_block_enabled);
@@ -875,12 +971,12 @@ fn handle_process_hit(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
             app.process_scan = process_block::scan();
             app.process_scroll = 0;
         }
-        ui::ProcessHit::ScrollUp => app.process_scroll = app.process_scroll.saturating_sub(1),
+        ui::ProcessHit::ScrollUp => app.process_scroll = app.process_scroll.saturating_sub(ui::process_visible_rows(app)),
         ui::ProcessHit::ScrollDown => {
             let max = ui::process_rows(app)
                 .len()
                 .saturating_sub(ui::process_visible_rows(app));
-            app.process_scroll = (app.process_scroll + 1).min(max);
+            app.process_scroll = (app.process_scroll + ui::process_visible_rows(app)).min(max);
         }
         ui::ProcessHit::Rule(index) => {
             if index < app.process_rules.len() {
@@ -906,28 +1002,61 @@ fn handle_process_hit(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
             set_process_keyboard(rt, app, false);
             app.process_block_open = false;
             app.settings_open = true;
+            app.settings_ui.opened_at = now_ms();
         }
     }
     ip.pending_ui = None;
+    app.process_scroll = app.process_scroll.min(ui::process_rows(app).len().saturating_sub(ui::process_visible_rows(app)));
     apply_input_shape(rt, app);
     rt.redraw_full(app);
 }
 
 pub fn open_settings(rt: &Rt, app: &mut App) {
+    #[cfg(unix)]
+    if let Some(window) = &app.settings_ui.window {
+        window.raise();
+        return;
+    }
     if std::env::var("SIDERA_TRACE").is_ok() { log::info!("[SETTINGS] 打开"); }
     app.settings_open = true;
     app.settings_page = 0;
+    app.settings_ui.addins_unlocked = false;
+    if app.settings_ui.tab == settings_state::Tab::Addins { app.settings_ui.select(settings_state::Tab::Appearance); }
+    app.settings_ui.opened_at = now_ms();
+    app.settings_ui.closing_at = 0;
+    app.settings_ui.overlay_closing_at = 0;
+    app.settings_ui.dialog = None;
+    app.settings_ui.picker = None;
+    app.settings_ui.editor = None;
+    app.settings_ui.autostart = ui::is_autostart();
     rt.backend.set_text_input(false);
     app.process_block_open = false;
     app.process_input_active = false;
     app.open_anim = now_ms();
     close_all_popups(rt, app);
+    #[cfg(unix)]
+    if !app.launch.active() && !app.show_input_group_prompt {
+        match settings_window::Window::open(rt, app) {
+            Ok(window) => {
+                app.settings_ui.window = Some(window);
+                // The annotation canvas stays intact while the preferences
+                // window is open. Clear only its presentation surface.
+                rt.render(app, R { x: 0, y: 0, w: app.screen_w, h: app.screen_h });
+            }
+            Err(error) => log::info!("独立设置窗口不可用，使用原有设置面板：{error}"),
+        }
+    }
     apply_input_shape(rt, app);
     rt.redraw_full(app);
 }
 
 fn apply_slider(app: &mut App, id: ui::SliderId, v: f32) {
     match id {
+        ui::SliderId::Position => {
+            let height = app.sidebar_position_height();
+            app.sb_y=((app.screen_h-height).max(0) as f32*v.clamp(0.0,100.0)/100.0).round() as i32;
+        }
+        ui::SliderId::AutoExpand => { app.sidebar_expand_minutes = v.round().clamp(1.0,20.0) as u32; }
         ui::SliderId::Alpha => {
             app.sidebar_alpha = v.round().clamp(30.0, 255.0) as u8;
         }
@@ -950,86 +1079,251 @@ fn apply_slider(app: &mut App, id: ui::SliderId, v: f32) {
     }
 }
 
-pub fn handle_settings_hit(rt: &Rt, app: &mut App, hit: SetHit) {
-    if std::env::var("SIDERA_TRACE").is_ok() { log::info!("[SETTINGS] 命中 {:?}", hit); }
-    match hit {
-        SetHit::Theme(preference) => {
-            app.apply_theme(ui_theme::Theme { preference, system_dark: app.theme.system_dark, ..app.theme });
-            app::save_settings(app);
+pub fn open_value_input(rt:&Rt,app:&mut App,target:value_input::Target) {
+    app.settings_ui.editor=Some(value_input::Editor::new(app,target));
+    app.press=None;
+    rt.set_text_input(app, true);
+    apply_input_shape(rt,app);
+    rt.redraw_full(app);
+}
+
+pub fn value_input_key(rt:&Rt,app:&mut App,key:value_input::Key)->bool {
+    use value_input::{Key,Target};
+    let Some(target)=app.settings_ui.editor.as_ref().map(|editor|editor.target) else {return false};
+    if key==Key::Escape || (key==Key::Enter && app.settings_ui.editor.as_ref().is_some_and(|e|e.text==e.initial)) {
+        app.settings_ui.editor=None;
+        rt.set_text_input(app, app.process_input_active);
+        apply_input_shape(rt,app);
+    } else if key==Key::Enter {
+        match value_input::parse(app) {
+            Err(message)=>{if let Some(editor)=app.settings_ui.editor.as_mut(){editor.error=message;}},
+            Ok(value)=>{
+                match target {
+                    Target::Setting(id)=>{
+                        let raw=match id {ui::SliderId::Alpha=>value/100.0*255.0,ui::SliderId::Scale=>value/100.0,_=>value};
+                        apply_slider(app,id,raw);app::save_settings(app);
+                    }
+                    Target::DotSize=>{app.whiteboard_dot_size=value as i32;app::save_settings(app);}
+                    Target::Page=>{if let Some(picker)=app.page_picker.as_mut(){picker.set_selected(value as i32);}}
+                    Target::Hex=>{app.settings_ui.picker=Some(settings_state::ColorDraft::new(value as u32));}
+                    Target::Hue|Target::Saturation|Target::Brightness=>{
+                        if let Some(picker)=app.settings_ui.picker.as_mut(){match target {
+                            Target::Hue=>picker.hue=(value/360.0).rem_euclid(1.0),
+                            Target::Saturation=>picker.saturation=value/100.0,
+                            _=>picker.value=value/100.0,
+                        }}
+                    }
+                }
+                app.settings_ui.editor=None;
+                rt.set_text_input(app, app.process_input_active);
+                apply_input_shape(rt,app);
+            }
         }
+    } else if key==Key::Paste {
+        if let Some(text)=clipboard::get_text(){if let Some(editor)=app.settings_ui.editor.as_mut(){editor.insert(text.trim());}}
+    } else if let Some(editor)=app.settings_ui.editor.as_mut(){editor.edit(key);}
+    rt.redraw_full(app);true
+}
+
+pub fn text_input_key(rt:&Rt,app:&mut App,key:value_input::Key)->bool {
+    if value_input_key(rt,app,key) {return true;}
+    if !app.process_block_open || !app.process_input_active {return false;}
+    use value_input::Key;
+    match key {
+        Key::Escape=>set_process_keyboard(rt,app,false),
+        Key::Enter=>add_process_input(app),
+        Key::Backspace=>{app.process_input.pop();},
+        Key::Paste=>{if let Some(text)=clipboard::get_text(){app.process_input=text.chars().take(256).collect();}},
+        Key::Character(ch) if !ch.is_control() && app.process_input.chars().count()<256=>app.process_input.push(ch),
+        _=>{},
+    }
+    rt.redraw_full(app);true
+}
+
+fn handle_value_hit(rt:&Rt,app:&mut App,hit:value_input::Hit) {
+    use value_input::{Hit,Key};
+    match hit {
+        Hit::Field=>{value_input_key(rt,app,Key::SelectAll);},
+    }
+}
+
+fn save_theme_selection(app: &mut App, next: ui_theme::Theme) -> bool {
+    let previous = app.theme;
+    let recent = app.settings_ui.recent.clone();
+    let rgb = next.accent.rgb();
+    app.settings_ui.recent.retain(|color| *color != rgb);
+    app.settings_ui.recent.insert(0, rgb);
+    app.settings_ui.recent.truncate(8);
+    let changed = app.apply_theme(next);
+    match settings_state::save_appearance(app) {
+        Ok(()) => {
+            app::save_settings(app);
+            // The synchronous atomic writes must not consume the first frames.
+            if changed {
+                if let Some((_, start)) = app.settings_ui.theme_from.as_mut() {
+                    *start = now_ms();
+                }
+            }
+            app.settings_ui.notify("外观已保存");
+            true
+        }
+        Err(error) => {
+            app.apply_theme(previous);
+            app.settings_ui.recent = recent;
+            app.settings_ui.notify(format!("未保存：{error}"));
+            diag_log::warn(&format!("保存外观失败：{error}"));
+            false
+        }
+    }
+}
+
+fn show_inspector(app: &mut App, kind: settings_state::Inspector, text: String) {
+    app.diag_text = text;
+    app.show_diag = true;
+    app.settings_ui.inspector = kind;
+    app.settings_ui.inspector_page = 0;
+    app.settings_ui.overlay_at = now_ms();
+}
+
+fn open_project_link(app: &mut App, url: &'static str) {
+    #[cfg(unix)]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(windows)]
+    let result = std::process::Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", url]).spawn();
+    #[cfg(not(any(unix, windows)))]
+    let result: std::io::Result<std::process::Child> = Err(std::io::Error::other("当前系统无法打开链接"));
+    match result {
+        Ok(mut child) => { std::thread::spawn(move || { let _ = child.wait(); }); }
+        Err(error) => app.settings_ui.notify(format!("打开链接失败：{error}")),
+    }
+}
+
+pub fn handle_settings_hit(rt: &Rt, app: &mut App, hit: SetHit) {
+    use settings_state::{Dialog, Inspector, Tab};
+    match hit {
+        SetHit::EditSlider(id) => open_value_input(rt,app,value_input::Target::Setting(id)),
+        SetHit::Tab(tab) => {
+            if tab == Tab::Addins && !app.settings_ui.addins_unlocked {
+                app.settings_ui.show_dialog(Dialog::Addins);
+            } else {
+                app.settings_ui.select(tab);
+                app.settings_page = 0;
+            }
+        }
+        SetHit::Theme(preference) => { save_theme_selection(app, ui_theme::Theme { preference, ..app.theme }); }
         SetHit::ResetSlider(id) => {
             apply_slider(app, id, id.default_value());
             app::save_settings(app);
+            app.settings_ui.notify("已恢复此项默认值");
         }
-        SetHit::Autostart => ui::set_autostart(!ui::is_autostart()),
-        SetHit::WpsDebug => {
-            app.wps_debug = !app.wps_debug;
-            app::save_settings(app);
+        SetHit::Autostart => {
+            let old = ui::is_autostart();
+            app.settings_ui.begin_toggle(ui::Control::Setting(hit), old);
+            ui::set_autostart(!old);
+            app.settings_ui.autostart = ui::is_autostart();
+            if app.settings_ui.autostart == old { app.settings_ui.notify("未能修改自动启动设置"); }
         }
-        SetHit::WpsRemove => {
-            let (message, ok) = match wps::remove_addin_registration() {
-                Ok(text) => (format!("已清除当前用户的 WPS 加载项。\n请重启 WPS 使改动生效。\n{text}"), true),
-                Err(error) => (format!("清除 WPS 加载项失败：\n{error}"), false),
-            };
-            if ok { diag_log::info(&message); } else { diag_log::error(&message); }
-            app.diag_text = format!("{message}\n\n日志：{}", diag_log::path()
-                .map(|p| p.display().to_string()).unwrap_or_default());
-            app.show_diag = true;
-        }
+        // Kept for source compatibility; there is no off state in the settings UI.
+        SetHit::WpsDebug => { app.wps_debug = true; app::save_settings(app); }
+        SetHit::WpsRemove => app.settings_ui.show_dialog(Dialog::Remove),
+        SetHit::WpsRegister => app.settings_ui.show_dialog(Dialog::Register),
         SetHit::ProcessBlock => {
             app.settings_open = false;
             app.process_block_open = true;
             app.process_rules = process_block::load_rules();
             app.process_scan = process_block::scan();
             app.process_input.clear();
+            app.settings_ui.process_view=if app.process_rules.is_empty() {settings_state::ProcessView::Running}else{settings_state::ProcessView::Rules};
             app.process_input_active = false;
             app.process_scroll = 0;
-            app.open_anim = now_ms();
+            app.settings_ui.overlay_at = now_ms();
         }
         SetHit::ThemeAccent => {
-            app.theme.accent = app.theme.accent.next();
-            app.apply_theme(app.theme);
-            app::save_settings(app);
-        }
-        SetHit::WpsRegister => {
-            let (message, ok) = match wps::register_addin() {
-                Ok(text) => (format!("已重新登记 WPS 加载项。\n请重启 WPS 使改动生效。\n{text}"), true),
-                Err(error) => (format!("重新登记 WPS 加载项失败：\n{error}"), false),
-            };
-            if ok { diag_log::info(&message); } else { diag_log::error(&message); }
-            app.diag_text = format!("{message}\n\n日志：{}", diag_log::path()
-                .map(|p| p.display().to_string()).unwrap_or_default());
-            app.show_diag = true;
+            app.settings_ui.picker = Some(settings_state::ColorDraft::new(app.theme.accent.rgb()));
+            app.settings_ui.overlay_at = now_ms();
+            app.settings_ui.overlay_closing_at = 0;
         }
         SetHit::RightClick => {
+            app.settings_ui.begin_toggle(ui::Control::Setting(hit), app.right_click_cursor_on);
             app.right_click_cursor_on = !app.right_click_cursor_on;
             app::save_settings(app);
         }
-        SetHit::ClearLog => {
-            let _ = std::fs::remove_file(wps::log_file());
-            diag_log::clear();
-            app.log_cleared_until = now_ms() + 1200;
+        SetHit::ClearLog => app.settings_ui.show_dialog(Dialog::ClearLogs),
+        SetHit::Logs => {
+            let lines = diag_log::tail(400);
+            show_inspector(app, Inspector::Logs, if lines.is_empty() { "暂无运行日志。".into() } else { lines.join("\n") });
         }
-        SetHit::SysInfo => {
-            let info = collect_system_info(rt, app);
-            log::info!("\n{}", info);
-            let _ = std::fs::write(std::env::temp_dir().join("sidera-diag.txt"), &info);
-            app.diag_text = info;
-            app.show_diag = true;
+        SetHit::SysInfo => { let info = collect_system_info(rt, app); show_inspector(app, Inspector::Diagnostics, info); }
+        SetHit::Repository => open_project_link(app, settings_state::REPOSITORY),
+        SetHit::License => open_project_link(app, settings_state::LICENSE_URL),
+        SetHit::InspectorPage(delta) => {
+            let pages = settings_panel::inspector_lines(app, &rt.fonts).len().div_ceil(settings_panel::inspector_page_size(app)).max(1);
+            let page=app.settings_ui.inspector_page.min(pages-1);
+            app.settings_ui.inspector_page = (page as i64 + delta as i64).clamp(0, pages as i64 - 1) as usize;
         }
-        SetHit::Quit => {
-            app.confirm_quit = true;
-        }
-        SetHit::Done => {
-            app.settings_open = false;
-            app.confirm_quit = false;
-            app.show_diag = false;
-            apply_input_shape(rt, app);
-        }
+        SetHit::InspectorClose => { app.show_diag = false; }
+        SetHit::Quit => { app.confirm_quit = true; app.settings_ui.overlay_at = now_ms(); }
+        SetHit::Done => { app.settings_ui.closing_at = now_ms(); }
         SetHit::SettingsPage(delta) => { ui::settings_change_page(app, delta); }
     }
     apply_input_shape(rt, app);
-    rt.redraw_full(app);
+    let sidebar_preview_dirty = matches!(hit, SetHit::Tab(_) | SetHit::Theme(_) | SetHit::ResetSlider(_));
+    rt.redraw_preferences(app, sidebar_preview_dirty);
+}
+
+fn handle_dialog(rt: &Rt, app: &mut App, hit: settings_state::DialogHit) {
+    use settings_state::{Dialog, DialogHit, Inspector, Tab};
+    if hit == DialogHit::Cancel {
+        app.settings_ui.overlay_closing_at = now_ms();
+    } else if let Some(dialog) = app.settings_ui.dialog.take() {
+        match dialog {
+            Dialog::Addins => {
+                app.settings_ui.addins_unlocked = true;
+                app.settings_ui.select(Tab::Addins);
+                app.settings_page = 0;
+            }
+            Dialog::Register | Dialog::Remove => {
+                let result = if dialog == Dialog::Register { wps::register_addin() } else { wps::remove_addin_registration() };
+                let text = match result {
+                    Ok(detail) => {
+                        diag_log::info(&detail);
+                        format!("{}已完成。\n请重新打开 WPS 使改动生效。\n\n{detail}", if dialog == Dialog::Register { "加载项登记" } else { "加载项清除" })
+                    }
+                    Err(error) => { diag_log::error(&error.to_string()); format!("操作未完成：\n{error}\n\n可在“关于 → 运行日志”查看记录。") }
+                };
+                show_inspector(app, Inspector::Notice, text);
+            }
+            Dialog::ClearLogs => {
+                let _ = std::fs::remove_file(wps::log_file());
+                diag_log::clear();
+                show_inspector(app, Inspector::Logs, "日志已清空。".into());
+            }
+        }
+    }
+    apply_input_shape(rt, app);
+    rt.redraw_preferences(app, true);
+}
+
+fn handle_picker(rt: &Rt, app: &mut App, ip: &mut Ip, hit: settings_state::PickerHit, x: i32, y: i32) {
+    use settings_state::{ColorDraft, PickerHit};
+    match hit {
+        PickerHit::Edit(target) => open_value_input(rt,app,target),
+        PickerHit::Field | PickerHit::Hue => { settings_panel::picker_drag(app, hit, x, y); ip.picker_drag = Some(hit); }
+        PickerHit::Preset(index) => {
+            if let Some(accent) = settings_panel::PRESETS.get(index) { app.settings_ui.picker = Some(ColorDraft::new(accent.rgb())); }
+        }
+        PickerHit::Recent(index) => {
+            if let Some(rgb) = app.settings_ui.recent.get(index) { app.settings_ui.picker = Some(ColorDraft::new(*rgb)); }
+        }
+        PickerHit::Cancel => app.settings_ui.overlay_closing_at = now_ms(),
+        PickerHit::Apply => {
+            if let Some(rgb) = app.settings_ui.picker.as_ref().map(ColorDraft::rgb) {
+                save_theme_selection(app, ui_theme::Theme { accent: ui_theme::Accent::Custom(rgb), ..app.theme });
+                app.settings_ui.overlay_closing_at = now_ms();
+            }
+        }
+    }
+    rt.redraw_preferences(app, hit == PickerHit::Apply && app.previewing_sidebars());
 }
 
 fn first_hit(r: R, x: i32, y: i32) -> bool {
@@ -1047,6 +1341,7 @@ pub fn on_press(
     x: i32, y: i32, button: u8,
 ) {
     if app.launch.active() { return; }
+    if app.settings_ui.closing_at != 0 || app.settings_ui.overlay_closing_at != 0 { return; }
     if button == 4 || button == 5 {
         on_scroll(rt, app, ip, x, y, if button == 4 { -1.0 } else { 1.0 });
         return;
@@ -1054,12 +1349,36 @@ pub fn on_press(
     if app.page_picker.as_ref().is_some_and(|p| p.dragging()) { return; }
     // The press that started a drag owns it until release. A second button
     // must not replace it with a pending click and consume that release.
-    if ip.pending_ui.is_some() || ip.slider.is_some() || ip.dragging { return; }
+    if ip.pending_ui.is_some() || ip.slider.is_some() || ip.dragging || ip.picker_drag.is_some() || ip.panel_scroll.is_some() { return; }
+    if button==1 && !app.show_input_group_prompt && app.settings_ui.editor.is_some()
+        && !value_input::controls(app).iter().any(|(_,r)|r.contains(x,y)) {
+        value_input_key(rt,app,value_input::Key::Enter);
+        if app.settings_ui.editor.is_some() || ui::control_at(app,x,y).is_none() {return;}
+    }
+    if button == 1 && !app.show_input_group_prompt && !app.settings_ui.modal() && !app.confirm_quit {
+        if app.process_block_open && settings_panel::process_list_rect(app).contains(x,y) {
+            ip.panel_scroll = Some((y, app.process_scroll, false));
+        } else if app.show_diag {
+            if settings_panel::inspector_body_rect(app).contains(x,y) {
+                ip.panel_scroll=Some((y,app.settings_ui.inspector_page,false));
+            }
+        } else if app.settings_open && settings_panel::content_rect(app).contains(x,y) && ui::settings_slider_hit(app,x,y).is_none() {
+            ip.panel_scroll=Some((y,app.settings_page,false));
+        }
+    }
     if !app.settings_open && !app.confirm_quit && !app.show_diag
         && ui::sidebar_animating(app) && [false, true].into_iter()
         .any(|right| ui::sidebar_input_rect(app, right).contains(x, y)) { return; }
     if let Some(control) = ui::control_at(app, x, y) {
         if button != 1 || !ui::control_enabled(app, control) { return; }
+        if let ui::Control::Setting(SetHit::InspectorPage(delta))=control {
+            if !settings_panel::inspector_can_page(app,&rt.fonts,delta) {return;}
+        }
+        // The entire tucked tab shares its drag gesture; a stationary release expands it.
+        if app.collapsed && matches!(control, ui::Control::Sidebar(Btn::Collapse, _)) {
+            activate_press(rt, app, ip, wps, x, y, button);
+            return;
+        }
         if control == ui::Control::PagePicker(ui::PagePickerHit::Wheel) {
             app.press = None;
             if let Some(picker) = app.page_picker.as_mut() { picker.begin(y, Instant::now()); }
@@ -1071,7 +1390,11 @@ pub fn on_press(
         }
         app.press = Some(ui::PressFeedback::new(control));
         if let Some(r) = ui::control_rect(app, control) { rt.redraw(app, r); }
-        if !matches!(control, ui::Control::Slider(_) | ui::Control::Whiteboard(ui::WhiteboardControl::DotSize)) {
+        if !matches!(control, ui::Control::Slider(_) | ui::Control::Whiteboard(ui::WhiteboardControl::DotSize)
+            | ui::Control::Picker(settings_state::PickerHit::Field | settings_state::PickerHit::Hue)) {
+            if control == ui::Control::Whiteboard(ui::WhiteboardControl::DotValue) {
+                ip.dot_value_press_x = x;
+            }
             ip.pending_ui = Some(control);
             return;
         }
@@ -1089,6 +1412,18 @@ fn activate_press(
     y: i32,
     button: u8,
 ) {
+    if !app.show_input_group_prompt && app.settings_ui.editor.is_some() {
+        if let Some(ui::Control::Editor(hit))=ui::control_at(app,x,y){handle_value_hit(rt,app,hit);}
+        return;
+    }
+    if !app.show_input_group_prompt && app.settings_ui.dialog.is_some() {
+        if let Some(ui::Control::Dialog(hit)) = ui::control_at(app,x,y) { handle_dialog(rt,app,hit); }
+        return;
+    }
+    if !app.show_input_group_prompt && app.settings_ui.picker.is_some() {
+        if let Some(ui::Control::Picker(hit)) = ui::control_at(app,x,y) { handle_picker(rt,app,ip,hit,x,y); }
+        return;
+    }
     if app.show_input_group_prompt {
         if let Some(h) = ui::input_group_prompt_hit(app, x, y) {
             match h {
@@ -1123,11 +1458,7 @@ fn activate_press(
         return;
     }
     if app.show_diag {
-        if ui::diag_close_hit(app, x, y) {
-            app.show_diag = false;
-            apply_input_shape(rt, app);
-        }
-        rt.redraw_full(app);
+        if let Some(ui::Control::Setting(hit)) = ui::control_at(app,x,y) { handle_settings_hit(rt,app,hit); }
         return;
     }
     log::debug!(
@@ -1162,6 +1493,7 @@ fn activate_press(
                     app.whiteboard_dot_size = ui::whiteboard_dot_size_at(app, x);
                     ip.dot_slider = true;
                 }
+                ui::WhiteboardControl::DotValue => open_value_input(rt,app,value_input::Target::DotSize),
             }
             apply_input_shape(rt, app);
             rt.redraw_full(app);
@@ -1173,6 +1505,7 @@ fn activate_press(
             if button == 1 {
                 match ui::page_picker_hit(app, x, y) {
                     Some(ui::PagePickerHit::Cancel) => close_all_popups(rt, app),
+                    Some(ui::PagePickerHit::Input) => open_value_input(rt,app,value_input::Target::Page),
                     Some(ui::PagePickerHit::Jump) => commit_page_picker(rt, app, wps),
                     _ => (),
                 }
@@ -1211,11 +1544,9 @@ fn activate_press(
             match hit {
                 PopupHit::Color(i) => {
                     app.cur_color = i;
-                    app::save_settings(app);
                 }
                 PopupHit::PenSize(i) => {
                     app.cur_pen = i;
-                    app::save_settings(app);
                 }
                 _ => {}
             }
@@ -1241,6 +1572,7 @@ fn activate_press(
     // 侧边栏按钮
     for right in [false, true] {
         for (k, r) in ui::sidebar_buttons(app, right) {
+            if app.collapsed && k == Btn::Collapse { continue; }
             if first_hit(r, x, y) {
                 log::debug!("[INPUT] hit {:?} right={} rect=({},{} {}x{})", k, right, r.x, r.y, r.w, r.h);
                 app.popup_on_right = right;
@@ -1290,6 +1622,7 @@ fn activate_press(
         }
         close_all_popups(rt, app);
         app.begin_undo();
+        let restore_was_visible = app.can_restore_cleared();
         ip.stroke_skipped = false;
         app.is_drawing = true;
         app.last_pt = (x, y);
@@ -1305,6 +1638,13 @@ fn activate_press(
             paint::stroke_tapered(app, (x, y), (x, y), w, w);
         }
         let _ = button;
+        if restore_was_visible && !app.can_restore_cleared() {
+            for right in [false, true] {
+                if let Some(r) = ui::control_rect(app, ui::Control::Sidebar(Btn::Clear, right)) {
+                    rt.redraw(app, r);
+                }
+            }
+        }
         rt.redraw(
             app,
             R {
@@ -1398,8 +1738,41 @@ pub fn handle_btn(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>, k: Btn, right
 }
 
 pub fn on_motion(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
+    if let Some(hit)=ip.picker_drag {
+        settings_panel::picker_drag(app,hit,x,y);
+        rt.redraw(app,settings_panel::picker_rect(app));
+        return;
+    }
+    if let Some((start, initial, moved))=ip.panel_scroll {
+        if moved || (y-start).abs()>9 {
+            ip.panel_scroll=Some((start,initial,true));
+            ip.pending_ui=None;
+            app.press=None;
+            if app.process_block_open {
+                let max=ui::process_rows(app).len().saturating_sub(ui::process_visible_rows(app));
+                app.process_scroll=(initial as i64+(start-y) as i64/52).clamp(0,max as i64) as usize;
+            } else if app.show_diag {
+                let pages=settings_panel::inspector_lines(app,&rt.fonts).len().div_ceil(settings_panel::inspector_page_size(app)).max(1);
+                app.settings_ui.inspector_page=(initial as i64+(start-y) as i64/72).clamp(0,pages as i64-1) as usize;
+            } else if app.settings_open {
+                let max=ui::settings_layout(app).pages.saturating_sub(1);
+                app.settings_page=(initial as i64+(start-y) as i64/72).clamp(0,max as i64) as usize;
+            }
+            rt.redraw_full(app);
+            return;
+        }
+    }
+    // A tap on the number edits it. Dragging from the same spot still
+    // moves the slider, even when the thumb sits underneath the number.
+    if ip.pending_ui == Some(ui::Control::Whiteboard(ui::WhiteboardControl::DotValue))
+        && app.whiteboard && app.whiteboard_dots && x >= 0
+        && (x - ip.dot_value_press_x).abs() > 4 {
+        ip.pending_ui = None;
+        ip.dot_slider = true;
+        app.press = None;
+    }
     if ip.dot_slider {
-        if app.whiteboard {
+        if app.whiteboard && app.whiteboard_dots {
             let size = ui::whiteboard_dot_size_at(app, x);
             if size != app.whiteboard_dot_size {
                 app.whiteboard_dot_size = size;
@@ -1432,7 +1805,7 @@ pub fn on_motion(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
             apply_slider(app, id, def.value_at(x));
             rt.redraw(app, ui::settings_rect(app));
             // 透明度/大小会改变侧栏本身，需一并重绘两侧栏
-            if matches!(id, ui::SliderId::Alpha | ui::SliderId::Scale) {
+            if matches!(id, ui::SliderId::Alpha | ui::SliderId::Scale | ui::SliderId::Position) {
                 for old in old_sidebars { rt.redraw(app, old); }
                 for right in [false, true] {
                     rt.redraw(app, ui::sidebar_rect(app, right));
@@ -1550,6 +1923,9 @@ pub fn on_motion(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
 
 pub fn on_release(rt: &Rt, app: &mut App, ip: &mut Ip, wps: Option<&WpsBridge>, x: i32, y: i32, button: u8) {
     if button == 4 || button == 5 { return; }
+    if button != 1 && (ip.panel_scroll.is_some() || ip.picker_drag.is_some()) { return; }
+    if ip.picker_drag.take().is_some() { app.press=None; rt.redraw_full(app); return; }
+    if ip.panel_scroll.take().is_some_and(|(_,_,moved)|moved) { ip.pending_ui=None; app.press=None; rt.redraw_full(app); return; }
     if ip.dot_slider {
         ip.dot_slider = false;
         app::save_settings(app);
@@ -1608,9 +1984,11 @@ pub fn on_release(rt: &Rt, app: &mut App, ip: &mut Ip, wps: Option<&WpsBridge>, 
     if ip.dragging {
         // Include the release position even if its final motion was coalesced.
         on_motion(rt, app, ip, x, y);
+        let released_inside = app.sidebar_drag.is_some_and(
+            |drag| ui::sidebar_rect(app, drag.right).contains(x, y));
         ip.dragging = false;
         set_sidebar_drag_feedback(rt, app, None);
-        if ip.collapse_press && !ip.moved {
+        if ip.collapse_press && !ip.moved && released_inside {
             toggle_collapse(rt, app);
         } else if ip.moved {
             // 拖动结束：按新位置更新输入区域
@@ -1660,7 +2038,7 @@ pub fn handle_touch(
         return;
     }
     let wants_touch = app.launch.active() || app.whiteboard || app.mode != 0
-        || app.settings_open || app.confirm_quit || app.show_diag || app.show_input_group_prompt
+        || app.settings_open || app.process_block_open || app.settings_ui.modal() || app.confirm_quit || app.show_diag || app.show_input_group_prompt
         || dismiss_capture(app) || over_ui(app, x, y);
     match kind {
         TouchKind::Begin => {
@@ -1732,7 +2110,6 @@ pub struct Timers {
     last_wps: Instant,
     last_foreground: Instant,
     foreground: Option<bool>,
-    foreground_false: u8,
 }
 
 impl Timers {
@@ -1741,7 +2118,6 @@ impl Timers {
             last_wps: Instant::now() - Duration::from_secs(10),
             last_foreground: Instant::now() - Duration::from_secs(10),
             foreground: None,
-            foreground_false: 0,
         }
     }
 }
@@ -1755,6 +2131,8 @@ pub fn tick(
     t: &mut Timers,
     system_dark: bool,
 ) {
+    #[cfg(unix)]
+    settings_window::poll(rt, app, ip, wps_bridge.as_ref());
     let update = poll_wps(app.wps_debug, app.whiteboard, app.wps_test_mode, wps_bridge);
     tick_shared(rt, app, ip, wps_bridge.as_ref(), &update, t, system_dark);
     resolve_drawing_tools_auto_update(rt, app);
@@ -1840,37 +2218,74 @@ pub fn poll_wps(enabled: bool, whiteboard: bool, test_mode: bool, wps_bridge: &m
 
 pub fn tick_shared(rt: &Rt, app: &mut App, _ip: &mut Ip,
     wps_bridge: Option<&WpsBridge>, update: &WpsUpdate, t: &mut Timers, system_dark: bool) {
-    if app.update_system_theme(system_dark) { rt.redraw_full(app); }
-    tick_launch(rt, app, wps_bridge, update.connected);
-    if app.sidebar_expand_due() { expand_sidebars(rt, app); }
-    // Sample foreground at a low rate. Doing this every 4ms caused hundreds of
-    // X11 round trips per second and made the page/mode state flutter on slow
-    // classroom machines. Require two consecutive "not foreground" samples so
-    // a transient focus change cannot leave presentation mode.
-    let had_foreground_sample = t.foreground.is_some();
-    let was_visible = match t.foreground {
-        Some(false) => had_foreground_sample && t.foreground_false < 2,
-        _ => true,
-    };
-    if t.last_foreground.elapsed() >= Duration::from_millis(500) {
-        t.last_foreground = Instant::now();
-        let sample = rt.wps_foreground();
-        if sample == Some(false) { t.foreground_false = t.foreground_false.saturating_add(1); }
-        else { t.foreground_false = 0; }
-        t.foreground = sample;
-        let now_visible = match t.foreground {
-            Some(false) => had_foreground_sample && t.foreground_false < 2,
-            _ => true,
-        };
-        if now_visible != was_visible {
-            if now_visible { diag_log::info("WPS/覆盖层进入前台，恢复放映 UI"); }
-            else { diag_log::warn("WPS/覆盖层离开前台，隐藏放映 UI"); }
+    if app.update_system_theme(system_dark) {
+        rt.redraw_preferences(app, app.previewing_sidebars());
+    }
+    let now=now_ms();
+    if app.settings_ui.animating() && now-app.settings_ui.last_frame>=16 {
+        app.settings_ui.last_frame=now;
+        if app.settings_ui.window_size().is_some() {
+            // A modal fade changes only its own window. A theme fade also
+            // changes the sidebar samples on the Appearance tab.
+            rt.redraw_preferences(app, app.previewing_sidebars() && app.settings_ui.theme_from.is_some());
+        } else if app.settings_ui.theme_from.is_some() || app.settings_ui.modal() {
+            rt.redraw_full(app);
+        } else {
+            for (visible,r) in [(app.settings_open,ui::settings_rect(app)),
+                (app.process_block_open,ui::process_block_rect(app)),
+                (app.show_diag,ui::diag_rect(app)),(app.confirm_quit,ui::confirm_rect(app))] {
+                if visible { rt.redraw(app,R {x:r.x-12,y:r.y-12,w:r.w+24,h:r.h+24}); }
+            }
         }
     }
-    let wps_visible = match t.foreground {
-        Some(false) => had_foreground_sample && t.foreground_false < 2,
-        _ => true,
-    };
+    if app.settings_ui.closing_at>0 && now-app.settings_ui.closing_at>=120 {
+        #[cfg(unix)]
+        settings_window::close(rt, app, _ip);
+        app.settings_ui.closing_at=0;
+        app.settings_open=false;
+        apply_input_shape(rt,app);
+        rt.redraw_full(app);
+    }
+    if app.settings_ui.overlay_closing_at>0 && now-app.settings_ui.overlay_closing_at>=120 {
+        app.settings_ui.overlay_closing_at=0;
+        app.settings_ui.dialog=None;
+        app.settings_ui.picker=None;
+        _ip.picker_drag=None;
+        apply_input_shape(rt,app);
+        rt.redraw_preferences(app, false);
+    }
+    if app.settings_ui.theme_from.is_some_and(|(_,start)|now-start>=220) {
+        app.settings_ui.theme_from=None;
+        app.launch.card.get_mut().take();
+        rt.redraw_preferences(app, app.previewing_sidebars());
+    }
+    if app.settings_ui.toggle.is_some_and(|(_,_,start)|now-start>=180) {
+        app.settings_ui.toggle=None;
+        rt.redraw_preferences(app, false);
+    }
+    if app.settings_ui.toast_until>0 && now>=app.settings_ui.toast_until {
+        app.settings_ui.toast_until=0;
+        if app.settings_open {rt.redraw(app,ui::settings_rect(app));}
+    }
+    tick_launch(rt, app, wps_bridge, update.connected);
+    if app.sidebar_expand_due() { expand_sidebars(rt, app); }
+    // Limit X11 round trips in the periodic repaint path. User actions also
+    // check focus directly so they cannot use stale navigation availability.
+    let was_visible = t.foreground != Some(false);
+    if t.last_foreground.elapsed() >= Duration::from_millis(250) {
+        t.last_foreground = Instant::now();
+        t.foreground = rt.wps_foreground();
+        let now_visible = t.foreground != Some(false);
+        if now_visible != was_visible {
+            if now_visible {
+                diag_log::info("WPS 演示进入前台，恢复放映联动");
+            } else {
+                if let Some(bridge) = wps_bridge { bridge.discard_pending_navigation(); }
+                diag_log::info("WPS 演示离开前台，暂停放映联动");
+            }
+        }
+    }
+    let wps_visible = t.foreground != Some(false);
     let jump_epoch = if app.wps_debug && wps_visible { wps_bridge.and_then(WpsBridge::jump_epoch) } else { None };
     let jump_changed = app.wps_can_jump != jump_epoch.is_some() || app.wps_deck_epoch != jump_epoch.unwrap_or(-1);
     app.wps_can_jump = jump_epoch.is_some();
@@ -1986,8 +2401,9 @@ pub fn tick_shared(rt: &Rt, app: &mut App, _ip: &mut Ip,
             app.wps_real_pos = pos;
         }
     }
-    let navigation_ready = navigation_route(linked_show, wps_bridge.is_some_and(|w| w.ready()),
-        rt.backend.can_inject_keys_without_prompt()) != NavigationRoute::Unavailable;
+    let navigation_ready = (!app.wps_debug || !update.connected || wps_visible)
+        && navigation_route(linked_show, wps_bridge.is_some_and(|w| w.ready()),
+            rt.backend.can_inject_keys_without_prompt()) != NavigationRoute::Unavailable;
     let action = if linked_show {
         ui::PresentationAction::End
     } else if app.wps_debug && wps_visible && (

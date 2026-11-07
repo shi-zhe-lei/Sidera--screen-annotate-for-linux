@@ -10,6 +10,8 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import {Peer, listen} from './bridge.js';
 import {chromeParameters} from './chrome.js';
+import {keyText} from './keyboard.js';
+import {isWpsPresentation} from './presentation.js';
 
 const TILE = 256;
 const MAX_PIXELS = 67108864;
@@ -47,6 +49,7 @@ class Output {
         this.rects = [];
         this.inputDirty = true;
         this.ready = false;
+        this.textInputOn = false;
         this.destroyed = false;
         this.root = new St.Widget({reactive: false, x: monitor.x, y: monitor.y,
             width: monitor.width, height: monitor.height, visible: false});
@@ -124,6 +127,7 @@ class Output {
     clearInput() {
         this.releasePointer();
         const inputs = this.inputs;
+        if (inputs.includes(global.stage.get_key_focus())) global.stage.set_key_focus(null);
         this.inputs = [];
         this.inputDirty = true;
         for (const actor of inputs) {
@@ -140,13 +144,21 @@ class Output {
         this.clearInput();
         if (!this.ready || !this.owner.active()) return;
         for (const [x, y, width, height] of this.rects) {
-            const actor = new St.Widget({reactive: true, can_focus: false,
+            const actor = new St.Widget({reactive: true, can_focus: this.textInputOn,
                 x: this.monitor.x + x, y: this.monitor.y + y, width, height});
             actor.connect('event', (_actor, event) => this.event(actor, event));
             addChromeActor(actor, true);
             this.inputs.push(actor);
         }
         this.inputDirty = false;
+        if (this.textInputOn) this.inputs[0]?.grab_key_focus();
+    }
+
+    textInput(enabled) {
+        this.textInputOn = enabled === true;
+        for (const actor of this.inputs) actor.can_focus = this.textInputOn;
+        if (this.textInputOn) this.inputs[0]?.grab_key_focus();
+        else if (this.inputs.includes(global.stage.get_key_focus())) global.stage.set_key_focus(null);
     }
 
     grabPointer(actor) {
@@ -194,6 +206,20 @@ class Output {
             return Clutter.EVENT_PROPAGATE;
         }
         const kind = event.type();
+        if (kind === Clutter.EventType.KEY_PRESS && this.textInputOn) {
+            const sym = event.get_key_symbol();
+            const ctrl = (event.get_state() & Clutter.ModifierType.CONTROL_MASK) !== 0;
+            const names = new Map([[0xff0d, 'enter'], [0xff8d, 'enter'], [0xff1b, 'escape'],
+                [0xff08, 'backspace'], [0xffff, 'delete'], [0xff51, 'left'], [0xff53, 'right'],
+                [0xff50, 'home'], [0xff57, 'end']]);
+            let key = names.get(sym);
+            if (ctrl && (sym === 65 || sym === 97)) key = 'select_all';
+            if (ctrl && (sym === 86 || sym === 118)) key = 'paste';
+            const text = !ctrl && !key ? keyText(event.get_key_unicode(), sym) : '';
+            if (key || text) this.owner.peer?.send({type: 'value_key', generation: this.owner.generation,
+                id: this.monitor.id, key: key ?? '', text});
+            return Clutter.EVENT_STOP;
+        }
         // Clutter supplies real touch events as well as optional emulated mouse
         // events. Processing both would draw and activate buttons twice.
         if (event.is_pointer_emulated?.()) return Clutter.EVENT_STOP;
@@ -313,13 +339,18 @@ export default class SideraNative extends Extension {
         this.pointer = null;
         this.keysBound = false;
         this.hotkey = false;
+        this.focusWindow = null;
+        this.focusTitleSignal = 0;
         try {
             this.stopListening = listen(connection => this.connected(connection));
             const watch = (object, signal, callback) => this.signals.push([object, object.connect(signal, callback)]);
             watch(Main.layoutManager, 'monitors-changed', () => this.refreshMonitors());
-            watch(Main.sessionMode, 'updated', () => this.visibility());
-            watch(Main.overview, 'showing', () => this.visibility());
-            watch(Main.overview, 'hidden', () => this.visibility());
+            const visibilityChanged = () => { this.visibility(); this.sendState(); };
+            watch(Main.sessionMode, 'updated', visibilityChanged);
+            watch(Main.overview, 'showing', visibilityChanged);
+            watch(Main.overview, 'hidden', visibilityChanged);
+            watch(global.display, 'notify::focus-window', () => this.trackFocus());
+            this.trackFocus();
             this.settings = this.getSettings();
             this.timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
                 if (this.peer && GLib.get_monotonic_time() - this.peer.lastSeen > 5000000)
@@ -343,6 +374,33 @@ export default class SideraNative extends Extension {
         this.sources.add(id);
     }
     visibility() { for (const output of this.outputs.values()) output.visibility(); }
+    wpsForeground() {
+        const window = global.display.focus_window;
+        return Boolean(this.active() && window &&
+            isWpsPresentation(window.get_wm_class_instance(), window.get_wm_class(), window.get_title()));
+    }
+    sendState() {
+        const window = global.display.focus_window;
+        this.peer?.send({type: 'state', generation: this.generation,
+            fullscreen: window?.is_fullscreen() ? window.get_monitor() : -1,
+            wpsPresentation: this.wpsForeground()});
+    }
+    trackFocus() {
+        const window = global.display.focus_window;
+        if (window !== this.focusWindow) {
+            this.clearFocus();
+            this.focusWindow = window;
+            if (window)
+                this.focusTitleSignal = window.connect('notify::title', () => this.sendState());
+        }
+        this.sendState();
+    }
+    clearFocus() {
+        if (this.focusTitleSignal)
+            this.focusWindow.disconnect(this.focusTitleSignal);
+        this.focusTitleSignal = 0;
+        this.focusWindow = null;
+    }
     clearOutputs() {
         const outputs = [...this.outputs.values()];
         this.outputs.clear();
@@ -427,6 +485,7 @@ export default class SideraNative extends Extension {
             for (const monitor of this.monitors) this.outputs.set(monitor.index, new Output(this, monitor));
             peer.send({type: 'hello', protocol: 1, generation: this.generation, monitors: this.monitors,
                 capabilities: {keyboard: true, rightClick: true, screenshot: true, hotkey: this.hotkey, touchShape: false}});
+            this.trackFocus();
         } catch (error) { this.connectionFailed(error, peer); }
     }
 
@@ -441,9 +500,7 @@ export default class SideraNative extends Extension {
         }
         if (message.type === 'ping') {
             this.visibility();
-            const window = global.display.focus_window;
-            this.peer.send({type: 'state', generation: this.generation,
-                fullscreen: window?.is_fullscreen() ? window.get_monitor() : -1});
+            this.sendState();
             return;
         }
         if (message.generation !== this.generation) return;
@@ -452,9 +509,11 @@ export default class SideraNative extends Extension {
         case 'begin': output?.begin(message.width, message.height); break;
         case 'end': output?.end(); break;
         case 'input': output?.input(message.rects, message.full); break;
+        case 'text_input': output?.textInput(message.enabled); break;
         case 'screenshot': if (this.active()) this.screenshot(); break;
         case 'key': {
             if (!this.active()) break;
+            if ((message.presentationOnly || message.key === 'StartShow') && !this.wpsForeground()) break;
             const time = GLib.get_monotonic_time();
             if (message.key === 'StartShow') {
                 const shift = Clutter.KEY_Shift_L;
@@ -527,6 +586,7 @@ export default class SideraNative extends Extension {
         this.peer?.close(); this.peer = null;
         this.clearOutputs();
         this.stopListening?.(); this.stopListening = null;
+        this.clearFocus();
         for (const [object, id] of this.signals ?? []) object.disconnect(id);
         this.signals = [];
         if (this.timer) GLib.source_remove(this.timer);

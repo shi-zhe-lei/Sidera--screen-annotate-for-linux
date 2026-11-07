@@ -116,6 +116,8 @@ struct Controls {
     drawing_tools: bool, saved_drawing_tools: bool,
     page: i32, color: usize, pen: usize, eraser: usize, wps: bool, wps_test: bool, linked_show: bool,
     alpha: u8, scale: f64, right_click: bool,
+    sidebar_expand_minutes: u32,
+    recent_colors: Vec<u32>,
     threshold: f64, erase_scale: i32,
     theme: crate::ui_theme::Theme,
 }
@@ -128,6 +130,8 @@ impl Controls {
             wps: app.wps_debug, wps_test: app.wps_test_mode, alpha: app.sidebar_alpha, scale: app.sb_scale,
             linked_show: app.wps_debug && app.wps_connected && app.wps_real_pos > 0,
             right_click: app.right_click_cursor_on,
+            sidebar_expand_minutes: app.sidebar_expand_minutes,
+            recent_colors: app.settings_ui.recent.clone(),
             theme: app.theme,
             threshold: app.large_touch_threshold, erase_scale: app.large_erase_scale10 }
     }
@@ -152,6 +156,8 @@ impl Controls {
         a.cur_color = self.color; a.cur_pen = self.pen; a.cur_eraser = self.eraser;
         a.wps_debug = self.wps; a.wps_test_mode = self.wps_test;
         a.sidebar_alpha = self.alpha; a.sb_scale = self.scale;
+        a.sidebar_expand_minutes = self.sidebar_expand_minutes;
+        a.settings_ui.recent.clone_from(&self.recent_colors);
         a.right_click_cursor_on = self.right_click;
         a.large_touch_threshold = self.threshold; a.large_erase_scale10 = self.erase_scale;
         crate::apply_input_shape(&output.rt, a);
@@ -176,7 +182,6 @@ impl Desktop {
         let mut app = App::new(Pixmap::new(1, 1).unwrap(), 1920, 1080);
         app::load_settings(&mut app);
         app.update_system_theme(crate::system_theme::dark());
-        if let Ok(value) = std::env::var("WPS_API_DEBUG") { app.wps_debug = value == "1"; }
         crate::process_block::set_daemon_enabled(app.process_block_enabled);
         Self { outputs: BTreeMap::new(), wps: None, controls: Controls::read(&app),
             detached: VecDeque::new(), fonts, icon, icon_big, single, starting: true }
@@ -211,6 +216,12 @@ impl Desktop {
             crate::cancel_input(&output.rt, &mut output.app, &mut output.ip);
             output.app.launch.finish();
             output.app.settings_open = false;
+            output.app.settings_ui.dialog = None;
+            output.app.settings_ui.picker = None;
+            output.app.settings_ui.editor = None;
+            output.rt.backend.set_text_input(false);
+            output.app.settings_ui.closing_at = 0;
+            output.app.settings_ui.overlay_closing_at = 0;
             self.detached.push_back((id.to_string(), output.app));
             // Keep a bounded number of disconnected displays for projector reconnection.
             while self.detached.len() > 2 { self.detached.pop_front(); }
@@ -285,6 +296,10 @@ impl Desktop {
         if let Some(o) = self.outputs.get_mut(id) { crate::on_press(&o.rt, &mut o.app, &mut o.ip, self.wps.as_ref(), x, y, button); }
         self.synchronize(id);
     }
+    pub fn value_key(&mut self, id: &str, key: crate::value_input::Key) {
+        if let Some(o) = self.outputs.get_mut(id) { crate::text_input_key(&o.rt, &mut o.app, key); }
+        self.synchronize(id);
+    }
     pub fn release(&mut self, id: &str, x: i32, y: i32, button: u8) {
         if let Some(o) = self.outputs.get_mut(id) { crate::on_release(&o.rt, &mut o.app, &mut o.ip, self.wps.as_ref(), x, y, button); }
         self.synchronize(id);
@@ -317,8 +332,21 @@ impl Desktop {
         }
         self.resolve_drawing_tools_auto_update();
     }
+    pub(crate) fn settings_animating(&self) -> bool {
+        self.outputs.values().any(|output| output.app.settings_ui.animating())
+    }
+
     pub fn tick(&mut self) {
         if self.outputs.values().any(|o| !o.launch_pending && o.app.canvas.width() > 1) { self.starting = false; }
+        let window_inputs: Vec<_> = self.outputs.iter_mut()
+            .filter_map(|(id, output)| {
+                crate::settings_window::poll(&output.rt, &mut output.app, &mut output.ip, self.wps.as_ref())
+                    .then(|| id.clone())
+            })
+            .collect();
+        for id in window_inputs {
+            self.synchronize(&id);
+        }
         let update = crate::poll_wps(self.controls.wps, self.controls.whiteboard, self.controls.wps_test, &mut self.wps);
         for output in self.outputs.values_mut() {
             crate::tick_shared(&output.rt, &mut output.app, &mut output.ip, self.wps.as_ref(), &update, &mut output.timers, crate::system_theme::dark());

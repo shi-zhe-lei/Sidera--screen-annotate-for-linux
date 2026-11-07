@@ -27,6 +27,22 @@ pub const XK_SHIFT_L: u32 = 0xffe1;
 pub const XK_BACKSPACE: u32 = 0xff08;
 pub const XK_RETURN: u32 = 0xff0d;
 
+fn wps_presentation_title(title: &str) -> bool {
+    let title = title.trim().to_lowercase();
+    let document = title.rsplit_once(" - ")
+        .filter(|(_, suffix)| matches!(*suffix, "wps office" | "wps presentation" | "wps 演示" | "wps演示"))
+        .map_or(title.as_str(), |(document, _)| document)
+        .trim_end_matches([' ', '*']);
+    document.rsplit_once('.').is_some_and(|(_, extension)| matches!(extension,
+        "dps" | "dpt" | "ppt" | "pptx" | "pptm" | "pps" | "ppsx" | "ppsm" | "pot" | "potx" | "potm"))
+        || ["演示文稿", "presentation"].into_iter().any(|prefix| {
+            document.strip_prefix(prefix).is_some_and(|number| {
+                let number = number.trim();
+                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        })
+}
+
 pub struct X11 {
     pub conn: RustConnection,
     #[allow(dead_code)]
@@ -41,6 +57,7 @@ pub struct X11 {
     pub net_wm_state: Atom,
     pub net_wm_fullscreen: Atom,
     pub net_active_window: Atom,
+    net_wm_name: Atom,
     pub net_wm_cm: Atom,
     pub key_escape: Keycode,
     pub key_up: Keycode,
@@ -92,6 +109,7 @@ impl X11 {
             xproto::intern_atom(&conn, false, b"_NET_WM_STATE_FULLSCREEN")?.reply()?.atom;
         let net_active_window =
             xproto::intern_atom(&conn, false, b"_NET_ACTIVE_WINDOW")?.reply()?.atom;
+        let net_wm_name = xproto::intern_atom(&conn, false, b"_NET_WM_NAME")?.reply()?.atom;
         let net_wm_cm = xproto::intern_atom(&conn, false, b"_NET_WM_CM_S0")?.reply()?.atom;
         let atom_touch_major =
             xproto::intern_atom(&conn, false, b"Abs MT Touch Major")?.reply()?.atom;
@@ -112,6 +130,7 @@ impl X11 {
             net_wm_state,
             net_wm_fullscreen,
             net_active_window,
+            net_wm_name,
             net_wm_cm,
             key_escape: 0,
             key_up: 0,
@@ -355,43 +374,51 @@ impl X11 {
         let _ = self.conn.flush();
     }
 
-    pub fn keycode_to_char(&self, keycode: Keycode, shift: bool) -> Option<char> {
+    pub fn text_key(&self, keycode: Keycode, modifiers: xproto::KeyButMask) -> Option<crate::value_input::Key> {
+        use crate::value_input::Key;
+        use xproto::KeyButMask;
         if keycode == 0 {
             return None;
         }
-        let reply = xproto::get_keyboard_mapping(&self.conn, keycode, 1)
-            .ok()?
-            .reply()
-            .ok()?;
-        let per = reply.keysyms_per_keycode as usize;
-        if per == 0 {
-            return None;
+        let mapping = xproto::get_keyboard_mapping(&self.conn, keycode, 1).ok()?.reply().ok()?;
+        let symbols = &mapping.keysyms;
+        for (symbol, key) in [
+            (XK_ESCAPE, Key::Escape), (XK_RETURN, Key::Enter), (0xff8d, Key::Enter),
+            (XK_BACKSPACE, Key::Backspace), (0xffff, Key::Delete),
+            (0xff51, Key::Left), (0xff53, Key::Right), (0xff50, Key::Home), (0xff57, Key::End),
+        ] {
+            if symbols.contains(&symbol) {
+                return Some(key);
+            }
         }
-        let index = if shift { 1.min(per - 1) } else { 0 };
-        let keysym = *reply.keysyms.get(index)?;
-        let ch = char::from_u32(keysym)?;
-        if ch.is_control() {
-            None
-        } else {
-            Some(ch)
+        if modifiers.contains(KeyButMask::CONTROL) {
+            return if symbols.iter().any(|&symbol| matches!(symbol, 0x41 | 0x61)) {
+                Some(Key::SelectAll)
+            } else if symbols.iter().any(|&symbol| matches!(symbol, 0x56 | 0x76)) {
+                Some(Key::Paste)
+            } else {
+                None
+            };
         }
-    }
-
-    pub fn keycode_is(&self, keycode: Keycode, keysym: u32) -> bool {
-        if keycode == 0 {
-            return false;
+        // Keypad keysyms are X11 codes, not Unicode characters. XKB may
+        // place the number in a secondary column next to a navigation key.
+        for &symbol in symbols {
+            match symbol {
+                0xffb0..=0xffb9 => return Some(Key::Character((b'0' + (symbol - 0xffb0) as u8) as char)),
+                0xffae | 0xffac => return Some(Key::Character('.')),
+                0xffad => return Some(Key::Character('-')),
+                _ => {}
+            }
         }
-        let Ok(cookie) = xproto::get_keyboard_mapping(&self.conn, keycode, 1) else {
-            return false;
+        let shifted = usize::from(modifiers.contains(KeyButMask::SHIFT));
+        let symbol = symbols.get(shifted).copied().filter(|&symbol| symbol != 0)
+            .or_else(|| symbols.first().copied())?;
+        let unicode = match symbol {
+            0x20..=0x7e | 0xa0..=0xff => symbol,
+            0x01000100..=0x0110ffff => symbol & 0x00ffffff,
+            _ => return None,
         };
-        let Ok(reply) = cookie.reply() else {
-            return false;
-        };
-        reply
-            .keysyms
-            .iter()
-            .take(reply.keysyms_per_keycode as usize)
-            .any(|value| *value == keysym)
+        char::from_u32(unicode).filter(|ch| !ch.is_control()).map(Key::Character)
     }
 
     pub fn fake_key(&self, keycode: Keycode) {
@@ -629,27 +656,47 @@ impl X11 {
         false
     }
 
-    /// 当前活动窗口是否属于 WPS 类办公软件或本覆盖层。
-    /// 用于避免后台放映窗口仍把 Sidera 切到放映模式。
-    pub fn is_office_foreground(&self, self_win: Window) -> Option<bool> {
+    pub fn is_wps_presentation_foreground(&self) -> bool {
         let active = xproto::get_property(&self.conn, false, self.root, self.net_active_window,
-            AtomEnum::WINDOW, 0, 1).ok()?.reply().ok()?
-            .value32()?.next()?;
-        if active == x11rb::NONE {
-            return None;
-        }
+            AtomEnum::WINDOW, 0, 1).ok().and_then(|cookie| cookie.reply().ok())
+            .and_then(|reply| reply.value32()?.next());
+        // Old non-EWMH window managers may only expose the X keyboard focus.
+        let active = active.or_else(|| xproto::get_input_focus(&self.conn).ok()
+            .and_then(|cookie| cookie.reply().ok()).map(|reply| reply.focus));
+        let Some(active) = active.filter(|&window| window > 1) else { return false };
         let mut window = active;
         for _ in 0..32 {
-            if window == self_win || self.is_office_window(window) {
-                return Some(true);
+            if self.is_wps_presentation_window(window) {
+                return true;
             }
-            let parent = xproto::query_tree(&self.conn, window).ok()?.reply().ok()?.parent;
+            let Some(parent) = xproto::query_tree(&self.conn, window).ok()
+                .and_then(|cookie| cookie.reply().ok()).map(|tree| tree.parent) else { break };
             if parent == x11rb::NONE || parent == self.root {
                 break;
             }
             window = parent;
         }
-        Some(false)
+        false
+    }
+
+    fn is_wps_presentation_window(&self, window: Window) -> bool {
+        let Some(class) = xproto::get_property(&self.conn, false, window, AtomEnum::WM_CLASS,
+            AtomEnum::STRING, 0, 64).ok().and_then(|cookie| cookie.reply().ok()) else { return false };
+        let class = String::from_utf8_lossy(&class.value).to_ascii_lowercase();
+        let fields = || class.split('\0');
+        if fields().any(|name| matches!(name, "wpp" | "wps-office-wpp" | "com.kingsoft.wps.wpp")) {
+            return true;
+        }
+        // Integrated WPS uses one WM_CLASS for Writer, Spreadsheets and
+        // Presentation. Its active document title changes even within a tabbed window.
+        if !fields().any(|name| matches!(name, "wpsoffice" | "wps-office" | "com.kingsoft.wpsoffice" | "wps")) {
+            return false;
+        }
+        let read_title = |atom| xproto::get_property(&self.conn, false, window, atom,
+            AtomEnum::ANY, 0, 1024).ok().and_then(|cookie| cookie.reply().ok())
+            .filter(|reply| !reply.value.is_empty() && reply.format == 8);
+        read_title(self.net_wm_name).or_else(|| read_title(AtomEnum::WM_NAME.into()))
+            .is_some_and(|title| wps_presentation_title(&String::from_utf8_lossy(&title.value)))
     }
 
     fn is_office_window(&self, w: Window) -> bool {
@@ -739,6 +786,7 @@ pub struct X11Plat {
     refresh_input_regions: bool,
     input_region: RefCell<Option<(bool, Vec<Rectangle>)>>,
     input_refresh_pending: Cell<bool>,
+    text_keyboard_grabbed: Cell<bool>,
     key_injector: RefCell<Option<crate::uinput::KeyInjector>>,
 }
 
@@ -753,7 +801,7 @@ struct TouchAxis {
 
 impl X11Plat {
     pub fn grab_text_keyboard(&self) -> bool {
-        xproto::grab_keyboard(
+        let grabbed = xproto::grab_keyboard(
             &self.x11.conn,
             false,
             self.win,
@@ -763,20 +811,15 @@ impl X11Plat {
         )
         .ok()
         .and_then(|cookie| cookie.reply().ok())
-        .is_some()
+        .is_some_and(|reply| reply.status == xproto::GrabStatus::SUCCESS);
+        self.text_keyboard_grabbed.set(grabbed);
+        grabbed
     }
 
     pub fn ungrab_text_keyboard(&self) {
+        self.text_keyboard_grabbed.set(false);
         let _ = xproto::ungrab_keyboard(&self.x11.conn, 0u32);
         let _ = self.x11.conn.flush();
-    }
-
-    pub fn keycode_to_char(&self, keycode: Keycode, shift: bool) -> Option<char> {
-        self.x11.keycode_to_char(keycode, shift)
-    }
-
-    pub fn keycode_is(&self, keycode: Keycode, keysym: u32) -> bool {
-        self.x11.keycode_is(keycode, keysym)
     }
 
     pub fn new(x11: X11, win: Window, gc: Gcontext) -> XResult<Self> {
@@ -808,6 +851,7 @@ impl X11Plat {
             refresh_input_regions,
             input_region: RefCell::new(None),
             input_refresh_pending: Cell::new(false),
+            text_keyboard_grabbed: Cell::new(false),
             key_injector,
         };
         plat.raise_overlays()?;
@@ -852,7 +896,8 @@ impl X11Plat {
     /// Never unmap during an active press/touch: that would cancel its grab and
     /// can discard the release. The caller redraws the retained canvas afterward.
     pub fn refresh_input_window(&self, input_idle: bool) -> XResult<bool> {
-        if !self.input_refresh_pending.get() || !input_idle {
+        // Unmapping the grab window would release the keyboard in mid-edit.
+        if !self.input_refresh_pending.get() || !input_idle || self.text_keyboard_grabbed.get() {
             return Ok(false);
         }
         let pointer = xproto::query_pointer(&self.x11.conn, self.x11.root)?.reply()?;
@@ -1058,7 +1103,7 @@ impl crate::backend::Backend for X11Plat {
     fn set_text_input(&self, on: bool) {
         if on {
             if !self.grab_text_keyboard() {
-                log::warn!("无法抓取键盘，进程名可先复制后用“粘贴”");
+                log::warn!("X11 输入层未能取得键盘焦点");
             }
         } else {
             self.ungrab_text_keyboard();
@@ -1115,7 +1160,7 @@ impl crate::backend::Backend for X11Plat {
         self.x11.is_presentation_fullscreen(self.win)
     }
     fn presentation_foreground(&self) -> Option<bool> {
-        self.x11.is_office_foreground(self.win)
+        Some(self.x11.is_wps_presentation_foreground())
     }
     fn has_compositor(&self) -> bool {
         self.x11.has_compositor()

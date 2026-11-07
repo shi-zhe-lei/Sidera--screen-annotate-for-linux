@@ -14,54 +14,21 @@ mod linux {
 
     use std::collections::HashSet;
     use std::io::Read;
-    use std::path::PathBuf;
     use std::time::Duration;
 
-    use tiny_skia::{IntSize, Pixmap};
+    use tiny_skia::Pixmap;
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{ConnectionExt, KeyButMask};
     use x11rb::protocol::Event;
 
-fn process_key(rt: &Rt, app: &mut App, keycode: u8, state: KeyButMask) -> bool {
-    let Some(xp) = rt.backend.as_any().downcast_ref::<x11::X11Plat>() else {
+fn process_key(rt: &Rt, app: &mut App, keycode: u8, modifiers: KeyButMask) -> bool {
+    let Some(platform) = rt.backend.as_any().downcast_ref::<x11::X11Plat>() else {
         return false;
     };
-    if xp.keycode_is(keycode, x11::XK_ESCAPE) {
-        set_process_keyboard(rt, app, false);
-        rt.redraw(app, ui::process_block_rect(app));
-        return true;
+    if let Some(key) = platform.x11.text_key(keycode, modifiers) {
+        text_input_key(rt, app, key);
     }
-    if xp.keycode_is(keycode, x11::XK_RETURN) {
-        add_process_input(app);
-        rt.redraw(app, ui::process_block_rect(app));
-        return true;
-    }
-    if xp.keycode_is(keycode, x11::XK_BACKSPACE) {
-        app.process_input.pop();
-        rt.redraw(app, ui::process_block_rect(app));
-        return true;
-    }
-    if state.contains(KeyButMask::CONTROL) {
-        if let Some(ch) = xp.keycode_to_char(keycode, false) {
-            if ch.eq_ignore_ascii_case(&'v') {
-                if let Some(text) = clipboard::get_text() {
-                    app.process_input = text.chars().take(256).collect();
-                    rt.redraw(app, ui::process_block_rect(app));
-                }
-                return true;
-            }
-        }
-        return false;
-    }
-    let shift = state.contains(KeyButMask::SHIFT);
-    if let Some(ch) = xp.keycode_to_char(keycode, shift) {
-        if !ch.is_control() && app.process_input.chars().count() < 256 {
-            app.process_input.push(ch);
-            rt.redraw(app, ui::process_block_rect(app));
-        }
-        return true;
-    }
-    false
+    true
 }
 fn touch_dev(deviceid: u16, sourceid: u16) -> u8 {
     (if sourceid != 0 { sourceid } else { deviceid }) as u8
@@ -136,7 +103,7 @@ fn handle_event(rt: &Rt, app: &mut App, ip: &mut Ip, wps: Option<&WpsBridge>, ev
             if ip.pending_ui.is_some() { on_motion(rt, app, ip, -1, -1); }
         }
         Event::KeyPress(e) => {
-            if app.process_block_open && app.process_input_active
+            if (app.settings_ui.editor.is_some() || (app.process_block_open && app.process_input_active))
                 && process_key(rt, app, e.detail, e.state) { return; }
             let mods = KeyButMask::CONTROL | KeyButMask::SHIFT;
             let key_d = rt
@@ -230,57 +197,9 @@ fn handle_event(rt: &Rt, app: &mut App, ip: &mut Ip, wps: Option<&WpsBridge>, ev
     }
 }
 fn load_icon(size: u32) -> Option<Pixmap> {
-    let mut cands: Vec<PathBuf> = Vec::new();
-    if let Ok(env) = std::env::var("SIDERA_ICON") {
-        cands.push(PathBuf::from(env));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for up in 0..5 {
-                let mut d = dir.to_path_buf();
-                for _ in 0..up {
-                    d = d.join("..");
-                }
-                cands.push(d.join("sidera.png"));
-            }
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        for up in 0..3 {
-            let mut d = cwd.clone();
-            for _ in 0..up {
-                d = d.join("..");
-            }
-            cands.push(d.join("sidera.png"));
-        }
-    }
-    cands.push(PathBuf::from("/usr/share/sidera/sidera.png"));
-    cands.push(PathBuf::from(
-        "/usr/share/icons/hicolor/256x256/apps/sidera.png",
-    ));
-    for p in cands {
-        let Ok(img) = image::open(&p) else { continue };
-        let rgba = image::imageops::resize(
-            &img.to_rgba8(),
-            size,
-            size,
-            image::imageops::FilterType::Lanczos3,
-        );
-        let mut data = vec![0u8; (size * size * 4) as usize];
-        for (i, px) in rgba.pixels().enumerate() {
-            let a = px[3] as u16;
-            let mul = |c: u8| ((c as u16 * a + 127) / 255) as u8;
-            data[i * 4] = mul(px[0]);
-            data[i * 4 + 1] = mul(px[1]);
-            data[i * 4 + 2] = mul(px[2]);
-            data[i * 4 + 3] = px[3];
-        }
-        if let Some(pm) = Pixmap::from_vec(data, IntSize::from_wh(size, size)?) {
-            return Some(pm);
-        }
-    }
-    None
+    sidera_core::ui_icons::app_icon(size)
 }
+
 fn single_instance() -> Result<Option<UnixListener>, Box<dyn std::error::Error>> {
     let command: &[u8] = if std::env::args().any(|arg| arg == "--toggle") { b"toggle" } else { b"show" };
     let instance = instance::acquire(command).map_err(|error| format!("无法创建单实例通信文件：{error}"))?;
@@ -421,15 +340,10 @@ fn run_application() -> Result<(), Box<dyn std::error::Error>> {
     canvas.fill(tiny_skia::Color::TRANSPARENT);
     let mut app = App::new(canvas, logical_w, logical_h);
     app::load_settings(&mut app);
-    app.more_settings_entry = gnome_desktop;
     app.update_system_theme(system_theme::dark());
     // X11 DPI 缩放：逻辑尺寸 × scale = 物理分辨率画布
     app.set_scale(scale);
     app.show_input_group_prompt = need_input_group;
-    // 环境变量仅本次运行覆盖（不落盘），与 C++ 版一致
-    if let Ok(v) = std::env::var("WPS_API_DEBUG") {
-        app.wps_debug = v == "1";
-    }
     process_block::set_daemon_enabled(app.process_block_enabled);
 
     let rt = Rt {
@@ -770,6 +684,7 @@ fn run_application() -> Result<(), Box<dyn std::error::Error>> {
         let busy = app.is_drawing || ip.dragging || ip.slider.is_some()
             || ip.pending_ui.is_some() || app.press.is_some()
             || app.launch.active() || ui::sidebar_animating(&app)
+            || app.settings_ui.animating()
             || app.open_anim != 0 || app.page_picker.is_some();
         std::thread::sleep(Duration::from_millis(if busy { 4 } else { 12 }));
     }

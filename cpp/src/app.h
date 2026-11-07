@@ -116,7 +116,7 @@ struct AppState {
   // 颜色 + 粗细
   QVector<QColor> colors     = { QColor(255,40,40), QColor(50,120,255), QColor(40,200,60), QColor(255,210,30), QColor(240,240,240),
                                  QColor("#0ABAB5"), QColor("#AB47BC"), QColor("#C9DD22"),
-                                 QColor("#FF6D00"), QColor("#795548") };
+                                 QColor("#FF6D00"), QColor("#000000") };
   QVector<int> penSizes      = { 3, 5, 10 };
   QVector<int> eraserSizes   = { 12, 24, 48 };
   int curColor   = 0;

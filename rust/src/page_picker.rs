@@ -30,6 +30,10 @@ impl PagePicker {
             scroll_goal: position, last_scroll: None }
     }
     pub fn dragging(&self) -> bool { self.drag.is_some() }
+    pub fn set_selected(&mut self,page:i32) {
+        self.drag=None;self.snap=None;self.last_scroll=None;
+        self.position=page.clamp(1,self.total) as f64;self.scroll_goal=self.position;
+    }
     pub fn selected(&self) -> i32 {
         self.snap.as_ref().map_or(self.position, |s| s.to).round().clamp(1.0, self.total as f64) as i32
     }

@@ -144,14 +144,14 @@ fn run() -> Result<(), String> {
     let rt = Rt {
         backend: plat,
         fonts,
-        icon: None,
-        icon_big: None,
+        icon: sidera_core::ui_icons::app_icon(44),
+        icon_big: sidera_core::ui_icons::app_icon(84),
         batching: Cell::new(false),
         dirty: RefCell::new(Vec::new()),
     };
 
     if let Ok(path) = std::env::var("SIDERA_RENDER_PNG") {
-        let pm = ui::render_region(&app, &rt.fonts, None, 0, 0, app.screen_w, app.screen_h)
+        let pm = ui::render_region(&app, &rt.fonts, rt.icon.as_ref(), 0, 0, app.screen_w, app.screen_h)
             .ok_or("渲染失败")?;
         save_png(&pm, &path)?;
         log(&format!("rendered {path}"));
@@ -251,6 +251,7 @@ fn run() -> Result<(), String> {
                     }
                 }
                 WinEvent::DisplayChanged => {}
+                WinEvent::ValueKey(key) => { sidera_core::text_input_key(&rt, &mut app, key); }
                 WinEvent::Quit => return Ok(()),
             }
         }

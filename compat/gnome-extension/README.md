@@ -10,6 +10,10 @@
 
 扩展版本 4 根据真实鼠标移动事件携带的按键状态，清除已经松开却残留的按下记录，并取消对应客户端拖动/点击；不根据闲置时间猜测松手，不触发补偿点击。Rust 同时限制只有左键能开始工具栏拖动，正在拖动时其他按下不能覆盖其归属。详见 [拖动释放记录](../../docs/audit/DRAG_RELEASE_2026-10-24.md)。
 
+扩展版本 7 修复原位输入的字符转换：GJS 的 `get_key_unicode()` 返回单字符字符串，旧逻辑错误地把数字字符再次当作编码转换，导致 `0`、小数点和 HEX 字母丢失，其余数字变成控制字符。现在保留字符本身，兼容数值码点返回值，并为缺少 Unicode 值的小键盘数字和小数点补充映射。界面继续使用原位输入，不增加输入框或弹窗。
+
+`get_key_unicode()` 的返回类型为 [`gunichar`](https://gnome.pages.gitlab.gnome.org/mutter/clutter/method.Event.get_key_unicode.html)。本次在虚拟机中仅查询同类型的 `GLib.utf8_get_char('1')`，结果为字符串 `"1"`，未操作桌面或安装更新。字符转换的 5 项隔离回归检查通过；可在仓库根目录使用 `node --test compat/gnome-extension/tests/keyboard.test.mjs` 运行。实际界面输入仍需应用更新后确认。
+
 ## 安装与切换
 
 扩展版本 6 在鼠标按住输入控件时使用 Clutter stage grab，持续接收工具栏外及屏幕顶部的移动和松开。正常释放、真实按键状态恢复、其他 Shell 抓取打断、锁屏、连接断开和扩展停用均释放抓取；不使用等待超时来判断松手，不改变键盘焦点或桌面的模态计数。扩展本身不限制坐标，屏幕边界由 Rust 的工具栏布局与拖动共同处理。依据：[Stage.grab](https://mutter.gnome.org/clutter/method.Stage.grab.html)、[Mutter 50.1 grab 生命周期](https://github.com/GNOME/mutter/blob/50.1/clutter/clutter/clutter-stage.c)、[Mutter 46 grab 撤销状态](https://github.com/GNOME/mutter/blob/46.0/clutter/clutter/clutter-grab.c)。隔离模块检查没有覆盖这项抓取交互，实际桌面操作仍由用户验收。

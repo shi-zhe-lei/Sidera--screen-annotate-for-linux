@@ -58,6 +58,13 @@ pub enum MoreHit {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SetHit {
+    EditSlider(SliderId),
+    Tab(crate::settings_state::Tab),
+    Logs,
+    Repository,
+    License,
+    InspectorPage(i32),
+    InspectorClose,
     Theme(theme::Preference),
     ResetSlider(SliderId),
     Autostart,
@@ -74,8 +81,10 @@ pub enum SetHit {
     SettingsPage(i32),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SliderId {
+    Position,
+    AutoExpand,
     Alpha,
     Scale,
     StartupDelay,
@@ -86,6 +95,8 @@ pub enum SliderId {
 impl SliderId {
     pub fn default_value(self) -> f32 {
         match self {
+            Self::Position => 50.0,
+            Self::AutoExpand => crate::app::DEFAULT_SIDEBAR_EXPAND_MINUTES as f32,
             Self::Alpha => crate::app::DEFAULT_SIDEBAR_ALPHA as f32,
             Self::Scale => crate::app::DEFAULT_SB_SCALE as f32,
             Self::StartupDelay => crate::app::DEFAULT_STARTUP_DELAY as f32,
@@ -98,27 +109,45 @@ impl SliderId {
 pub use crate::toolbar::PresentationAction;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PagePickerHit { Wheel, Cancel, Jump }
+pub enum PagePickerHit { Wheel, Input, Cancel, Jump }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum WhiteboardControl {
     Dots,
     DotSize,
+    DotValue,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Control {
+    Editor(crate::value_input::Hit),
+    Prompt(PromptHit),
+    Process(ProcessHit),
+    Dialog(crate::settings_state::DialogHit),
+    Picker(crate::settings_state::PickerHit),
     Sidebar(Btn, bool), Popup(PopupHit), More(MoreHit), Setting(SetHit),
     Slider(SliderId), Confirm(ConfirmHit), DiagClose,
     PageCount(bool), PagePicker(PagePickerHit), Whiteboard(WhiteboardControl),
 }
 
 pub fn control_enabled(app: &App, control: Control) -> bool {
+    if let Control::Process(hit)=control {
+        let max=process_rows(app).len().saturating_sub(process_visible_rows(app));
+        return match hit {
+            ProcessHit::ScrollUp=>app.process_scroll.min(max)>0,
+            ProcessHit::ScrollDown=>app.process_scroll.min(max)<max,
+            ProcessHit::Add=>!app.process_input.trim().is_empty()&&app.process_rules.len()<64,
+            _=>true,
+        };
+    }
     if let Control::Setting(SetHit::SettingsPage(delta)) = control {
         let l = settings_layout(app);
         return (delta < 0 && l.page > 0) || (delta > 0 && l.page + 1 < l.pages);
     }
     if matches!(control, Control::PageCount(_)) { return app.page_picker_context().is_some(); }
     if matches!(control, Control::Sidebar(Btn::Restore, _)) { return app.can_restore_cleared(); }
+    if matches!(control, Control::Whiteboard(WhiteboardControl::DotSize | WhiteboardControl::DotValue)) {
+        return app.whiteboard && app.whiteboard_dots;
+    }
     !(app.whiteboard && matches!(control, Control::Sidebar(Btn::Cursor, _)))
 }
 
@@ -152,8 +181,21 @@ impl PressFeedback {
 // Painting and hit testing use the same sampled toolbar layout.
 pub fn control_at(app: &App, x: i32, y: i32) -> Option<Control> {
     if app.launch.active() { return None; }
+    if app.show_input_group_prompt { return input_group_prompt_hit(app,x,y).map(Control::Prompt); }
+    if app.settings_ui.editor.is_some() {
+        return crate::value_input::controls(app).into_iter().find_map(|(hit,r)|r.contains(x,y).then_some(Control::Editor(hit)));
+    }
+    if app.settings_ui.dialog.is_some() {
+        return crate::settings_panel::dialog_controls(app).into_iter().find_map(|(hit, r)| r.contains(x,y).then_some(Control::Dialog(hit)));
+    }
+    if app.settings_ui.picker.is_some() {
+        return crate::settings_panel::picker_controls(app).into_iter().find_map(|(hit, r)| r.contains(x,y).then_some(Control::Picker(hit)));
+    }
     if app.confirm_quit { return confirm_hit(app, x, y).map(Control::Confirm); }
-    if app.show_diag { return diag_close_hit(app, x, y).then_some(Control::DiagClose); }
+    if app.show_diag {
+        return crate::settings_panel::inspector_controls(app).into_iter().find_map(|(hit, r)| r.contains(x,y).then_some(Control::Setting(hit)));
+    }
+    if app.process_block_open { return process_block_hit(app,x,y).map(Control::Process); }
     if app.settings_open {
         return settings_slider_hit(app, x, y).map(|s| Control::Slider(s.id))
             .or_else(|| settings_hit(app, x, y).map(Control::Setting));
@@ -176,10 +218,36 @@ pub fn control_at(app: &App, x: i32, y: i32) -> Option<Control> {
 }
 
 pub fn control_rect(app: &App, control: Control) -> Option<R> {
+    if app.settings_ui.editor.is_some() && !app.show_input_group_prompt {
+        return match control {
+            Control::Editor(hit)=>crate::value_input::controls(app).into_iter().find(|(h,_)|*h==hit).map(|(_,r)|r),
+            _=>None,
+        };
+    }
+    if app.show_input_group_prompt {
+        return match control {
+            Control::Prompt(hit) => input_group_prompt_controls(app).into_iter().find(|(h,_)|*h==hit).map(|(_,r)|r),
+            _ => None,
+        };
+    }
+    if app.settings_ui.modal() {
+        return match control {
+            Control::Dialog(hit) => crate::settings_panel::dialog_controls(app).into_iter().find(|(h,_)| *h==hit).map(|(_,r)|r),
+            Control::Picker(hit) => crate::settings_panel::picker_controls(app).into_iter().find(|(h,_)| *h==hit).map(|(_,r)|r),
+            _ => None,
+        };
+    }
+    if app.show_diag {
+        return match control {
+            Control::Setting(hit) => crate::settings_panel::inspector_controls(app).into_iter().find(|(h,_)|*h==hit).map(|(_,r)|r),
+            Control::DiagClose => crate::settings_panel::inspector_controls(app).into_iter().find(|(h,_)|*h==SetHit::InspectorClose).map(|(_,r)|r),
+            _ => None,
+        };
+    }
     if app.confirm_quit && !matches!(control, Control::Confirm(_)) { return None; }
-    if app.show_diag && control != Control::DiagClose { return None; }
     if app.settings_open && !matches!(control, Control::Setting(_) | Control::Slider(_) | Control::Confirm(_) | Control::DiagClose) { return None; }
     match control {
+        Control::Process(hit) if app.process_block_open => process_block_controls(app).into_iter().find(|(h,_)|*h==hit).map(|(_,r)|r),
         Control::PageCount(right) if app.sidebar_page_visible() && !app.collapsed => Some(sidebar_page_rect(app, right)),
         Control::PagePicker(hit) if app.page_picker.is_some() => Some(page_picker_control_rect(app, hit)),
         Control::Sidebar(b, right) => sidebar_buttons(app, right).into_iter().find(|(k, _)| *k == b).map(|(_, r)| r),
@@ -191,7 +259,8 @@ pub fn control_rect(app: &App, control: Control) -> Option<R> {
             Some(R { x: m.x, y: m.y + offset, w: m.w, h: if offset == 0 { 48 } else { m.h - 48 } })
         }
         Control::Whiteboard(WhiteboardControl::Dots) if app.whiteboard => Some(whiteboard_dots_toggle_rect(app)),
-        Control::Whiteboard(WhiteboardControl::DotSize) if app.whiteboard && app.whiteboard_dots => Some(whiteboard_dot_slider_rect(app)),
+        Control::Whiteboard(WhiteboardControl::DotSize) if app.whiteboard => Some(whiteboard_dot_slider_rect(app)),
+        Control::Whiteboard(WhiteboardControl::DotValue) if app.whiteboard => Some(whiteboard_dot_value_rect(app)),
         Control::Popup(PopupHit::Color(i)) if app.pen_popup_visible && i < 10 => {
             let p = pen_popup_rect(app);
             Some(R { x: p.x + 16 + (i % 4) as i32 * 48, y: p.y + 46 + (i / 4) as i32 * 48, w: 38, h: 38 })
@@ -209,8 +278,7 @@ pub fn control_rect(app: &App, control: Control) -> Option<R> {
             Some(R { x: p.x + 16, y: p.y + 110, w: p.w - 32, h: 48 })
         }
         Control::Confirm(hit) if app.confirm_quit => {
-            let p = confirm_rect(app); let half = (p.w - 60) / 2;
-            Some(R { x: p.x + 20 + if hit == ConfirmHit::Yes { half + 20 } else { 0 }, y: p.y + 92, w: half, h: 40 })
+            confirm_controls(app).into_iter().find(|(h,_)|*h==hit).map(|(_,r)|r)
         }
         Control::DiagClose if app.show_diag => {
             let p = diag_rect(app);
@@ -226,7 +294,11 @@ fn draw_press_feedback(app: &App, ctx: &mut Ctx) {
     if !control_enabled(app, press.control) { return; }
     if sidebar_animating(app) && matches!(press.control, Control::Sidebar(_, _)) { return; }
     let Some(r) = control_rect(app, press.control) else { return };
-    if matches!(press.control, Control::Slider(_) | Control::PagePicker(PagePickerHit::Wheel)) { return; }
+    if matches!(press.control, Control::Slider(_) | Control::PagePicker(PagePickerHit::Wheel)
+        | Control::Picker(crate::settings_state::PickerHit::Field | crate::settings_state::PickerHit::Hue | crate::settings_state::PickerHit::Edit(_))
+        | Control::Editor(_) | Control::Setting(SetHit::EditSlider(_) | SetHit::InspectorPage(_))
+        | Control::Process(ProcessHit::ScrollUp | ProcessHit::ScrollDown)
+        | Control::PagePicker(PagePickerHit::Input) | Control::Whiteboard(WhiteboardControl::DotValue)) { return; }
     let radius = match press.control {
         Control::Popup(PopupHit::Color(_)) => 19.0,
         Control::Sidebar(_, _) => (r.w as f32 * 0.24).min(10.0),
@@ -236,7 +308,9 @@ fn draw_press_feedback(app: &App, ctx: &mut Ctx) {
     let filled_action = matches!(press.control, Control::Setting(SetHit::Done)
         | Control::DiagClose | Control::PagePicker(PagePickerHit::Jump))
         || matches!(press.control, Control::Setting(SetHit::Theme(p)) if p == app.theme.preference);
-    let feedback = if filled_action || matches!(press.control, Control::Sidebar(button, _) if sidebar_button_selected(app, button)) {
+    let feedback = if matches!(press.control, Control::Setting(SetHit::Quit)) {
+        palette.danger
+    } else if filled_action || matches!(press.control, Control::Sidebar(button, _) if sidebar_button_selected(app, button)) {
         palette.on_accent
     } else {
         palette.accent
@@ -376,13 +450,13 @@ impl<'a> Ctx<'a> {
 
 // Draw decoration inside the existing bounds: partial redraws must not leave
 // shadows behind when a popup closes or a toolbar moves.
-fn surface(ctx: &mut Ctx, r: R, radius: f32, fill: Color, border: Color) {
+pub(crate) fn surface(ctx: &mut Ctx, r: R, radius: f32, fill: Color, border: Color) {
     ctx.fill_round(r, radius, fill);
     ctx.stroke_round(R { x: r.x + 1, y: r.y + 1, w: r.w - 2, h: r.h - 2 },
         (radius - 1.0).max(1.0), border, 1.0);
 }
 
-fn panel(ctx: &mut Ctx, r: R, radius: f32, opacity: f32) {
+pub(crate) fn panel(ctx: &mut Ctx, r: R, radius: f32, opacity: f32) {
     let palette = ctx.palette;
     let a = (255.0 * opacity.clamp(0.0, 1.0)) as u8;
     surface(ctx, r, radius, alpha(palette.paper, a), alpha(palette.border, a));
@@ -442,6 +516,14 @@ pub fn sidebar_transition_rect(app: &App, right: bool) -> R {
     R { x: if right { app.screen_w - w } else { 0 }, y, w, h: bottom - y }
 }
 
+#[cfg(unix)]
+pub(crate) fn sidebar_preview_strip(app: &App, right: bool) -> R {
+    // Include the widest supported sidebar, so reducing the scale clears its
+    // previous footprint. The full height covers every position of the slider.
+    let width = ((crate::app::SB_BASE_W * 1.4).ceil() as i32 + 6).min(app.screen_w);
+    R { x: if right { app.screen_w - width } else { 0 }, y: 0, w: width, h: app.screen_h }
+}
+
 pub fn sidebar_animating(app: &App) -> bool {
     app.sidebar_anim_start.is_some() || app.drawing_tools.animating()
 }
@@ -467,15 +549,7 @@ pub fn sidebar_button_at(app: &App, x: i32, y: i32) -> Option<(Btn, bool)> {
 pub fn sidebar_buttons(app: &App, right: bool) -> Vec<(Btn, R)> {
     let sb = sidebar_rect(app, right);
     if app.collapsed {
-        return vec![(
-            Btn::Collapse,
-            R {
-                x: sb.x,
-                y: sb.y + 6,
-                w: sb.w,
-                h: sb.h - 12,
-            },
-        )];
+        return vec![(Btn::Collapse, sb)];
     }
     expanded_sidebar_buttons(app, right)
 }
@@ -503,7 +577,8 @@ fn expanded_sidebar_buttons(app: &App, right: bool) -> Vec<(Btn, R)> {
 fn drawing_tool_buttons(app: &App, right: bool) -> Vec<(Btn, R)> {
     let sb = expanded_sidebar_rect(app, right);
     let btn = app.sb_btn();
-    [Btn::Eraser, Btn::Clear, Btn::Restore, Btn::Undo].into_iter().enumerate().map(|(i, k)|
+    let clear_or_restore = if app.can_restore_cleared() { Btn::Restore } else { Btn::Clear };
+    [Btn::Eraser, clear_or_restore, Btn::Undo].into_iter().enumerate().map(|(i, k)|
         (k, R { x: sb.x + (sb.w - btn) / 2, y: sb.y + 12 + (3 + i as i32) * (btn + 6),
             w: btn, h: btn })).collect()
 }
@@ -542,13 +617,14 @@ pub fn page_picker_control_rect(app: &App, hit: PagePickerHit) -> R {
     let p = page_picker_rect(app);
     match hit {
         PagePickerHit::Wheel => R { x: p.x + 16, y: p.y + 74, w: p.w - 32, h: 220 },
+        PagePickerHit::Input => R {x:p.x+p.w-104,y:p.y+14,w:88,h:40},
         PagePickerHit::Cancel => R { x: p.x + 16, y: p.y + 314, w: 92, h: 44 },
         PagePickerHit::Jump => R { x: p.x + 118, y: p.y + 314, w: 126, h: 44 },
     }
 }
 
 pub fn page_picker_hit(app: &App, x: i32, y: i32) -> Option<PagePickerHit> {
-    [PagePickerHit::Wheel, PagePickerHit::Cancel, PagePickerHit::Jump].into_iter()
+    [PagePickerHit::Wheel, PagePickerHit::Input, PagePickerHit::Cancel, PagePickerHit::Jump].into_iter()
         .find(|hit| page_picker_control_rect(app, *hit).contains(x, y))
 }
 
@@ -710,6 +786,11 @@ pub fn whiteboard_dot_slider_rect(app: &App) -> R {
     }
 }
 
+pub fn whiteboard_dot_value_rect(app: &App) -> R {
+    let slider = whiteboard_dot_slider_rect(app);
+    R { x: slider.x + slider.w / 2 + 12, y: slider.y, w: 28, h: slider.h }
+}
+
 pub fn whiteboard_control_hit(app: &App, x: i32, y: i32) -> Option<WhiteboardControl> {
     if !app.whiteboard || !whiteboard_bar_rect(app).contains(x, y) {
         return None;
@@ -717,7 +798,10 @@ pub fn whiteboard_control_hit(app: &App, x: i32, y: i32) -> Option<WhiteboardCon
     if whiteboard_dots_toggle_rect(app).contains(x, y) {
         return Some(WhiteboardControl::Dots);
     }
-    if app.whiteboard_dots && whiteboard_dot_slider_rect(app).contains(x, y) {
+    if whiteboard_dot_value_rect(app).contains(x, y) {
+        return Some(WhiteboardControl::DotValue);
+    }
+    if whiteboard_dot_slider_rect(app).contains(x, y) {
         return Some(WhiteboardControl::DotSize);
     }
     None
@@ -732,6 +816,7 @@ pub fn whiteboard_dot_size_at(app: &App, x: i32) -> i32 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ProcessHit {
     Enable,
+    View(crate::settings_state::ProcessView),
     Input,
     Add,
     Paste,
@@ -750,29 +835,16 @@ pub enum ProcessRow {
 }
 
 
-pub fn process_block_rect(app: &App) -> R {
-    let w = 620.min((app.screen_w - 24).max(320));
-    let h = 560.min((app.screen_h - 24).max(320));
-    R {
-        x: (app.screen_w - w) / 2,
-        y: (app.screen_h - h) / 2,
-        w,
-        h,
-    }
-}
-
-fn process_row_height() -> i32 {
-    34
-}
-
-pub fn process_visible_rows(app: &App) -> usize {
-    ((process_block_rect(app).h - 304) / process_row_height()).max(1) as usize
-}
+pub fn process_block_rect(app: &App) -> R { crate::settings_panel::process_rect(app) }
+pub fn process_visible_rows(app: &App) -> usize { crate::settings_panel::process_visible_rows(app) }
 
 pub fn process_rows(app: &App) -> Vec<(ProcessRow, String, String)> {
     let mut rows = Vec::new();
-    for (index, rule) in app.process_rules.iter().enumerate() {
-        rows.push((ProcessRow::Rule(index), rule.clone(), "点击移除".into()));
+    if app.settings_ui.process_view==crate::settings_state::ProcessView::Rules {
+        for (index,rule) in app.process_rules.iter().enumerate() {
+            rows.push((ProcessRow::Rule(index),rule.clone(),if rule.contains('/') {"按完整路径匹配"}else{"按进程名称匹配"}.into()));
+        }
+        return rows;
     }
     for (index, proc) in app.process_scan.iter().enumerate() {
         let added = app
@@ -789,102 +861,7 @@ pub fn process_rows(app: &App) -> Vec<(ProcessRow, String, String)> {
     rows
 }
 
-pub fn process_block_controls(app: &App) -> Vec<(ProcessHit, R)> {
-    let p = process_block_rect(app);
-    let mut controls = vec![
-        (
-            ProcessHit::Enable,
-            R {
-                x: p.x + 20,
-                y: p.y + 60,
-                w: 220,
-                h: 36,
-            },
-        ),
-        (
-            ProcessHit::Input,
-            R {
-                x: p.x + 20,
-                y: p.y + 110,
-                w: p.w - 190,
-                h: 38,
-            },
-        ),
-        (
-            ProcessHit::Add,
-            R {
-                x: p.x + p.w - 158,
-                y: p.y + 110,
-                w: 64,
-                h: 38,
-            },
-        ),
-        (
-            ProcessHit::Paste,
-            R {
-                x: p.x + p.w - 88,
-                y: p.y + 110,
-                w: 68,
-                h: 38,
-            },
-        ),
-        (
-            ProcessHit::Scan,
-            R {
-                x: p.x + 20,
-                y: p.y + 160,
-                w: 112,
-                h: 34,
-            },
-        ),
-        (
-            ProcessHit::ScrollUp,
-            R {
-                x: p.x + p.w - 126,
-                y: p.y + 160,
-                w: 48,
-                h: 34,
-            },
-        ),
-        (
-            ProcessHit::ScrollDown,
-            R {
-                x: p.x + p.w - 72,
-                y: p.y + 160,
-                w: 52,
-                h: 34,
-            },
-        ),
-        (
-            ProcessHit::Done,
-            R {
-                x: p.x + p.w - 118,
-                y: p.y + p.h - 54,
-                w: 98,
-                h: 36,
-            },
-        ),
-    ];
-    let rows = process_rows(app);
-    let start = app.process_scroll.min(rows.len().saturating_sub(1));
-    let visible = process_visible_rows(app);
-    for (offset, (row, _, _)) in rows.iter().enumerate().skip(start).take(visible) {
-        let hit = match row {
-            ProcessRow::Rule(i) => ProcessHit::Rule(*i),
-            ProcessRow::Proc(i) => ProcessHit::Proc(*i),
-        };
-        controls.push((
-            hit,
-            R {
-                x: p.x + 20,
-                y: p.y + 206 + (offset - start) as i32 * process_row_height(),
-                w: p.w - 40,
-                h: process_row_height() - 4,
-            },
-        ));
-    }
-    controls
-}
+pub fn process_block_controls(app: &App) -> Vec<(ProcessHit, R)> { crate::settings_panel::process_controls(app) }
 
 pub fn process_block_hit(app: &App, x: i32, y: i32) -> Option<ProcessHit> {
     if !app.process_block_open || !process_block_rect(app).contains(x, y) {
@@ -895,175 +872,18 @@ pub fn process_block_hit(app: &App, x: i32, y: i32) -> Option<ProcessHit> {
         .find_map(|(hit, rect)| rect.contains(x, y).then_some(hit))
 }
 
-pub fn settings_rect(app: &App) -> R {
-    let w = 460.min((app.screen_w - 16).max(1));
-    let stride = if w < 420 { 72 } else { 48 };
-    let h = (152 + settings_row_count(app) as i32 * stride).min((app.screen_h - 16).max(1));
-    R { x: (app.screen_w - w) / 2, y: (app.screen_h - h) / 2, w, h }
-}
-
+pub fn settings_rect(app: &App) -> R { crate::settings_panel::rect(app) }
 #[derive(Clone, Copy, Debug)]
-pub struct SettingsLayout {
-    pub rows: usize,
-    pub page: usize,
-    pub pages: usize,
-    pub stride: i32,
-}
-
-fn settings_row_count(app: &App) -> usize { (settings_action_start(app) + 3) as usize }
-
-pub fn settings_layout(app: &App) -> SettingsLayout {
-    let p = settings_rect(app);
-    let stride = if p.w < 420 { 72 } else { 48 };
-    let rows = ((p.h - 152) / stride).max(1) as usize;
-    let pages = settings_row_count(app).div_ceil(rows);
-    SettingsLayout { rows, page: app.settings_page.min(pages - 1), pages, stride }
-}
-
-pub fn settings_change_page(app: &mut App, delta: i32) -> bool {
-    let l = settings_layout(app);
-    let next = (l.page as i64 + i64::from(delta)).clamp(0, l.pages as i64 - 1) as usize;
-    app.settings_page = next;
-    if next == l.page { return false; }
-    app.press = None;
-    true
-}
-
-fn settings_row_visible(app: &App, row: i32) -> bool {
-    let l = settings_layout(app);
-    (l.page * l.rows..(l.page + 1) * l.rows).contains(&(row as usize))
-}
-
-fn settings_row_y(app: &App, row: i32) -> i32 {
-    let l = settings_layout(app);
-    settings_rect(app).y + 84 + (row - (l.page * l.rows) as i32) * l.stride
-}
-
-fn settings_accent_row(_app: &App) -> i32 {
-    11
-}
-
-fn settings_action_start(app: &App) -> i32 {
-    settings_accent_row(app) + 1
-}
-
-pub fn settings_sliders(app: &App) -> Vec<SliderDef> {
-    let p = settings_rect(app);
-    let mk = |id: SliderId,
-              row: i32,
-              min: f32,
-              max: f32,
-              value: f32,
-              step: f32,
-              label: &'static str,
-              signed: bool| {
-        let narrow = p.w < 420;
-        let ry = settings_row_y(app, row) + if narrow { 28 } else { 0 };
-        let reset = R { x: p.x + p.w - 80, y: ry, w: 58, h: 38 };
-        let badge = R { x: reset.x - 72, y: ry + 4, w: 62, h: 30 };
-        let tx = p.x + if narrow { 30 } else { 190 };
-        SliderDef {
-            id,
-            track: R {
-                x: tx,
-                y: ry + 10,
-                w: (badge.x - 18 - tx).max(1),
-                h: 18,
-            },
-            hit: R {
-                x: tx - 10,
-                y: ry,
-                w: (badge.x - 8 - (tx - 10)).max(1),
-                h: 42,
-            },
-            badge,
-            reset,
-            min,
-            max,
-            value,
-            step,
-            label,
-            signed,
-        }
-    };
-    let mut v = vec![
-        mk(SliderId::Alpha, 0, 30.0, 255.0, app.sidebar_alpha as f32, 1.0, "侧边栏透明度", false),
-        mk(SliderId::Scale, 1, 0.6, 1.4, app.sb_scale as f32, 0.01, "侧边栏大小", true),
-    ];
-    v.push(mk(SliderId::StartupDelay, 2, 5.0, 20.0, app.startup_delay as f32, 1.0, "自动启动延迟 (秒)", false));
-    v.push(mk(SliderId::Threshold, 6, 20.0, 260.0, app.large_touch_threshold as f32, 10.0, "大触点阈值", false));
-    v.push(mk(SliderId::EraseScale, 7, 0.8, 2.5, app.large_erase_scale10 as f32 / 10.0, 0.1, "大触点橡皮倍率", true));
-    v.retain(|s| settings_row_visible(app, match s.id {
-        SliderId::Alpha => 0, SliderId::Scale => 1, SliderId::StartupDelay => 2,
-        SliderId::Threshold => 6, SliderId::EraseScale => 7,
-    }));
-    v
-}
-
+pub struct SettingsLayout { pub rows: usize, pub page: usize, pub pages: usize, pub stride: i32 }
+pub fn settings_layout(app: &App) -> SettingsLayout { crate::settings_panel::layout(app) }
+pub fn settings_change_page(app: &mut App, delta: i32) -> bool { crate::settings_panel::change_page(app, delta) }
+pub fn settings_sliders(app: &App) -> Vec<SliderDef> { crate::settings_panel::sliders(app) }
 pub fn settings_slider_hit(app: &App, x: i32, y: i32) -> Option<SliderDef> {
-    settings_sliders(app).into_iter().find(|s| s.hit.contains(x, y))
+    settings_sliders(app).into_iter().find(|s| s.hit.contains(x,y))
 }
-
-pub fn settings_controls(app: &App) -> Vec<(SetHit, R)> {
-    let p = settings_rect(app);
-    let full = |row: i32| R {
-        x: p.x + 18,
-        y: settings_row_y(app, row),
-        w: p.w - 36,
-        h: 38,
-    };
-    let a = settings_action_start(app);
-    let accent_row = settings_accent_row(app);
-    let mut controls = vec![
-        (SetHit::Autostart, full(3)),
-        (SetHit::WpsDebug, full(4)),
-        (SetHit::WpsRemove, full(8)),
-        (SetHit::WpsRegister, full(9)),
-        (SetHit::ProcessBlock, full(10)),
-        (SetHit::ThemeAccent, full(accent_row)),
-        (SetHit::RightClick, full(5)),
-        (SetHit::ClearLog, full(a)),
-        (SetHit::SysInfo, full(a + 1)),
-        (SetHit::Quit, full(a + 2)),
-    ];
-    controls.retain(|(hit, _)| settings_row_visible(app, match hit {
-        SetHit::Autostart => 3, SetHit::WpsDebug => 4,
-        SetHit::WpsRemove => 8, SetHit::WpsRegister => 9, SetHit::ProcessBlock => 10,
-        SetHit::ThemeAccent => accent_row,
-        SetHit::RightClick => 5,
-        SetHit::ClearLog => a, SetHit::SysInfo => a + 1,
-        SetHit::Quit => a + 2, _ => unreachable!(),
-    }));
-    let theme_x = p.x + if p.w < 420 { 18 } else { 84 };
-    let available = p.x + p.w - 24 - theme_x;
-    let unit = (available - 12) / 7;
-    for (preference, offset, width) in [(theme::Preference::Light, 0, unit * 2),
-        (theme::Preference::Dark, unit * 2 + 6, unit * 2),
-        (theme::Preference::System, unit * 4 + 12, available - unit * 4 - 12)] {
-        controls.push((SetHit::Theme(preference), R { x: theme_x + offset, y: p.y + 46, w: width, h: 32 }));
-    }
-    let l = settings_layout(app);
-    let footer = p.y + p.h - 68;
-    controls.push((SetHit::Done, R { x: p.x + p.w - 118, y: footer, w: 100, h: 38 }));
-    if l.pages > 1 {
-        for (delta, offset) in [(-1, 0), (1, 52)] {
-            controls.push((SetHit::SettingsPage(delta), R { x: p.x + 18 + offset, y: footer, w: 44, h: 38 }));
-        }
-    }
-    controls.extend(settings_sliders(app).into_iter().map(|s| (SetHit::ResetSlider(s.id), s.reset)));
-    controls
-}
-
+pub fn settings_controls(app: &App) -> Vec<(SetHit, R)> { crate::settings_panel::controls(app) }
 pub fn settings_hit(app: &App, x: i32, y: i32) -> Option<SetHit> {
-    if !settings_rect(app).contains(x, y) {
-        return None;
-    }
-    for (k, r) in settings_controls(app) {
-        if r.contains(x, y) {
-            return Some(k);
-        }
-    }
-    None
+    settings_controls(app).into_iter().find_map(|(hit,r)|r.contains(x,y).then_some(hit))
 }
 
 // ---------------- 退出确认 / 系统诊断 覆盖层 ----------------
@@ -1074,102 +894,56 @@ pub enum ConfirmHit {
 }
 
 pub fn confirm_rect(app: &App) -> R {
-    let w = 380.min((app.screen_w - 16).max(1));
-    let h = 150;
-    R {
-        x: (app.screen_w - w) / 2,
-        y: (app.screen_h - h) / 2,
-        w,
-        h,
-    }
+    let (width, height) = crate::settings_panel::available_size(app);
+    let w=440.min((width-24).max(1)); let h=220.min((height-24).max(1));
+    R {x:(width-w)/2,y:(height-h)/2,w,h}
 }
-
-pub fn confirm_hit(app: &App, x: i32, y: i32) -> Option<ConfirmHit> {
-    let p = confirm_rect(app);
-    let by = p.y + 92;
-    let half = (p.w - 60) / 2;
-    let no = R { x: p.x + 20, y: by, w: half, h: 40 };
-    let yes = R { x: p.x + 20 + half + 20, y: by, w: half, h: 40 };
-    if no.contains(x, y) {
-        Some(ConfirmHit::No)
-    } else if yes.contains(x, y) {
-        Some(ConfirmHit::Yes)
-    } else {
-        None
-    }
+pub fn confirm_controls(app: &App) -> Vec<(ConfirmHit,R)> {
+    let p=confirm_rect(app); let w=(p.w-52)/2;
+    vec![(ConfirmHit::No,R {x:p.x+20,y:p.y+p.h-64,w,h:44}),
+        (ConfirmHit::Yes,R {x:p.x+32+w,y:p.y+p.h-64,w,h:44})]
 }
-
-pub fn draw_confirm(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
-    let palette = ctx.palette;
-    let p = confirm_rect(app);
-    panel(ctx, p, 16.0, 1.0);
-    ctx.text_center(
-        fonts,
-        R { x: p.x, y: p.y + 24, w: p.w, h: 40 },
-        "确定要退出 Sidera 吗？",
-        20.0,
-        c(palette.text),
-    );
-    let half = (p.w - 60) / 2;
-    let no = R { x: p.x + 20, y: p.y + 92, w: half, h: 40 };
-    let yes = R { x: p.x + 20 + half + 20, y: p.y + 92, w: half, h: 40 };
-    surface(ctx, no, 10.0, c(palette.surface), c(palette.border));
-    ctx.text_center(fonts, no, "取消", 19.0, c(palette.text));
-    surface(ctx, yes, 10.0, c(palette.danger_light), alpha(palette.danger, 85));
-    ctx.text_center(fonts, yes, "确定退出", 19.0, c(palette.danger));
+pub fn confirm_hit(app: &App,x:i32,y:i32)->Option<ConfirmHit> {
+    confirm_controls(app).into_iter().find_map(|(hit,r)|r.contains(x,y).then_some(hit))
+}
+pub fn draw_confirm(app:&App,fonts:&Fonts,ctx:&mut Ctx) {
+    crate::settings_panel::layer(ctx,crate::settings_state::ease(app.settings_ui.overlay_at,160),|ctx| {
+        let p=confirm_rect(app); let palette=ctx.palette;
+        panel(ctx,p,12.0,1.0);
+        ctx.text(fonts,"退出 Sidera？",(p.x+24) as f32,(p.y+42) as f32,19.0,c(palette.text));
+        let lines=crate::settings_panel::wrapped(fonts,"退出后当前批注不会保留。\n请先截图保存需要的内容。",14.0,p.w-48);
+        for (i,line) in lines.iter().enumerate() {
+            if 72+i as i32*24>p.h-72 {break;}
+            ctx.text(fonts,line,(p.x+24) as f32,(p.y+72+i as i32*24) as f32,14.0,c(palette.muted));
+        }
+        for (hit,r) in confirm_controls(app) {
+            if hit==ConfirmHit::Yes {
+                let r=R {y:r.y+6,h:r.h-12,..r};
+                surface(ctx,r,6.0,c(palette.danger_light),c(palette.danger));
+                ctx.text_center(fonts,r,"确定退出",14.0,c(palette.text));
+            } else {crate::settings_panel::button(ctx,fonts,r,"取消",false);}
+        }
+    });
 }
 
 pub fn diag_rect(app: &App) -> R {
-    let w = 620.min((app.screen_w - 16).max(1));
-    let h = 620.min((app.screen_h - 16).max(1));
+    let (width, height) = crate::settings_panel::available_size(app);
+    let w = 620.min((width - 16).max(1));
+    let h = 620.min((height - 16).max(1));
     R {
-        x: (app.screen_w - w) / 2,
-        y: ((app.screen_h - h) / 2).max(8),
+        x: (width - w) / 2,
+        y: ((height - h) / 2).max(8),
         w,
         h,
     }
 }
 
 pub fn diag_close_hit(app: &App, x: i32, y: i32) -> bool {
-    let p = diag_rect(app);
-    let r = R { x: p.x + 20, y: p.y + p.h - 52, w: p.w - 40, h: 38 };
-    r.contains(x, y)
+    crate::settings_panel::inspector_controls(app).into_iter().any(|(h,r)|h==SetHit::InspectorClose && r.contains(x,y))
 }
-
 pub fn draw_diag(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
-    let palette = ctx.palette;
-    let p = diag_rect(app);
-    panel(ctx, p, 16.0, 1.0);
-    ctx.text_center(
-        fonts,
-        R { x: p.x, y: p.y + 12, w: p.w, h: 30 },
-        "诊断信息与日志",
-        18.0,
-        c(palette.text),
-    );
-    let mut yy = p.y + 52;
-    for line in app.diag_text.split('\n') {
-        if yy > p.y + p.h - 70 {
-            break;
-        }
-        let mut visible = line.to_string();
-        if fonts.text_width(&visible, 13.0) > (p.w - 40) as f32 {
-            while fonts.text_width(&(visible.clone() + "…"), 13.0) > (p.w - 40) as f32 {
-                if visible.pop().is_none() { break; }
-            }
-            visible.push('…');
-        }
-        let ink = if visible.contains("[ERROR]") { c(palette.danger) }
-            else if visible.contains("[WARN]") { c(palette.warning) }
-            else { c(palette.muted) };
-        ctx.text(fonts, &visible, (p.x + 20) as f32, yy as f32, 13.0, ink);
-        yy += 17;
-    }
-    let close = R { x: p.x + 20, y: p.y + p.h - 52, w: p.w - 40, h: 38 };
-    surface(ctx, close, 10.0, c(palette.accent), c(palette.accent));
-    ctx.text_center(fonts, close, "关闭", 19.0, c(palette.on_accent));
+    crate::settings_panel::draw_inspector(app, fonts, ctx);
 }
-
 
 // ---------------- input 组授权弹窗 ----------------
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1178,119 +952,38 @@ pub enum PromptHit {
     Close,
 }
 
-pub fn input_group_prompt_rect(app: &App) -> R {
-    let w = 580;
-    let h = 224;
-    R {
-        x: (app.screen_w - w) / 2,
-        y: (app.screen_h - h) / 2,
-        w,
-        h,
-    }
+pub fn input_group_prompt_rect(app:&App)->R {
+    let w=540.min((app.screen_w-24).max(1)); let h=290.min((app.screen_h-24).max(1));
+    R {x:(app.screen_w-w)/2,y:(app.screen_h-h)/2,w,h}
 }
-
-pub fn input_group_prompt_hit(app: &App, x: i32, y: i32) -> Option<PromptHit> {
-    let p = input_group_prompt_rect(app);
-    if !p.contains(x, y) {
-        return None;
-    }
-    let by = p.y + p.h - 58;
-    if app.input_group_state == 0 {
-        let bw = (p.w - 60) / 2;
-        let a = R { x: p.x + 20, y: by, w: bw, h: 40 };
-        let b = R {
-            x: p.x + 20 + bw + 20,
-            y: by,
-            w: bw,
-            h: 40,
-        };
-        if a.contains(x, y) {
-            return Some(PromptHit::Authorize);
-        }
-        if b.contains(x, y) {
-            return Some(PromptHit::Close);
-        }
-        None
-    } else {
-        let c = R {
-            x: p.x + 20,
-            y: by,
-            w: p.w - 40,
-            h: 40,
-        };
-        if c.contains(x, y) {
-            return Some(PromptHit::Close);
-        }
-        None
-    }
+pub fn input_group_prompt_controls(app:&App)->Vec<(PromptHit,R)> {
+    let p=input_group_prompt_rect(app); let w=(p.w-52)/2;
+    if app.input_group_state==0 {
+        vec![(PromptHit::Close,R {x:p.x+20,y:p.y+p.h-64,w,h:44}),
+            (PromptHit::Authorize,R {x:p.x+32+w,y:p.y+p.h-64,w,h:44})]
+    } else {vec![(PromptHit::Close,R {x:p.x+20,y:p.y+p.h-64,w:p.w-40,h:44})]}
 }
-
-pub fn draw_input_group_prompt(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
-    let p = input_group_prompt_rect(app);
-    ctx.fill_round(p, 12.0, color(0x2b, 0x2b, 0x33, 255));
-    ctx.stroke_round(p, 12.0, color(0x66, 0x66, 0x66, 255), 2.0);
-    ctx.text_center(
-        fonts,
-        R {
-            x: p.x,
-            y: p.y + 16,
-            w: p.w,
-            h: 30,
-        },
-        "需要输入设备权限",
-        22.0,
-        color(0xee, 0xee, 0xee, 255),
-    );
-    let user = std::env::var("USER").unwrap_or_default();
-    let body = match app.input_group_state {
-        0 => format!(
-            "当前用户不在 input 组，触屏批注无法读取触摸设备。\n是否加入 input 组？将执行：\npkexec usermod -aG input {}",
-            user
-        ),
-        1 => "正在请求授权，请在弹出的对话框中输入密码…".to_string(),
-        2 => "已加入 input 组。\n请注销或重启后重新登录，权限才会生效。".to_string(),
-        _ => format!("加入失败。可手动执行：\nsudo usermod -aG input {}", user),
+pub fn input_group_prompt_hit(app:&App,x:i32,y:i32)->Option<PromptHit> {
+    input_group_prompt_controls(app).into_iter().find_map(|(hit,r)|r.contains(x,y).then_some(hit))
+}
+pub fn draw_input_group_prompt(app:&App,fonts:&Fonts,ctx:&mut Ctx) {
+    let p=input_group_prompt_rect(app); let palette=ctx.palette;
+    panel(ctx,p,12.0,1.0);
+    ctx.text(fonts,"触屏输入权限",(p.x+24) as f32,(p.y+42) as f32,19.0,c(palette.text));
+    let body=match app.input_group_state {
+        0 if p.h<250 => "触屏需要访问输入设备。\n授权后需重新登录。",
+        0 => "触屏批注需要读取输入设备。\n授权会允许当前用户读取输入设备事件。\n添加后请注销并重新登录。",
+        1 => "请在系统授权窗口中完成授权。",
+        2 => "权限已添加。\n注销并重新登录后生效。",
+        _ => "授权未完成。\n可以稍后重新尝试。",
     };
-    ctx.text_multiline_center(
-        fonts,
-        R {
-            x: p.x + 16,
-            y: p.y + 50,
-            w: p.w - 32,
-            h: 106,
-        },
-        &body,
-        15.0,
-        color(0xcc, 0xcc, 0xcc, 255),
-    );
-    let by = p.y + p.h - 58;
-    if app.input_group_state == 0 {
-        let bw = (p.w - 60) / 2;
-        let a = R {
-            x: p.x + 20,
-            y: by,
-            w: bw,
-            h: 40,
-        };
-        let b = R {
-            x: p.x + 20 + bw + 20,
-            y: by,
-            w: bw,
-            h: 40,
-        };
-        ctx.fill_round(a, 8.0, color(0x2a, 0x6e, 0x3f, 255));
-        ctx.text_center(fonts, a, "授权加入", 18.0, Color::WHITE);
-        ctx.fill_round(b, 8.0, color(0x44, 0x44, 0x44, 255));
-        ctx.text_center(fonts, b, "稍后", 18.0, Color::WHITE);
-    } else {
-        let c = R {
-            x: p.x + 20,
-            y: by,
-            w: p.w - 40,
-            h: 40,
-        };
-        ctx.fill_round(c, 8.0, color(0x33, 0x77, 0xcc, 255));
-        ctx.text_center(fonts, c, "关闭", 18.0, Color::WHITE);
+    let lines=crate::settings_panel::wrapped(fonts,body,14.0,p.w-48);
+    for (i,line) in lines.iter().enumerate() {
+        if 78+i as i32*25>p.h-72 {break;}
+        ctx.text(fonts,line,(p.x+24) as f32,(p.y+78+i as i32*25) as f32,14.0,c(palette.muted));
+    }
+    for (hit,r) in input_group_prompt_controls(app) {
+        crate::settings_panel::button(ctx,fonts,r,match hit {PromptHit::Authorize=>"授权",PromptHit::Close if app.input_group_state==0=>"稍后",_=>"关闭"},hit==PromptHit::Authorize);
     }
 }
 
@@ -1445,7 +1138,7 @@ pub fn render_region(
     w: i32,
     h: i32,
 ) -> Option<Pixmap> {
-    let palette = app.theme.palette();
+    let palette = app.palette();
     let x = x.max(0);
     let y = y.max(0);
     let x2 = (x + w).min(app.screen_w);
@@ -1461,6 +1154,14 @@ pub fn render_region(
     let mut pm = Pixmap::new(pw, ph)?;
     // world(逻辑) -> region(物理)：先平移再缩放
     let tr = Transform::from_scale(sc, sc).pre_translate(-x as f32, -y as f32);
+    if app.settings_ui.window_size().is_some() {
+        if app.previewing_sidebars() {
+            let mut ctx = Ctx { palette, pm: &mut pm, tr };
+            draw_sidebar(app, fonts, &mut ctx, false, 0.0);
+            draw_sidebar(app, fonts, &mut ctx, true, 0.0);
+        }
+        return Some(pm);
+    }
 
     // 背景
     if app.whiteboard {
@@ -1479,7 +1180,7 @@ pub fn render_region(
     );
 
     if app.launch.active() {
-        let mut ctx = Ctx { palette: app.theme.palette(), pm: &mut pm, tr };
+        let mut ctx = Ctx { palette: app.palette(), pm: &mut pm, tr };
         for right in [false, true] { draw_launch_sidebar(app, fonts, &mut ctx, right); }
         let r = launch_rect(app);
         if app.launch.panel_alpha() > 0.0 && x < r.x + r.w && x2 > r.x && y < r.y + r.h && y2 > r.y {
@@ -1561,7 +1262,7 @@ pub fn render_region(
 
         if app.whiteboard { draw_whiteboard_controls(app, fonts, &mut ctx); }
 
-        let sidebar_progress = app.sidebar_retract();
+        let sidebar_progress = if app.previewing_sidebars() { 0.0 } else { app.sidebar_retract() };
         draw_sidebar(app, fonts, &mut ctx, false, sidebar_progress);
         draw_sidebar(app, fonts, &mut ctx, true, sidebar_progress);
 
@@ -1587,6 +1288,8 @@ pub fn render_region(
         if app.show_diag {
             draw_diag(app, fonts, &mut ctx);
         }
+        crate::settings_panel::draw_overlay(app, fonts, &mut ctx);
+        crate::value_input::draw(app, fonts, &mut ctx);
         if app.show_input_group_prompt {
             draw_input_group_prompt(app, fonts, &mut ctx);
         }
@@ -1594,6 +1297,32 @@ pub fn render_region(
     }
 
     Some(pm)
+}
+
+#[cfg(unix)]
+pub(crate) fn render_settings_window(
+    app: &App, fonts: &Fonts, icon: Option<&Pixmap>, width: u32, height: u32, scale: f32,
+) -> Option<Pixmap> {
+    let mut pixmap = Pixmap::new(width, height)?;
+    let palette = app.palette();
+    pixmap.fill(c(palette.paper));
+    let mut ctx = Ctx { palette, pm: &mut pixmap, tr: Transform::from_scale(scale, scale) };
+    if app.settings_open {
+        draw_settings(app, fonts, &mut ctx, icon);
+    }
+    if app.process_block_open {
+        draw_process_block(app, fonts, &mut ctx);
+    }
+    if app.show_diag {
+        draw_diag(app, fonts, &mut ctx);
+    }
+    if app.confirm_quit {
+        draw_confirm(app, fonts, &mut ctx);
+    }
+    crate::settings_panel::draw_overlay(app, fonts, &mut ctx);
+    crate::value_input::draw(app, fonts, &mut ctx);
+    draw_press_feedback(app, &mut ctx);
+    Some(pixmap)
 }
 
 fn draw_launch_piece(app: &App, ctx: &mut Ctx, target: R, visible: R, r: R,
@@ -1608,7 +1337,7 @@ fn draw_launch_piece(app: &App, ctx: &mut Ctx, target: R, visible: R, r: R,
     let scale = app.scale as f32;
     let Some(mut tile) = Pixmap::new((r.w as f32 * scale).ceil() as u32,
         (r.h as f32 * scale).ceil() as u32) else { return; };
-    draw(&mut Ctx { palette: app.theme.palette(), pm: &mut tile,
+    draw(&mut Ctx { palette: app.palette(), pm: &mut tile,
         tr: Transform::from_scale(scale, scale).pre_translate(-r.x as f32, -r.y as f32) });
     ctx.pm.draw_pixmap(0, 0, tile.as_ref(), &tiny_skia::PixmapPaint { opacity, ..Default::default() },
         ctx.tr.pre_translate(r.x as f32, r.y as f32).pre_scale(1.0 / scale, 1.0 / scale), None);
@@ -1646,7 +1375,7 @@ fn draw_sidebar(app: &App, fonts: &Fonts, ctx: &mut Ctx, right: bool, progress: 
     if progress < 1.0 {
         let sb = expanded_sidebar_rect(app, right);
         let dx = (sb.w + 4) as f32 * progress * if right { 1.0 } else { -1.0 };
-        let mut moving = Ctx { palette: app.theme.palette(), pm: &mut *ctx.pm, tr: ctx.tr.pre_translate(dx, 0.0) };
+        let mut moving = Ctx { palette: app.palette(), pm: &mut *ctx.pm, tr: ctx.tr.pre_translate(dx, 0.0) };
         let radius = (sb.w as f32 * 0.30).min(20.0);
         let fill = if held { alpha(palette.accent_light, app.sidebar_alpha.max(200)) }
             else { alpha(palette.surface, app.sidebar_alpha) };
@@ -1672,7 +1401,7 @@ fn draw_sidebar(app: &App, fonts: &Fonts, ctx: &mut Ctx, right: bool, progress: 
     if progress > 0.0 {
         let tab = sidebar_tab_rect(app, right);
         let dx = tab.w as f32 * (1.0 - progress) * if right { 1.0 } else { -1.0 };
-        let mut moving = Ctx { palette: app.theme.palette(), pm: &mut *ctx.pm, tr: ctx.tr.pre_translate(dx, 0.0) };
+        let mut moving = Ctx { palette: app.palette(), pm: &mut *ctx.pm, tr: ctx.tr.pre_translate(dx, 0.0) };
         // Extend under the screen edge so only the inward corners are rounded.
         let outline = R { x: tab.x - if right { 0 } else { 12 }, w: tab.w + 12, ..tab };
         surface(&mut moving, outline, 12.0, c(if held { palette.accent_light } else { palette.paper }),
@@ -1704,7 +1433,7 @@ fn draw_opening_tools(app: &App, fonts: &Fonts, ctx: &mut Ctx, right: bool) {
         if opacity <= 0.0 { continue; }
         let Some(mut tile) = Pixmap::new((r.w as f32 * scale).ceil() as u32,
             (r.h as f32 * scale).ceil() as u32) else { continue };
-        let mut local = Ctx { palette: app.theme.palette(), pm: &mut tile,
+        let mut local = Ctx { palette: app.palette(), pm: &mut tile,
             tr: Transform::from_scale(scale, scale).pre_translate(-r.x as f32, -r.y as f32) };
         draw_btn(app, fonts, &mut local, button, r);
         ctx.pm.draw_pixmap(0, 0, tile.as_ref(), &tiny_skia::PixmapPaint {
@@ -1741,6 +1470,20 @@ fn draw_sidebar_pages(app: &App, fonts: &Fonts, ctx: &mut Ctx, right: bool) {
     }
 }
 
+fn draw_button_label(fonts: &Fonts, ctx: &mut Ctx, r: R, label: &str, ink: Color) {
+    // Fit visible outlines, including overhangs and descenders, inside the padding.
+    let Some((left, top, right, bottom)) = fonts.text_bounds(label, 1.0) else { return };
+    let width = (right - left).max(0.01);
+    let height = (bottom - top).max(0.01);
+    let padding = (r.w.min(r.h) as f32 * 0.10).max(2.0);
+    let size = (r.w as f32 * 0.49).max(11.0)
+        .min((r.w as f32 - 2.0 * padding).max(1.0) / width)
+        .min((r.h as f32 - 2.0 * padding).max(1.0) / height);
+    let x = r.x as f32 + (r.w as f32 - width * size) / 2.0 - left * size;
+    let baseline = r.y as f32 + (r.h as f32 - height * size) / 2.0 - top * size;
+    ctx.text(fonts, label, x, baseline, size, ink);
+}
+
 fn draw_btn(app: &App, fonts: &Fonts, ctx: &mut Ctx, k: Btn, r: R) {
     let palette = ctx.palette;
     let btn = app.sb_btn() as f32;
@@ -1758,8 +1501,10 @@ fn draw_btn(app: &App, fonts: &Fonts, ctx: &mut Ctx, k: Btn, r: R) {
         edge = c(palette.disabled_border);
         ink = c(palette.disabled_ink);
     }
-    if matches!(k, Btn::Prev | Btn::Next) && !app.whiteboard && !app.wps_navigation_ready {
-        fill = c(palette.warning_light); edge = c(palette.warning); ink = c(palette.warning);
+    if k == Btn::Whiteboard && app.whiteboard {
+        fill = c(palette.danger_light);
+        edge = c(palette.danger);
+        ink = c(palette.danger);
     }
     if k == Btn::Exit {
         fill = app.whiteboard_bg_color();
@@ -1788,10 +1533,19 @@ fn draw_btn(app: &App, fonts: &Fonts, ctx: &mut Ctx, k: Btn, r: R) {
             } else { ink };
             icons::draw(ctx, glyph, x, y, size, glyph_ink, app.pen_color());
         }
-        Btn::Clear => ctx.text_center(fonts, r, "清除", (btn * 0.49).max(11.0), c(palette.danger)),
-        Btn::Restore => ctx.text_center(fonts, r, "恢复", (btn * 0.49).max(11.0), ink),
+        Btn::Clear => draw_button_label(fonts, ctx, r, "清除", c(palette.danger)),
+        Btn::Restore => draw_button_label(fonts, ctx, r, "恢复", ink),
         Btn::Undo => ctx.text_center(fonts, r, "撤回", (btn * 0.49).max(11.0), ink),
-        Btn::Whiteboard => ctx.text_center(fonts, r, "白板", (btn * 0.49).max(11.0), ink),
+        Btn::Whiteboard => {
+            if app.whiteboard {
+                let top = R { h: r.h / 2, ..r };
+                let bottom = R { y: r.y + top.h, h: r.h - top.h, ..r };
+                draw_button_label(fonts, ctx, top, "关闭", ink);
+                draw_button_label(fonts, ctx, bottom, "白板", ink);
+            } else {
+                draw_button_label(fonts, ctx, r, "白板", ink);
+            }
+        }
         Btn::Exit => {
             ctx.text_multiline_center(fonts, r, "背景\n颜色", (btn * 0.42).max(10.0), ink);
         }
@@ -1834,7 +1588,7 @@ fn draw_page_picker(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
     let scale = app.scale as f32;
     let Some(mut tile) = Pixmap::new((p.w as f32 * scale).ceil() as u32,
         (p.h as f32 * scale).ceil() as u32) else { return };
-    let mut local = Ctx { palette: app.theme.palette(), pm: &mut tile,
+    let mut local = Ctx { palette: app.palette(), pm: &mut tile,
         tr: Transform::from_scale(scale, scale).pre_translate(-p.x as f32, -p.y as f32) };
     draw_page_picker_content(app, fonts, &mut local);
     ctx.pm.draw_pixmap(0, 0, tile.as_ref(), &tiny_skia::PixmapPaint { opacity, ..Default::default() },
@@ -1846,10 +1600,14 @@ fn draw_page_picker_content(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
     let Some(picker) = &app.page_picker else { return };
     let p = page_picker_rect(app);
     panel(ctx, p, 16.0, 1.0);
-    ctx.text(fonts, "跳转页面", (p.x + 18) as f32, (p.y + 32) as f32, 23.0, c(palette.text));
-    let hint = format!("共 {} 页 · 上下拨动选页", picker.total);
-    let hint_size = 16.0 * ((p.w - 36) as f32 / fonts.text_width(&hint, 16.0).max(1.0)).min(1.0);
-    ctx.text(fonts, &hint, (p.x + 18) as f32, (p.y + 56) as f32, hint_size, c(palette.muted));
+    ctx.text(fonts, "跳转页面", (p.x + 18) as f32, (p.y + 35) as f32, 18.0, c(palette.text));
+    crate::value_input::draw_value(app,fonts,ctx,crate::value_input::Target::Page,
+        page_picker_control_rect(app,PagePickerHit::Input),16.0,""," 页");
+    let hint = crate::value_input::message(app,crate::value_input::Target::Page)
+        .unwrap_or_else(||format!("共 {} 页 · 拨动选页或点击页码输入",picker.total));
+    let hint_size = 12.0 * ((p.w - 36) as f32 / fonts.text_width(&hint, 12.0).max(1.0)).min(1.0);
+    let error=app.settings_ui.editor.as_ref().is_some_and(|e|e.target==crate::value_input::Target::Page&&!e.error.is_empty());
+    ctx.text(fonts, &hint, (p.x + 18) as f32, (p.y + 56) as f32, hint_size, c(if error{palette.danger}else{palette.muted}));
     let wheel = page_picker_control_rect(app, PagePickerHit::Wheel);
     surface(ctx, wheel, 12.0, c(palette.surface), c(palette.border));
     let center = wheel.y as f64 + wheel.h as f64 / 2.0;
@@ -1865,7 +1623,7 @@ fn draw_page_picker_content(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
         // Size and the selection band supply depth; keep neighbouring page
         // numbers readable in a classroom instead of fading them almost away.
         let opacity = (1.0 - distance.abs() / 10.0).clamp(0.80, 1.0) as f32;
-        let ink = if distance.abs() < 0.5 { palette.accent } else { palette.text };
+        let ink = palette.text;
         let text = page.to_string();
         let fit = size * ((wheel.w - 36) as f32 / fonts.text_width(&text, size).max(1.0)).min(1.0);
         let x = wheel.x as f32 + (wheel.w as f32 - fonts.text_width(&text, fit)) / 2.0;
@@ -1906,7 +1664,7 @@ fn draw_pen_popup(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
             icons::draw(ctx, Glyph::Check, cx - 10.0, cy - 10.0, 20.0, check, check);
         }
     }
-    let names = ["红色", "蓝色", "绿色", "黄色", "白色", "青色", "紫色", "黄绿", "橙色", "棕色"];
+    let names = ["红色", "蓝色", "绿色", "黄色", "白色", "青色", "紫色", "黄绿", "橙色", "黑色"];
     ctx.text(fonts, "当前颜色", (p.x + 124) as f32, (p.y + 156) as f32, 15.0, c(palette.muted));
     ctx.text(fonts, names[app.cur_color.min(9)], (p.x + 124) as f32, (p.y + 177) as f32, 20.0, c(palette.text));
     let sy = p.y + 214;
@@ -1997,373 +1755,30 @@ fn draw_whiteboard_controls(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
     );
     let cx = sw.x + if app.whiteboard_dots { 33 } else { 11 };
     ctx.fill_circle(cx as f32, (sw.y + 11) as f32, 8.0, c(palette.on_accent));
-    if app.whiteboard_dots {
-        let r = whiteboard_dot_slider_rect(app);
-        let t = ((app.whiteboard_dot_size - 1) as f32 / 9.0).clamp(0.0, 1.0);
-        ctx.fill_round(r, 13.0, c(palette.accent_light));
-        let knob = R {
-            x: r.x + ((r.w - 22) as f32 * t) as i32,
-            y: r.y,
-            w: 22,
-            h: r.h,
-        };
-        ctx.fill_round(knob, 11.0, c(palette.accent));
-        ctx.text_center(
-            fonts,
-            R {
-                x: r.x,
-                y: r.y - 2,
-                w: r.w,
-                h: r.h,
-            },
-            &format!("点大小 {}", app.whiteboard_dot_size),
-            15.0,
-            c(palette.text),
-        );
+    let slider = whiteboard_dot_slider_rect(app);
+    let position = (app.whiteboard_dot_size.clamp(1, 10) - 1) as f32 / 9.0;
+    let track_ink = if app.whiteboard_dots { palette.accent_light } else { palette.disabled_surface };
+    let thumb_ink = if app.whiteboard_dots { palette.accent } else { palette.disabled_ink };
+    ctx.fill_round(slider, 13.0, c(track_ink));
+    let thumb = R { x: slider.x + ((slider.w - 22) as f32 * position) as i32, w: 22, ..slider };
+    ctx.fill_round(thumb, 11.0, c(thumb_ink));
+    let label = R { y: slider.y - 2, ..slider };
+    if app.settings_ui.editor.as_ref().is_some_and(|editor|
+        editor.target == crate::value_input::Target::DotSize) {
+        crate::value_input::draw_value(app, fonts, ctx, crate::value_input::Target::DotSize,
+            label, 15.0, "点大小 ", "");
+    } else {
+        let ink = if app.whiteboard_dots { palette.text } else { palette.disabled_ink };
+        ctx.text_center(fonts, label, &format!("点大小 {}", app.whiteboard_dot_size), 15.0, c(ink));
     }
 }
 
 fn draw_process_block(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
-    let palette = ctx.palette;
-    let p = process_block_rect(app);
-    panel(ctx, p, 18.0, 1.0);
-    ctx.text(
-        fonts,
-        "进程屏蔽",
-        (p.x + 22) as f32,
-        (p.y + 38) as f32,
-        26.0,
-        c(palette.text),
-    );
-    ctx.text(
-        fonts,
-        "启动 Sidera 后结束匹配的当前用户进程",
-        (p.x + 150) as f32,
-        (p.y + 37) as f32,
-        15.0,
-        c(palette.muted),
-    );
-    let enable = process_block_controls(app)
-        .into_iter()
-        .find(|(hit, _)| *hit == ProcessHit::Enable)
-        .unwrap()
-        .1;
-    ctx.text(
-        fonts,
-        "启用进程屏蔽",
-        (enable.x + 4) as f32,
-        (enable.y + 25) as f32,
-        19.0,
-        c(palette.text),
-    );
-    let sw = R {
-        x: enable.x + enable.w - 52,
-        y: enable.y + 7,
-        w: 44,
-        h: 22,
-    };
-    ctx.fill_round(
-        sw,
-        11.0,
-        c(if app.process_block_enabled {
-            palette.accent
-        } else {
-            palette.muted
-        }),
-    );
-    let cx = sw.x + if app.process_block_enabled { 33 } else { 11 };
-    ctx.fill_circle(cx as f32, (sw.y + 11) as f32, 8.0, c(palette.on_accent));
-
-    let input = process_block_controls(app)
-        .into_iter()
-        .find(|(hit, _)| *hit == ProcessHit::Input)
-        .unwrap()
-        .1;
-    surface(
-        ctx,
-        input,
-        8.0,
-        c(palette.paper),
-        c(if app.process_input_active {
-            palette.accent
-        } else {
-            palette.border
-        }),
-    );
-    let shown: String = app.process_input.chars().take(42).collect();
-    let text = if shown.is_empty() && !app.process_input_active {
-        "输入进程名或可执行文件路径".to_string()
-    } else {
-        shown
-    };
-    ctx.text(
-        fonts,
-        &text,
-        (input.x + 10) as f32,
-        (input.y + 26) as f32,
-        18.0,
-        c(
-            if app.process_input.is_empty() && !app.process_input_active {
-                palette.muted
-            } else {
-                palette.text
-            },
-        ),
-    );
-
-    for (hit, r) in process_block_controls(app) {
-        match hit {
-            ProcessHit::Add
-            | ProcessHit::Paste
-            | ProcessHit::Scan
-            | ProcessHit::ScrollUp
-            | ProcessHit::ScrollDown
-            | ProcessHit::Done => {
-                let (label, accent) = match hit {
-                    ProcessHit::Add => ("添加", true),
-                    ProcessHit::Paste => ("粘贴", false),
-                    ProcessHit::Scan => ("扫描进程", false),
-                    ProcessHit::ScrollUp => ("上翻", false),
-                    ProcessHit::ScrollDown => ("下翻", false),
-                    _ => ("完成", true),
-                };
-                surface(
-                    ctx,
-                    r,
-                    8.0,
-                    c(if accent {
-                        palette.accent_light
-                    } else {
-                        palette.surface
-                    }),
-                    c(if accent {
-                        palette.accent_line
-                    } else {
-                        palette.border
-                    }),
-                );
-                ctx.text_center(
-                    fonts,
-                    r,
-                    label,
-                    18.0,
-                    c(if accent { palette.accent } else { palette.text }),
-                );
-            }
-            ProcessHit::Rule(_) | ProcessHit::Proc(_) => {
-                let rows = process_rows(app);
-                let index = match hit {
-                    ProcessHit::Rule(i) => i,
-                    ProcessHit::Proc(i) => app.process_rules.len() + i,
-                    _ => continue,
-                };
-                let Some((_, label, detail)) = rows.get(index) else {
-                    continue;
-                };
-                let active = matches!(hit, ProcessHit::Rule(_));
-                surface(
-                    ctx,
-                    r,
-                    8.0,
-                    c(if active {
-                        palette.danger_light
-                    } else {
-                        palette.surface
-                    }),
-                    if active {
-                        alpha(palette.danger, 70)
-                    } else {
-                        c(palette.border)
-                    },
-                );
-                ctx.text(
-                    fonts,
-                    label,
-                    (r.x + 12) as f32,
-                    (r.y + 21) as f32,
-                    17.0,
-                    c(palette.text),
-                );
-                ctx.text(
-                    fonts,
-                    detail,
-                    (r.x + r.w - 220) as f32,
-                    (r.y + 21) as f32,
-                    14.0,
-                    c(palette.muted),
-                );
-            }
-            _ => {}
-        }
-    }
-    if process_rows(app).is_empty() {
-        ctx.text_center(
-            fonts,
-            R {
-                x: p.x + 20,
-                y: p.y + 250,
-                w: p.w - 40,
-                h: 60,
-            },
-            "暂无规则，输入进程名或点击“扫描进程”",
-            17.0,
-            c(palette.muted),
-        );
-    }
+    crate::settings_panel::draw_process(app, fonts, ctx);
 }
 
 fn draw_settings(app: &App, fonts: &Fonts, ctx: &mut Ctx, icon: Option<&Pixmap>) {
-    let palette = ctx.palette;
-    let p = settings_rect(app);
-    panel(ctx, p, 18.0, 1.0);
-    if let Some(ico) = icon {
-        let ix = p.x + 24;
-        let iy = p.y + if p.w < 420 { 8 } else { 20 };
-        let size = if p.w < 420 { 32.0 } else { 44.0 };
-        ctx.pm.draw_pixmap(0, 0, ico.as_ref(), &tiny_skia::PixmapPaint {
-            quality: tiny_skia::FilterQuality::Bicubic, ..Default::default()
-        }, ctx.tr.pre_translate(ix as f32, iy as f32)
-            .pre_scale(size / ico.width() as f32, size / ico.height() as f32), None);
-    }
-    ctx.text(fonts, "Sidera 设置", (p.x + 84) as f32, (p.y + 36) as f32, 27.0, c(palette.text));
-    ctx.stroke_line(((p.x + 24) as f32, (p.y + 82) as f32),
-        ((p.x + p.w - 24) as f32, (p.y + 82) as f32), c(palette.border), 1.0);
-
-    // Paint only complete rows on this page, without scaling down text or
-    // rasterizing a tall panel and stretching it into the available space.
-    for (first, count) in [(2, 4), (settings_action_start(app), 2)] {
-        for row in first..first + count {
-            if !settings_row_visible(app, row) { continue; }
-            let group = R { x: p.x + 18, y: settings_row_y(app, row), w: p.w - 36, h: 40 };
-            surface(ctx, group, 10.0, c(palette.surface), c(palette.border));
-        }
-    }
-
-    for s in &settings_sliders(app) {
-        let ry = s.hit.y;
-        let label = match s.id {
-            SliderId::Alpha => "工具栏不透明度", SliderId::Scale => "工具栏大小",
-            SliderId::StartupDelay => "自动启动延迟 (秒)", _ => s.label,
-        };
-        let baseline = ry + if p.w < 420 { -4 } else { 27 };
-        ctx.text(fonts, label, (p.x + 26) as f32, baseline as f32, 22.0, c(palette.text));
-        let track = s.track;
-        let cy = track.y + track.h / 2;
-        let rail = R { x: track.x, y: cy - 3, w: track.w, h: 6 };
-        ctx.fill_round(rail, 3.0, c(palette.border));
-        let fw = (track.w as f32 * s.t()) as i32;
-        if fw > 1 { ctx.fill_round(R { w: fw, ..rail }, 3.0, c(palette.accent)); }
-        let hx = track.x + fw;
-        let pressed = app.press.is_some_and(|p| p.active && !p.expired() && p.control == Control::Slider(s.id));
-        if pressed { ctx.fill_circle(hx as f32, cy as f32, 17.0, alpha(palette.accent, 45)); }
-        ctx.fill_circle(hx as f32, cy as f32, 11.0, c(palette.paper));
-        ctx.stroke_round(R { x: hx - 11, y: cy - 11, w: 22, h: 22 }, 11.0, c(palette.accent), 2.0);
-        let value = match s.id {
-            SliderId::Alpha => format!("{:.0}%", s.value / 255.0 * 100.0),
-            SliderId::Scale => format!("{:.0}%", s.value * 100.0),
-            SliderId::StartupDelay => format!("{:.0}s", s.value),
-            SliderId::EraseScale | SliderId::Threshold => {
-                let number = if s.signed { format!("{:.1}", s.value) } else { format!("{:.0}", s.value) };
-                if s.id == SliderId::EraseScale { format!("{number}×") } else { number }
-            }
-        };
-        ctx.fill_round(s.badge, 8.0, c(palette.surface));
-        ctx.text_center(fonts, s.badge, &value, 20.0, c(palette.accent));
-    }
-
-    let controls = settings_controls(app);
-    for (hit, r) in controls {
-        match hit {
-            SetHit::Theme(preference) => {
-                let selected = app.theme.preference == preference;
-                surface(ctx, r, 8.0, c(if selected { palette.accent } else { palette.surface }),
-                    c(if selected { palette.accent } else { palette.border }));
-                ctx.text_center(fonts, r, preference.label(), 17.0,
-                    c(if selected { palette.on_accent } else { palette.muted }));
-            }
-            SetHit::ResetSlider(_) => {
-                surface(ctx, r, 8.0, c(palette.paper), c(palette.accent_line));
-                ctx.text_center(fonts, r, "默认", 18.0, c(palette.accent));
-            }
-            SetHit::Autostart | SetHit::WpsDebug | SetHit::RightClick => {
-                let (label, on) = match hit {
-                    SetHit::Autostart => ("开机自启动", is_autostart()),
-                    SetHit::WpsDebug => ("WPS 联动", app.wps_debug),
-                    _ => ("右键切回光标", app.right_click_cursor_on),
-                };
-                ctx.text(fonts, label, (r.x + 14) as f32, (r.y + 27) as f32, 22.0, c(palette.text));
-                let toggle = R { x: r.x + r.w - 58, y: r.y + 8, w: 44, h: 22 };
-                ctx.fill_round(toggle, 11.0, c(if on { palette.accent } else { palette.muted }));
-                let cx = toggle.x + if on { 33 } else { 11 };
-                ctx.fill_circle(cx as f32, (toggle.y + 11) as f32, 8.0, c(palette.on_accent));
-                ctx.text_center(fonts, R { x: toggle.x - 50, y: r.y, w: 42, h: r.h },
-                    if on { "开启" } else { "关闭" }, 17.0, c(palette.muted));
-            }
-            SetHit::WpsRemove => {
-                surface(ctx, r, 10.0, c(palette.danger_light), alpha(palette.danger, 65));
-                ctx.text(fonts, "清除 WPS 加载项", (r.x + 14) as f32, (r.y + 27) as f32,
-                    22.0, c(palette.danger));
-            }
-            SetHit::WpsRegister => {
-                surface(ctx, r, 10.0, c(palette.accent_light), c(palette.accent_line));
-                ctx.text(fonts, "重新登记 WPS 加载项", (r.x + 14) as f32, (r.y + 27) as f32,
-                    22.0, c(palette.accent));
-            }
-            SetHit::ProcessBlock => {
-                ctx.text(fonts, "进程屏蔽", (r.x + 14) as f32, (r.y + 27) as f32, 22.0, c(palette.text));
-                let badge = R { x: r.x + r.w - 88, y: r.y + 5, w: 74, h: 28 };
-                ctx.fill_round(badge, 8.0, c(if app.process_block_enabled { palette.accent_light } else { palette.surface }));
-                ctx.text_center(fonts, badge, if app.process_block_enabled { "已启用" } else { "未启用" }, 17.0,
-                    c(if app.process_block_enabled { palette.accent } else { palette.muted }));
-            }
-            SetHit::ThemeAccent => {
-                ctx.text(fonts, "主题强调色", (r.x + 14) as f32, (r.y + 27) as f32,
-                    22.0, c(palette.text));
-                let badge = R { x: r.x + r.w - 130, y: r.y + 5, w: 116, h: 28 };
-                ctx.fill_round(badge, 8.0, c(palette.accent_light));
-                ctx.fill_circle((badge.x + 16) as f32, (badge.y + 14) as f32, 8.0, c(palette.accent));
-                ctx.text(fonts, app.theme.accent.label(), (badge.x + 30) as f32,
-                    (badge.y + 20) as f32, 17.0, c(palette.accent));
-            }
-            SetHit::ClearLog | SetHit::SysInfo => {
-                let label = if hit == SetHit::SysInfo { "诊断信息 / 日志" }
-                    else if crate::app::now_ms() < app.log_cleared_until { "日志已清空" } else { "清空调试日志" };
-                let glyph = if hit == SetHit::SysInfo { Glyph::Info } else { Glyph::Document };
-                icons::draw(ctx, glyph, (r.x + 13) as f32, (r.y + 8) as f32, 22.0, c(palette.muted), c(palette.muted));
-                ctx.text(fonts, label, (r.x + 47) as f32, (r.y + 27) as f32, 21.0, c(palette.text));
-                if hit == SetHit::SysInfo {
-                    icons::draw(ctx, Glyph::Right, (r.x + r.w - 32) as f32, (r.y + 10) as f32,
-                        18.0, c(palette.muted), c(palette.muted));
-                }
-            }
-            SetHit::Quit => {
-                surface(ctx, r, 10.0, c(palette.danger_light), alpha(palette.danger, 65));
-                ctx.text_center(fonts, r, "退出软件", 22.0, c(palette.danger));
-            }
-            SetHit::Done => {
-                surface(ctx, r, 10.0, c(palette.accent), c(palette.accent));
-                ctx.text_center(fonts, r, "完成", 24.0, c(palette.on_accent));
-                icons::draw(ctx, Glyph::Check, r.x as f32 + r.w as f32 / 2.0 - 44.0,
-                    (r.y + 10) as f32, 18.0, c(palette.on_accent), c(palette.on_accent));
-            }
-            SetHit::SettingsPage(delta) => {
-                let enabled = control_enabled(app, Control::Setting(hit));
-                surface(ctx, r, 9.0, c(palette.surface), c(palette.border));
-                let ink = if enabled { c(palette.accent) } else { alpha(palette.muted, 85) };
-                icons::draw(ctx, if delta < 0 { Glyph::Up } else { Glyph::Down },
-                    (r.x + 12) as f32, (r.y + 9) as f32, 20.0, ink, ink);
-            }
-        }
-    }
-    let l = settings_layout(app);
-    if l.pages > 1 {
-        ctx.text_center(fonts, R { x: p.x + 116, y: p.y + p.h - 68, w: p.w - 240, h: 38 },
-            &format!("{} / {}", l.page + 1, l.pages), 18.0, c(palette.muted));
-    }
-    ctx.text_center(fonts, R { x: p.x, y: p.y + p.h - 30, w: p.w, h: 16 },
-        &format!("Sidera {}  © 2026 Carl_Jin  GNU GPL v3", crate::app::VERSION), 11.0, c(palette.muted));
-    ctx.text_center(fonts, R { x: p.x, y: p.y + p.h - 16, w: p.w, h: 14 },
-        "定制与改进：shizhelei · Gary_6Stones", 10.0, alpha(palette.muted, 200));
+    crate::settings_panel::draw(app, fonts, ctx, icon);
 }
 
 #[cfg(test)]
@@ -2387,6 +1802,8 @@ mod tests {
                 let mut sliders = Vec::new();
                 let panel = settings_rect(&a);
                 assert!(panel.x >= 0 && panel.y >= 0 && panel.x + panel.w <= w as i32 && panel.y + panel.h <= h as i32);
+                for tab in crate::settings_state::Tab::ALL {
+                a.settings_ui.tab = tab;
                 let pages = settings_layout(&a).pages;
                 for page in 0..pages {
                     a.settings_page = page;
@@ -2408,13 +1825,14 @@ mod tests {
                         if !sliders.contains(&s.id) { sliders.push(s.id); }
                     }
                 }
-                for expected in [SetHit::Autostart, SetHit::WpsDebug,
+                }
+                for expected in [SetHit::Autostart,
                     SetHit::WpsRemove, SetHit::WpsRegister, SetHit::ProcessBlock, SetHit::ThemeAccent,
                     SetHit::RightClick,
-                    SetHit::ClearLog, SetHit::SysInfo, SetHit::Quit, SetHit::Done] {
+                    SetHit::Logs, SetHit::SysInfo, SetHit::License, SetHit::Repository, SetHit::Quit, SetHit::Done] {
                     assert!(reached.contains(&expected), "unreachable {expected:?} at {w}x{h}");
                 }
-                assert_eq!(sliders.len(), 5);
+                assert_eq!(sliders.len(), 7);
                 for id in sliders { assert!(reached.contains(&SetHit::ResetSlider(id))); }
                 assert!(!settings_change_page(&mut a, i32::MAX));
                 settings_change_page(&mut a, i32::MIN);
@@ -2429,7 +1847,7 @@ mod tests {
         let mut a = App::new(Pixmap::new(640, 360).unwrap(), 640, 360);
         a.settings_page = usize::MAX;
         assert!(settings_layout(&a).page < settings_layout(&a).pages);
-        assert!(settings_controls(&a).iter().any(|(hit, _)| *hit == SetHit::Quit));
+        assert!(settings_controls(&a).iter().any(|(hit, _)| *hit == SetHit::ResetSlider(SliderId::Position)));
         a.screen_h = 1080;
         assert_eq!(settings_layout(&a).page, 0);
         assert_eq!(settings_layout(&a).pages, 1);
@@ -2444,6 +1862,7 @@ mod tests {
             a.settings_open = true;
             for preference in [theme::Preference::Light, theme::Preference::Dark] {
                 a.apply_theme(theme::Theme { preference, system_dark: false, ..Default::default() });
+                a.settings_ui.theme_from = None;
                 for page in 0..settings_layout(&a).pages {
                     a.settings_page = page;
                     let r = settings_rect(&a);
@@ -2533,6 +1952,7 @@ mod tests {
             a.set_scale(scale);
             for preference in [theme::Preference::Light, theme::Preference::Dark] {
                 a.apply_theme(theme::Theme { preference, system_dark: false, ..Default::default() });
+                a.settings_ui.theme_from = None;
                 for panel in 0..7 {
                     a.settings_open = panel == 0;
                     a.pen_popup_visible = panel == 1;
@@ -2548,8 +1968,14 @@ mod tests {
                         _ => page_picker_rect(&a),
                     };
                     let pixels = render_region(&a, &fonts, None, r.x, r.y, r.w, r.h).unwrap();
+                    let palette = a.theme.palette();
+                    let edge_fill = if panel == 0 {
+                        theme::mix(palette.paper, palette.surface, 0.65)
+                    } else {
+                        palette.paper
+                    };
                     assert_eq!(pixels.pixel((4.0 * scale) as u32, pixels.height() / 2).unwrap(),
-                        c(a.theme.palette().paper).to_color_u8().premultiply(),
+                        c(edge_fill).to_color_u8().premultiply(),
                         "panel {panel} / {preference:?} / {scale}");
                     assert!(a.canvas.data().iter().all(|&b| b == 0));
                 }
@@ -2558,6 +1984,7 @@ mod tests {
             a.launch = crate::launch::Launch::begin("isolated".into(), true, true, std::time::Instant::now());
             for preference in [theme::Preference::Light, theme::Preference::Dark, theme::Preference::Light] {
                 a.apply_theme(theme::Theme { preference, system_dark: false, ..Default::default() });
+                a.settings_ui.theme_from = None;
                 let r = launch_rect(&a);
                 let pixels = render_region(&a, &fonts, None, r.x, r.y, r.w, r.h).unwrap();
                 assert_eq!(pixels.pixel((4.0 * scale) as u32, pixels.height() / 2).unwrap(),

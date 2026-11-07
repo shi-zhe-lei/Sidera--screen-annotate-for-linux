@@ -19,28 +19,44 @@ impl Preference {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Accent { #[default] Teal, Blue, Green, Amber, Violet, Rose }
+pub enum Accent { #[default] Teal, Blue, Green, Amber, Violet, Rose, Custom(u32) }
 
 impl Accent {
     pub fn parse(value: &str) -> Option<Self> {
         match value { "teal" => Some(Self::Teal), "blue" => Some(Self::Blue),
             "green" => Some(Self::Green), "amber" => Some(Self::Amber),
-            "violet" => Some(Self::Violet), "rose" => Some(Self::Rose), _ => None }
+            "violet" => Some(Self::Violet), "rose" => Some(Self::Rose),
+            _ => value.strip_prefix('#').filter(|v| v.len() == 6)
+                .and_then(|v| u32::from_str_radix(v, 16).ok()).map(Self::Custom) }
     }
-    pub fn key(self) -> &'static str {
-        match self { Self::Teal => "teal", Self::Blue => "blue", Self::Green => "green",
-            Self::Amber => "amber", Self::Violet => "violet", Self::Rose => "rose" }
+    pub fn key(self) -> String {
+        match self { Self::Teal => "teal".into(), Self::Blue => "blue".into(), Self::Green => "green".into(),
+            Self::Amber => "amber".into(), Self::Violet => "violet".into(), Self::Rose => "rose".into(),
+            Self::Custom(rgb) => format!("#{:06X}", rgb & 0xFFFFFF) }
     }
     pub fn label(self) -> &'static str {
         match self { Self::Teal => "青绿", Self::Blue => "蓝色", Self::Green => "绿色",
-            Self::Amber => "琥珀", Self::Violet => "紫色", Self::Rose => "玫红" }
+            Self::Amber => "琥珀", Self::Violet => "紫色", Self::Rose => "玫红", Self::Custom(_) => "自定义" }
     }
     pub fn next(self) -> Self {
         match self { Self::Teal => Self::Blue, Self::Blue => Self::Green, Self::Green => Self::Amber,
-            Self::Amber => Self::Violet, Self::Violet => Self::Rose, Self::Rose => Self::Teal }
+            Self::Amber => Self::Violet, Self::Violet => Self::Rose, Self::Rose | Self::Custom(_) => Self::Teal }
     }
+    pub fn rgb(self) -> u32 { if let Self::Custom(rgb) = self { rgb & 0xFFFFFF } else { self.colors(false).0 } }
     fn colors(self, dark: bool) -> (u32, u32, u32) {
         match (self, dark) {
+            (Self::Custom(rgb), dark) => {
+                let surface = if dark { DARK.surface } else { LIGHT.surface };
+                let tint = mix(surface, rgb, if dark { 0.18 } else { 0.10 });
+                let mut accent = rgb;
+                // Adapt the displayed accent, never the user's saved source colour.
+                for _ in 0..32 {
+                    let a = luminance(accent); let b = luminance(tint);
+                    if (a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5 { break; }
+                    accent = mix(accent, if dark { 0xFFFFFF } else { 0 }, 0.12);
+                }
+                (accent, tint, mix(surface, accent, 0.48))
+            }
             (Self::Teal, false) => (0x216F62, 0xDCEEE5, 0x8DB5A3),
             (Self::Teal, true) => (0x8CD6B5, 0x294D40, 0x5E9C82),
             (Self::Blue, false) => (0x2C5FA8, 0xDCE8F7, 0x8FB2D8),
@@ -94,24 +110,40 @@ pub struct Palette {
 }
 
 pub const LIGHT: Palette = Palette {
-    paper: 0xFAFBF7, surface: 0xF0F4EF, border: 0xCBD7CE,
-    text: 0x263E3A, muted: 0x5C7069,
-    disabled_surface: 0xECEEEA, disabled_border: 0xD7DAD5, disabled_ink: 0x9CA39E,
+    paper: 0xFCFCFD, surface: 0xF1F2F5, border: 0xD5D7DD,
+    text: 0x25262B, muted: 0x62646D,
+    disabled_surface: 0xECEDEF, disabled_border: 0xD7D9DE, disabled_ink: 0x92959F,
     accent: 0x216F62, accent_light: 0xDCEEE5, accent_line: 0x8DB5A3, on_accent: 0xFFFFFF,
     success: 0x2F774C, on_success: 0xFFFFFF,
     danger: 0xA44234, danger_light: 0xF8E9E3, warning: 0x906017, warning_light: 0xFFF0D7,
-    eraser: 0xD5E5EB, splash_header: 0xEDF4EE,
+    eraser: 0xD5E5EB, splash_header: 0xF0F1F5,
 };
 
 pub const DARK: Palette = Palette {
-    paper: 0x1D2B27, surface: 0x293C34, border: 0x4B6659,
-    text: 0xECF4EE, muted: 0xB3C7BB,
-    disabled_surface: 0x243028, disabled_border: 0x34443A, disabled_ink: 0x768A7C,
-    accent: 0x8CD6B5, accent_light: 0x294D40, accent_line: 0x5E9C82, on_accent: 0x102D22,
-    success: 0x8CD0A0, on_success: 0x142F20,
+    paper: 0x202126, surface: 0x2B2D34, border: 0x4A4D58,
+    text: 0xF2F2F5, muted: 0xBFC1CA,
+    disabled_surface: 0x27292F, disabled_border: 0x383B45, disabled_ink: 0x858995,
+    accent: 0x8CD6B5, accent_light: 0x294D40, accent_line: 0x5E9C82, on_accent: 0x000000,
+    success: 0x8CD0A0, on_success: 0x000000,
     danger: 0xFFAB98, danger_light: 0x4B2D29, warning: 0xF0C784, warning_light: 0x473A25,
-    eraser: 0x476578, splash_header: 0x253D32,
+    eraser: 0x476578, splash_header: 0x292B32,
 };
+
+pub fn mix(a: u32, b: u32, t: f32) -> u32 {
+    let t = t.clamp(0.0, 1.0);
+    let channel = |s: u32| ((((a >> s) & 255u32) as f32 * (1.0 - t)
+        + ((b >> s) & 255u32) as f32 * t).round() as u32) << s;
+    channel(16) | channel(8) | channel(0)
+}
+
+impl Palette {
+    pub fn blend(self, other: Self, t: f32) -> Self {
+        macro_rules! blended { ($($field:ident),*) => { Self { $($field: mix(self.$field, other.$field, t)),* } }; }
+        blended!(paper, surface, border, text, muted, disabled_surface, disabled_border,
+            disabled_ink, accent, accent_light, accent_line, on_accent, success, on_success,
+            danger, danger_light, warning, warning_light, eraser, splash_header)
+    }
+}
 
 pub fn alpha(rgb: u32, a: u8) -> Color {
     Color::from_rgba8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, a)

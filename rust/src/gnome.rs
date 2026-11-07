@@ -145,6 +145,7 @@ struct GnomePlat {
     back: RefCell<Pixmap>, dirty: RefCell<BTreeSet<(u32, u32)>>,
     input: RefCell<(Vec<IRect>, bool)>, input_dirty: Cell<bool>,
     commands: RefCell<VecDeque<Value>>, fullscreen: Cell<bool>,
+    wps_presentation: Cell<bool>,
     keyboard: bool, hotkey: bool,
 }
 impl GnomePlat {
@@ -153,6 +154,7 @@ impl GnomePlat {
             back: RefCell::new(Pixmap::new(1, 1).unwrap()), dirty: RefCell::new(BTreeSet::new()),
             input: RefCell::new((Vec::new(), false)), input_dirty: Cell::new(true),
             commands: RefCell::new(VecDeque::new()), fullscreen: Cell::new(false),
+            wps_presentation: Cell::new(false),
             keyboard: capabilities["keyboard"] == true, hotkey: capabilities["hotkey"] == true }
     }
     fn configure(&self, monitor: Monitor) {
@@ -167,6 +169,7 @@ impl GnomePlat {
         } }
         self.input_dirty.set(true);
         self.commands.borrow_mut().clear();
+        self.wps_presentation.set(false);
     }
     fn command(&self, mut value: Value) {
         let m = self.monitor.borrow(); value["generation"] = json!(m.generation); value["index"] = json!(m.index);
@@ -181,19 +184,24 @@ impl Backend for GnomePlat {
     fn has_compositor(&self) -> bool { true }
     fn grab_hotkey(&self) -> bool { self.hotkey }
     fn is_presentation_fullscreen(&self) -> bool { self.fullscreen.get() }
+    fn presentation_foreground(&self) -> Option<bool> { Some(self.wps_presentation.get()) }
     fn can_inject_keys_without_prompt(&self) -> bool { self.keyboard }
     fn screenshot(&self) -> Option<(Vec<u8>, u32, u32)> { None }
     fn request_screenshot(&self) -> bool { self.command(json!({"type":"screenshot"})); true }
     fn fake_key(&self, key: Key) {
-        if self.keyboard { self.command(json!({"type":"key", "key":format!("{key:?}")})); }
+        if self.keyboard {
+            self.command(json!({"type":"key", "key":format!("{key:?}"),
+                "presentationOnly":self.wps_presentation.get()}));
+        }
     }
     fn start_presentation(&self) -> bool {
-        if !self.keyboard { return false; }
+        if !self.keyboard || !self.wps_presentation.get() { return false; }
         self.command(json!({"type":"key", "key":"StartShow"}));
         true
     }
     fn virtual_right_click(&self, x: i32, y: i32) { self.command(json!({"type":"rightClick", "x":x, "y":y})); }
     fn can_forward_right_click(&self) -> bool { true }
+    fn set_text_input(&self, on: bool) { self.command(json!({"type":"text_input", "enabled":on})); }
     fn set_input_region(&self, rects: &[IRect], full: bool) {
         let old = self.input.borrow();
         let equal = old.1 == full && old.0.len() == rects.len() && old.0.iter().zip(rects).all(|(a,b)|
@@ -278,6 +286,7 @@ pub fn run(prepared: Prepared, fonts: Fonts, icon: Option<Pixmap>, icon_big: Opt
     let mut generation = configure(&mut desktop,&transport,&prepared.hello)?;
     let mut ping = Instant::now() - Duration::from_secs(1);
     while !transport.broken.load(Ordering::Relaxed) {
+        let frame_started = Instant::now();
         for value in incoming.try_iter().take(256) {
             let kind = value["type"].as_str().unwrap_or_default();
             match kind {
@@ -292,6 +301,7 @@ pub fn run(prepared: Prepared, fonts: Fonts, icon: Option<Pixmap>, icon_big: Opt
                 for output in desktop.outputs.values() {
                     let backend = output.rt.backend.as_any().downcast_ref::<GnomePlat>().unwrap();
                     backend.fullscreen.set(value["fullscreen"].as_i64() == Some(backend.monitor.borrow().index as i64));
+                    backend.wps_presentation.set(value["wpsPresentation"] == true);
                 }
                 continue;
             }
@@ -300,6 +310,18 @@ pub fn run(prepared: Prepared, fonts: Fonts, icon: Option<Pixmap>, icon_big: Opt
                 value["y"].as_i64().unwrap_or(0).clamp(-32768,32768) as i32);
             match kind {
                 "motion" => desktop.motion(id,x,y),
+                "value_key" => {
+                    use crate::value_input::Key;
+                    let key = match value["key"].as_str().unwrap_or_default() {
+                        "enter" => Some(Key::Enter), "escape" => Some(Key::Escape),
+                        "backspace" => Some(Key::Backspace), "delete" => Some(Key::Delete),
+                        "left" => Some(Key::Left), "right" => Some(Key::Right),
+                        "home" => Some(Key::Home), "end" => Some(Key::End),
+                        "select_all" => Some(Key::SelectAll), "paste" => Some(Key::Paste),
+                        _ => value["text"].as_str().and_then(|s| s.chars().next()).map(Key::Character),
+                    };
+                    if let Some(key) = key { desktop.value_key(id, key); }
+                }
                 "scroll" => if let Some(delta) = value["delta"].as_f64().filter(|d| d.is_finite()) {
                     desktop.scroll(id,x,y,delta.clamp(-8.0,8.0));
                 },
@@ -322,7 +344,13 @@ pub fn run(prepared: Prepared, fonts: Fonts, icon: Option<Pixmap>, icon_big: Opt
         }
         if ping.elapsed() >= Duration::from_secs(1) && transport.send(vec![control(&json!({"type":"ping"}))]) { ping = Instant::now(); }
         desktop.tick();
-        std::thread::sleep(Duration::from_millis(16));
+        let interval = Duration::from_millis(16);
+        let delay = if desktop.settings_animating() {
+            interval.saturating_sub(frame_started.elapsed())
+        } else {
+            interval
+        };
+        std::thread::sleep(delay);
     }
     // Shell has already removed the actors; a stale client must not relaunch them.
     log::info!("GNOME 原生扩展已断开，Sidera 退出");

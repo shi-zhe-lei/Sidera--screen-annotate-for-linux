@@ -156,6 +156,32 @@ impl Fonts {
         w
     }
 
+    /// Visible outline bounds relative to the text origin and baseline.
+    pub fn text_bounds(&self, s: &str, px: f32) -> Option<(f32, f32, f32, f32)> {
+        let mut bounds: Option<(f32, f32, f32, f32)> = None;
+        let mut caret = 0.0;
+        for ch in s.chars() {
+            let Some(font) = self.pick(ch) else { caret += px * 0.5; continue };
+            let scaled = font.as_scaled(PxScale::from(px));
+            let glyph = scaled.glyph_id(ch);
+            if let Some(outline) = font.outline(glyph) {
+                let scale = scaled.h_scale_factor();
+                let left = caret + outline.bounds.min.x * scale;
+                // ab_glyph stores the font-space top in min.y and bottom in max.y.
+                // Negate each in place to match draw's baseline_y - p.y transform.
+                let top = -outline.bounds.min.y * scale;
+                let right = caret + outline.bounds.max.x * scale;
+                let bottom = -outline.bounds.max.y * scale;
+                bounds = Some(match bounds {
+                    Some((l, t, r, b)) => (l.min(left), t.min(top), r.max(right), b.max(bottom)),
+                    None => (left, top, right, bottom),
+                });
+            }
+            caret += scaled.h_advance(glyph);
+        }
+        bounds
+    }
+
     /// 以 (x, baseline_y) 为起点绘制文本，颜色 color，字号 px。
     pub fn draw(
         &self,

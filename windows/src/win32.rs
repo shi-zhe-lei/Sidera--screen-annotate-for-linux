@@ -38,14 +38,14 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
     MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEINPUT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
     RegisterHotKey, ReleaseCapture, SendInput, SetCapture, UnregisterHotKey, VK_DOWN, VK_ESCAPE, VK_F5, VK_SHIFT,
-    VK_UP,
+    VK_UP, GetKeyState, SetFocus, VK_CONTROL,
 };
 use windows_sys::Win32::UI::Input::Pointer::{
     GetPointerInfo, GetPointerTouchInfo, POINTER_FLAG_INCONTACT, POINTER_INFO, POINTER_TOUCH_INFO,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetSystemMetrics,
+    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GWL_EXSTYLE, GetForegroundWindow, GetCursorPos, GetSystemMetrics,
     GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDI_APPLICATION,
     LoadCursorW, LoadIconW, LoadImageW, MF_STRING, MSG, PM_REMOVE, PeekMessageW,
     PostMessageW, PostQuitMessage, RegisterClassW, SetCursorPos, SetForegroundWindow,
@@ -56,7 +56,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     ULW_ALPHA, UpdateLayeredWindow, WNDCLASSW, LWA_ALPHA,
     WM_DESTROY, WM_DISPLAYCHANGE, WM_ERASEBKGND, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_CONTEXTMENU, WM_LBUTTONDBLCLK,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_KEYDOWN, WM_CHAR,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
     WS_POPUP, WS_VISIBLE, HICON, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE,
 };
@@ -87,6 +87,7 @@ pub enum WinEvent {
     Quit,
     ThemeChanged,
     DisplayChanged,
+    ValueKey(sidera_core::value_input::Key),
 }
 
 pub struct Win32Plat {
@@ -99,6 +100,8 @@ pub struct Win32Plat {
     events: RefCell<VecDeque<WinEvent>>,
     input_rects: RefCell<Vec<IRect>>,
     full_input: Cell<bool>,
+    text_input: Cell<bool>,
+    previous_focus: Cell<HWND>,
     touch_last: RefCell<HashMap<u32, (i32, i32, f64)>>,
     hdc_screen: HDC,
     hdc_mem: HDC,
@@ -291,6 +294,8 @@ impl Win32Plat {
                 events: RefCell::new(VecDeque::new()),
                 input_rects: RefCell::new(Vec::new()),
                 full_input: Cell::new(false),
+                text_input: Cell::new(false),
+                previous_focus: Cell::new(null_mut()),
                 touch_last: RefCell::new(HashMap::new()),
                 hdc_screen,
                 hdc_mem,
@@ -491,6 +496,24 @@ impl Win32Plat {
         lparam: LPARAM,
     ) -> Option<LRESULT> {
         match msg {
+            WM_KEYDOWN if self.text_input.get() => {
+                use sidera_core::value_input::Key;
+                let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
+                let key = match wparam as u32 {
+                    27 => Some(Key::Escape), 13 => Some(Key::Enter), 8 => Some(Key::Backspace),
+                    46 => Some(Key::Delete), 37 => Some(Key::Left), 39 => Some(Key::Right),
+                    36 => Some(Key::Home), 35 => Some(Key::End),
+                    65 if ctrl => Some(Key::SelectAll), 86 if ctrl => Some(Key::Paste), _ => None,
+                };
+                if let Some(key) = key { self.enqueue(WinEvent::ValueKey(key)); }
+                Some(0)
+            }
+            WM_CHAR if self.text_input.get() => {
+                if let Some(ch) = char::from_u32(wparam as u32).filter(|ch| !ch.is_control()) {
+                    self.enqueue(WinEvent::ValueKey(sidera_core::value_input::Key::Character(ch)));
+                }
+                Some(0)
+            }
             WM_NCHITTEST => {
                 let x = lo(lparam) - self.origin.0;
                 let y = hi(lparam) - self.origin.1;
@@ -667,6 +690,23 @@ impl Drop for Win32Plat {
 }
 
 impl Backend for Win32Plat {
+    fn set_text_input(&self, on: bool) {
+        if self.text_input.replace(on) == on { return; }
+        unsafe {
+            let style = GetWindowLongPtrW(self.input_hwnd, GWL_EXSTYLE);
+            if on {
+                self.previous_focus.set(GetForegroundWindow());
+                SetWindowLongPtrW(self.input_hwnd, GWL_EXSTYLE, style & !(WS_EX_NOACTIVATE as isize));
+                SetForegroundWindow(self.input_hwnd);
+                SetFocus(self.input_hwnd);
+            } else {
+                SetWindowLongPtrW(self.input_hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE as isize);
+                if GetForegroundWindow() == self.input_hwnd && !self.previous_focus.get().is_null() {
+                    SetForegroundWindow(self.previous_focus.get());
+                }
+            }
+        }
+    }
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

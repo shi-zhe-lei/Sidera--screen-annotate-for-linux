@@ -109,6 +109,47 @@ fn input_shape_round_trips_partial_empty_and_full() {
 
 #[test]
 #[ignore = "requires an isolated Xvfb server"]
+fn numeric_keyboard_grab_survives_a_pending_input_region_refresh() {
+    use crate::value_input::Key;
+    let _server = SERVER.lock().unwrap();
+    let plat = platform(true);
+    plat.set_input_region(&[IRect::new(0, 20, 32, 100)], false);
+    assert!(plat.grab_text_keyboard());
+    assert!(!plat.refresh_input_window(true).unwrap());
+    for (symbol, expected) in [(0x31, '1'), (0xffb1, '1'), (0xffae, '.')] {
+        let keycode = plat.x11.keysym_to_keycode(symbol);
+        assert_ne!(keycode, 0);
+        assert_eq!(plat.x11.text_key(keycode, xproto::KeyButMask::MOD2), Some(Key::Character(expected)));
+    }
+    plat.ungrab_text_keyboard();
+    assert!(plat.refresh_input_window(true).unwrap());
+}
+
+#[test]
+#[ignore = "requires an isolated Xvfb server"]
+fn wps_focus_distinguishes_documents_in_the_same_suite_window() {
+    let _server = SERVER.lock().unwrap();
+    let x11 = connect_to_test_server();
+    let (window, _) = x11.create_window(0, 0, 320, 240).unwrap();
+    x11.conn.change_property32(xproto::PropMode::REPLACE, x11.root, x11.net_active_window,
+        AtomEnum::WINDOW, &[window]).unwrap().check().unwrap();
+    x11.conn.change_property8(xproto::PropMode::REPLACE, window, AtomEnum::WM_CLASS,
+        AtomEnum::STRING, b"wpsoffice\0wpsoffice\0").unwrap().check().unwrap();
+    for (title, expected) in [
+        ("课程.dps - WPS Office", true),
+        ("笔记.pptx.docx - WPS Office", false),
+        ("WPS Office", false),
+        ("演示文稿1 - WPS Office", true),
+    ] {
+        x11.conn.change_property8(xproto::PropMode::REPLACE, window, x11.net_wm_name,
+            AtomEnum::STRING, title.as_bytes()).unwrap().check().unwrap();
+        assert_eq!(x11.is_wps_presentation_foreground(), expected, "{title}");
+    }
+    xproto::delete_property(&x11.conn, x11.root, x11.net_active_window).unwrap().check().unwrap();
+}
+
+#[test]
+#[ignore = "requires an isolated Xvfb server"]
 fn invalid_window_shape_updates_report_bad_window() {
     let _server = SERVER.lock().unwrap();
     let plat = platform(false);

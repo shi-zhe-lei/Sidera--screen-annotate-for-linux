@@ -43,7 +43,7 @@ def main():
     staged = Path(tempfile.mkdtemp(prefix=".sidera-install-", dir=extensions))
     backup = None
     try:
-        for name in ("extension.js", "bridge.js", "chrome.js", "metadata.json"):
+        for name in ("extension.js", "bridge.js", "chrome.js", "keyboard.js", "presentation.js", "metadata.json"):
             shutil.copy2(source / name, staged / name)
         shutil.copytree(source / "schemas", staged / "schemas", ignore=shutil.ignore_patterns("gschemas.compiled"))
         command("glib-compile-schemas", "--strict", str(staged / "schemas"))

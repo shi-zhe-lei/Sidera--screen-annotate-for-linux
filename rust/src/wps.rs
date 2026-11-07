@@ -1223,6 +1223,12 @@ impl WpsBridge {
         true
     }
 
+    pub(crate) fn discard_pending_navigation(&self) {
+        let mut state = self.shared.lock().unwrap();
+        state.queue.clear();
+        state.start_pending_until = 0;
+    }
+
     pub fn set_whiteboard(&self, on: bool) {
         let mut s = self.shared.lock().unwrap();
         if s.whiteboard != on {

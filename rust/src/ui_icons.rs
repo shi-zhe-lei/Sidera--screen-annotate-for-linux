@@ -3,8 +3,23 @@ use tiny_skia::{Color, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Sh
 use crate::ui::Ctx;
 use crate::ui_theme::c;
 
+/// Shared, version-matched application artwork for the startup and About panels.
+/// Embed the shipped PNG so an old system icon cannot override a new binary.
+pub fn app_icon(size: u32) -> Option<tiny_skia::Pixmap> {
+    if size == 0 { return None; }
+    let override_image = std::env::var_os("SIDERA_ICON").and_then(|path| image::open(path).ok());
+    let image = override_image.or_else(|| image::load_from_memory(include_bytes!("../../sidera.png")).ok())?;
+    let rgba = image::imageops::resize(&image.to_rgba8(), size, size, image::imageops::FilterType::Lanczos3);
+    let mut pixels = rgba.into_raw();
+    for pixel in pixels.chunks_exact_mut(4) {
+        let alpha = u16::from(pixel[3]);
+        for channel in &mut pixel[..3] { *channel = ((u16::from(*channel) * alpha + 127) / 255) as u8; }
+    }
+    tiny_skia::Pixmap::from_vec(pixels, tiny_skia::IntSize::from_wh(size, size)?)
+}
+
 #[derive(Clone, Copy)]
-pub enum Glyph { Cursor, Pen, Eraser, Up, Down, More, Camera, Settings, Check, Info, Document, Right }
+pub enum Glyph { Cursor, Pen, Eraser, Up, Down, More, Camera, Settings, Check, Info, Warning, Document, Left, Right, Reset, Exit }
 
 fn paint(ink: Color) -> Paint<'static> {
     Paint { shader: Shader::SolidColor(ink), anti_alias: true, ..Default::default() }
@@ -126,6 +141,15 @@ pub fn draw(ctx: &mut Ctx, glyph: Glyph, x: f32, y: f32, size: f32, ink: Color, 
             g.fill_circle(12.0, 7.5, 1.1, ink);
             line(&mut g, (12.0, 11.0), (12.0, 17.0));
         }
+        Glyph::Warning => {
+            let mut p = PathBuilder::new();
+            p.move_to(10.3, 4.5); p.quad_to(12.0, 1.8, 13.7, 4.5);
+            p.line_to(21.0, 17.5); p.quad_to(22.5, 20.0, 19.5, 20.0);
+            p.line_to(4.5, 20.0); p.quad_to(1.5, 20.0, 3.0, 17.5); p.close();
+            path(&mut g, p.finish(), None, Some(ink));
+            line(&mut g, (12.0, 8.5), (12.0, 12.5));
+            g.fill_circle(12.0, 16.0, 1.0, ink);
+        }
         Glyph::Document => {
             path(&mut g, polygon(&[(5.0, 3.0), (14.0, 3.0), (19.0, 8.0), (19.0, 21.0), (5.0, 21.0)]),
                 None, Some(ink));
@@ -134,9 +158,28 @@ pub fn draw(ctx: &mut Ctx, glyph: Glyph, x: f32, y: f32, size: f32, ink: Color, 
             line(&mut g, (9.0, 12.0), (15.0, 12.0));
             line(&mut g, (9.0, 16.0), (15.0, 16.0));
         }
-        Glyph::Right => {
-            line(&mut g, (9.0, 6.0), (15.0, 12.0));
-            line(&mut g, (15.0, 12.0), (9.0, 18.0));
+        Glyph::Left | Glyph::Right => {
+            let (outer,center)=if matches!(glyph,Glyph::Left) {(15.0,9.0)}else{(9.0,15.0)};
+            line(&mut g, (outer, 6.0), (center, 12.0));
+            line(&mut g, (center, 12.0), (outer, 18.0));
+        }
+        Glyph::Reset => {
+            let mut p=PathBuilder::new();
+            p.move_to(5.0,9.0);
+            p.cubic_to(7.0,3.5,15.0,3.0,18.0,8.0);
+            p.cubic_to(22.0,15.0,14.0,22.0,8.0,17.0);
+            path(&mut g,p.finish(),None,Some(ink));
+            line(&mut g,(4.0,4.0),(4.0,10.0));
+            line(&mut g,(4.0,10.0),(10.0,10.0));
+        }
+        Glyph::Exit => {
+            let mut p=PathBuilder::new();
+            p.move_to(11.0,4.0);p.line_to(5.0,4.0);p.quad_to(3.0,4.0,3.0,6.0);
+            p.line_to(3.0,18.0);p.quad_to(3.0,20.0,5.0,20.0);p.line_to(11.0,20.0);
+            path(&mut g,p.finish(),None,Some(ink));
+            line(&mut g,(9.0,12.0),(21.0,12.0));
+            line(&mut g,(17.0,8.0),(21.0,12.0));
+            line(&mut g,(21.0,12.0),(17.0,16.0));
         }
     }
 }

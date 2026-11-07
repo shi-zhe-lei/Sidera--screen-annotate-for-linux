@@ -20,6 +20,7 @@ pub const DEFAULT_SIDEBAR_ALPHA: u8 = 80;
 pub const DEFAULT_LARGE_TOUCH_THRESHOLD: f64 = 64.0;
 pub const DEFAULT_LARGE_ERASE_SCALE10: i32 = 12;
 pub const DEFAULT_STARTUP_DELAY: u32 = 10;
+pub const DEFAULT_SIDEBAR_EXPAND_MINUTES: u32 = 2;
 pub const MIN_STARTUP_DELAY: u32 = 5;
 pub const MAX_STARTUP_DELAY: u32 = 20;
 pub const MAX_UNDO: usize = 12;
@@ -44,7 +45,7 @@ pub const COLORS: [(u8, u8, u8); 10] = [
     (0xAB, 0x47, 0xBC),
     (0xC9, 0xDD, 0x22),
     (0xFF, 0x6D, 0x00),
-    (0x79, 0x55, 0x48),
+    (0, 0, 0),
 ];
 pub const PEN_SIZES: [i32; 3] = [3, 5, 10];
 pub const ERASER_SIZES: [i32; 3] = [30, 60, 80];
@@ -94,6 +95,7 @@ pub struct App {
     pub page_picker: Option<crate::page_picker::PagePicker>,
     pub settings_open: bool,
     pub settings_page: usize,
+    pub settings_ui: crate::settings_state::State,
     pub popup_on_right: bool,
 
     // 触屏按下反馈 / 弹窗淡入动画 / 设置里的确认与诊断
@@ -148,6 +150,7 @@ pub struct App {
     pub wps_debug: bool,
     pub wps_test_mode: bool,
     pub startup_delay: u32,
+    pub sidebar_expand_minutes: u32,
     pub wps_start_sent_until: i64,
     pub wps_connected: bool,
     pub wps_real_pos: i32,
@@ -246,6 +249,7 @@ impl App {
             page_picker: None,
             settings_open: false,
             settings_page: 0,
+            settings_ui: crate::settings_state::State::default(),
             popup_on_right: false,
             press: None,
             open_anim: 0,
@@ -283,6 +287,7 @@ impl App {
             wps_debug: true,
             wps_test_mode: true,
             startup_delay: DEFAULT_STARTUP_DELAY,
+            sidebar_expand_minutes: DEFAULT_SIDEBAR_EXPAND_MINUTES,
             wps_start_sent_until: 0,
             wps_connected: false,
             wps_real_pos: -1,
@@ -366,6 +371,16 @@ impl App {
     pub fn sidebar_y(&self, height: i32) -> i32 {
         self.sb_y.clamp(0, (self.screen_h - height).max(0))
     }
+    pub fn previewing_sidebars(&self) -> bool {
+        self.settings_open && self.settings_ui.tab == crate::settings_state::Tab::Appearance
+    }
+    pub fn sidebar_position_height(&self) -> i32 {
+        if self.collapsed && !self.previewing_sidebars() {
+            self.collapsed_h()
+        } else {
+            self.sb_height()
+        }
+    }
     pub fn sidebar_page_visible(&self) -> bool {
         self.whiteboard || (self.wps_debug && self.wps_connected
             && (self.wps_page_index > 0 || self.wps_page_total > 0))
@@ -385,7 +400,7 @@ impl App {
         (self.drawing_tools_full_height() as f32 * self.drawing_tools.fraction()).round() as i32
     }
     pub fn drawing_tools_full_height(&self) -> i32 {
-        4 * (self.sb_btn() + 6)
+        3 * (self.sb_btn() + 6)
     }
     pub fn sb_page_h(&self) -> i32 {
         page_counter_height(self.sb_scale)
@@ -411,10 +426,10 @@ impl App {
         self.sidebar_collapsed_since = collapsed.then(std::time::Instant::now);
     }
 
-    /// 手动收起两分钟后自动展开，避免课堂中把工具栏忘在贴边状态。
+    /// 手动收起后按用户设定展开；旧配置保持原来的两分钟。
     pub fn sidebar_expand_due(&self) -> bool {
         self.collapsed && self.sidebar_collapsed_since.is_some_and(
-            |start| start.elapsed() >= std::time::Duration::from_secs(120))
+            |start| start.elapsed() >= std::time::Duration::from_secs(u64::from(self.sidebar_expand_minutes.clamp(1, 20)) * 60))
     }
     pub fn finish_sidebar_animation(&mut self) -> bool {
         if self.sidebar_anim_start.is_some_and(|start| start.elapsed().as_millis() >= 180) {
@@ -447,9 +462,17 @@ impl App {
     /// A theme switch only invalidates UI artwork, never canvas/undo/page caches.
     pub fn apply_theme(&mut self, theme: crate::ui_theme::Theme) -> bool {
         let changed = self.theme.dark() != theme.dark() || self.theme.accent != theme.accent;
+        let previous = self.palette();
         self.theme = theme;
-        if changed { self.launch.card.get_mut().take(); }
+        if changed {
+            self.settings_ui.theme_from = Some((previous, now_ms()));
+            self.launch.card.get_mut().take();
+        }
         changed
+    }
+
+    pub fn palette(&self) -> crate::ui_theme::Palette {
+        self.settings_ui.palette(self.theme.palette())
     }
 
     pub fn update_system_theme(&mut self, dark: bool) -> bool {
@@ -731,6 +754,9 @@ impl App {
             self.drawing_tools.set_expanded(self.saved_drawing_tools);
             self.current_slide = self.saved_slide;
         }
+        // Each whiteboard session starts with the default dot controls.
+        self.whiteboard_dots = false;
+        self.whiteboard_dot_size = DEFAULT_WHITEBOARD_DOT_SIZE;
         self.wb_limit_msg_until = 0;
         self.load_page(self.current_slide);
     }
@@ -738,11 +764,11 @@ impl App {
 
 pub fn sb_height_of(scale: f64) -> i32 {
     let btn = (SB_BASE_BTN * scale) as i32;
-    22 + 12 * btn + 66 + page_counter_height(scale) + 6
+    22 + 11 * btn + 60 + page_counter_height(scale) + 6
 }
 
 fn sb_compact_height_of(scale: f64) -> i32 {
-    sb_height_of(scale) - 4 * ((SB_BASE_BTN * scale) as i32 + 6)
+    sb_height_of(scale) - 3 * ((SB_BASE_BTN * scale) as i32 + 6)
 }
 
 fn page_counter_height(scale: f64) -> i32 {
@@ -781,6 +807,13 @@ pub fn load_startup_delay() -> u32 {
 }
 
 pub fn load_settings(app: &mut App) {
+    load_main_settings(app);
+    crate::settings_state::load_appearance(app);
+    app.settings_ui.theme_from = None;
+    app.wps_debug = true;
+}
+
+fn load_main_settings(app: &mut App) {
     let Some(path) = config_file() else {
         crate::diag_log::warn("设置未加载：无法确定配置目录");
         return;
@@ -826,7 +859,7 @@ fn parse_settings(app: &mut App, content: &str) {
                     app.apply_theme(crate::ui_theme::Theme { preference, ..app.theme });
                 }
             }
-            "wpsDebug" => app.wps_debug = v == "1",
+            "wpsDebug" => app.wps_debug = true,
             "themeAccent" => {
                 if let Some(accent) = crate::ui_theme::Accent::parse(v) { app.theme.accent = accent; }
             }
@@ -835,6 +868,9 @@ fn parse_settings(app: &mut App, content: &str) {
                 if let Ok(n) = v.parse::<u32>() {
                     app.startup_delay = n.clamp(MIN_STARTUP_DELAY, MAX_STARTUP_DELAY);
                 }
+            }
+            "sidebarExpandMinutes" => {
+                if let Ok(minutes) = v.parse::<u32>() { app.sidebar_expand_minutes = minutes.clamp(1,20); }
             }
             "sbScale" => {
                 if let Ok(f) = v.parse::<f64>() {
@@ -852,12 +888,8 @@ fn parse_settings(app: &mut App, content: &str) {
                 if let Ok(n) = v.parse::<i32>() { app.whiteboard_dot_size = n.clamp(1, 10); }
             }
             "processBlock" => app.process_block_enabled = v == "1",
-            "penColor" => {
-                if let Ok(n) = v.parse::<usize>() { app.cur_color = n.min(COLORS.len() - 1); }
-            }
-            "penSize" => {
-                if let Ok(n) = v.parse::<usize>() { app.cur_pen = n.min(PEN_SIZES.len() - 1); }
-            }
+            // Pen choices last only for this session; ignore values saved by older versions.
+            "penColor" | "penSize" => {}
             "eraserSize" => {
                 if let Ok(n) = v.parse::<usize>() { app.cur_eraser = n.min(ERASER_SIZES.len() - 1); }
             }
@@ -894,18 +926,17 @@ pub fn save_settings(app: &App) {
 
 fn serialize_settings(app: &App) -> String {
     format!(
-        "wpsDebug={}\nwpsTestMode={}\nstartupDelay={}\nsbScale={:.2}\nsidebarAlpha={}\nrightClickCursor={}\nwhiteboardDots={}\nwhiteboardDotSize={}\nprocessBlock={}\npenColor={}\npenSize={}\neraserSize={}\nlargeTouchThreshold={}\nlargeEraseScale10={}\ntheme={}\nthemeAccent={}\n",
-        if app.wps_debug { 1 } else { 0 },
+        "wpsDebug={}\nwpsTestMode={}\nstartupDelay={}\nsidebarExpandMinutes={}\nsbScale={:.2}\nsidebarAlpha={}\nrightClickCursor={}\nwhiteboardDots={}\nwhiteboardDotSize={}\nprocessBlock={}\neraserSize={}\nlargeTouchThreshold={}\nlargeEraseScale10={}\ntheme={}\nthemeAccent={}\n",
+        1,
         1,
         app.startup_delay,
+        app.sidebar_expand_minutes.clamp(1,20),
         app.sb_scale,
         app.sidebar_alpha,
         if app.right_click_cursor_on { 1 } else { 0 },
         if app.whiteboard_dots { 1 } else { 0 },
         app.whiteboard_dot_size,
         if app.process_block_enabled { 1 } else { 0 },
-        app.cur_color,
-        app.cur_pen,
         app.cur_eraser,
         app.large_touch_threshold as i32,
         app.large_erase_scale10,
@@ -1264,16 +1295,21 @@ mod theme_tests {
     }
 
     #[test]
-    fn paint_tool_choices_roundtrip_through_settings() {
+    fn pen_choices_are_session_only_and_eraser_choice_roundtrips() {
         let mut source = App::new(Pixmap::new(10, 10).unwrap(), 10, 10);
         source.cur_color = 5;
         source.cur_pen = 2;
         source.cur_eraser = 0;
         let mut loaded = App::new(Pixmap::new(10, 10).unwrap(), 10, 10);
-        parse_settings(&mut loaded, &serialize_settings(&source));
-        assert_eq!(loaded.cur_color, 5);
-        assert_eq!(loaded.cur_pen, 2);
+        let saved = serialize_settings(&source);
+        assert!(!saved.contains("penColor=") && !saved.contains("penSize="));
+        parse_settings(&mut loaded, &saved);
+        assert_eq!(loaded.cur_color, 0);
+        assert_eq!(loaded.cur_pen, 1);
         assert_eq!(loaded.cur_eraser, 0);
+        parse_settings(&mut loaded, "penColor=5\npenSize=2\n");
+        assert_eq!(loaded.cur_color, 0);
+        assert_eq!(loaded.cur_pen, 1);
     }
 
     #[test]

@@ -5,6 +5,6 @@
   "shell-version": ["46", "47", "48", "49", "50"],
   "session-modes": ["user", "unlock-dialog"],
   "settings-schema": "org.gnome.shell.extensions.sidera-native",
-  "version": 6,
+  "version": 8,
   "url": "https://github.com/shi-zhe-lei/Sidera--screen-annotate-for-linux"
 }

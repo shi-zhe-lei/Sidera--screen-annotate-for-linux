@@ -85,7 +85,7 @@ pub fn draw(fonts: &Fonts, icon: Option<&Pixmap>, launch: &Launch, w: u32, h: u3
             c(if (i as usize) < launch.completed() { palette.accent } else { palette.border }));
     }
     ctx.text(fonts, "developed by jinyicheng", 32.0, 420.0, 13.0, alpha(palette.muted, 215));
-    ctx.text(fonts, "定制与改进：shizhelei · Gary_6Stones", 32.0, 437.0, 11.0, alpha(palette.muted, 190));
+    ctx.text(fonts, "定制与改进：Gary_6Stones · 教程与体验顾问：ofkuyu", 32.0, 437.0, 11.0, alpha(palette.muted, 190));
     let version = crate::app::VERSION;
     ctx.text(fonts, version, 528.0 - fonts.text_width(version, 12.0), 437.0, 12.0, alpha(palette.muted, 190));
     pm

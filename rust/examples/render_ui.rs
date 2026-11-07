@@ -2,6 +2,9 @@
 //! application event loop, WPS connection, input injection or test runner.
 #![allow(dead_code)]
 #[path = "../src/app.rs"] mod app;
+#[path = "../src/settings_state.rs"] mod settings_state;
+#[path = "../src/settings_panel.rs"] mod settings_panel;
+#[path = "../src/value_input.rs"] mod value_input;
 #[path = "../src/persistence.rs"] mod persistence;
 #[path = "../src/process_block.rs"] mod process_block;
 #[cfg(unix)]

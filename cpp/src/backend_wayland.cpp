@@ -39,7 +39,7 @@
 // ---- 调色板 / 尺寸（与 X11 路径一致） ----
 static const QVector<QColor> kColors = {
   QColor(255,40,40), QColor(50,120,255), QColor(40,200,60), QColor(255,210,30), QColor(240,240,240),
-  QColor("#0ABAB5"), QColor("#AB47BC"), QColor("#C9DD22"), QColor("#FF6D00"), QColor("#795548")
+  QColor("#0ABAB5"), QColor("#AB47BC"), QColor("#C9DD22"), QColor("#FF6D00"), QColor("#000000")
 };
 static const QVector<int> kPenSizes    = { 3, 5, 10 };
 static const QVector<int> kEraserSizes = { 12, 24, 48 };

@@ -60,6 +60,10 @@ fn small_settings_page_buttons_wheel_and_done_use_the_real_input_path() {
     let (x, y) = (done.x + done.w / 2, done.y + done.h / 2);
     on_press(&rt, &mut app, &mut ip, None, x, y, 1);
     on_release(&rt, &mut app, &mut ip, None, x, y, 1);
+    assert!(app.settings_ui.closing_at > 0);
+    app.settings_ui.closing_at -= 121;
+    tick_shared(&rt, &mut app, &mut ip, None,
+        &WpsUpdate { connected: false, events: Vec::new() }, &mut Timers::new(), false);
     assert!(!app.settings_open);
     assert!(!app.is_drawing && !app.page_has_ink);
     assert!(ip.pending_ui.is_none() && ip.slider.is_none());
@@ -108,6 +112,41 @@ fn background_wps_does_not_enter_presentation_or_switch_pages() {
     assert!(!app.wps_can_jump);
     assert!(!app.sidebar_page_visible());
     assert_eq!(app.presentation_action, ui::PresentationAction::Escape);
+}
+
+#[test]
+fn background_wps_rejects_toolbar_actions_even_before_the_next_tick() {
+    let (rt, mut app, keys) = fixture_with_foreground(true, Some(false));
+    app.wps_debug = true;
+    let bridge = WpsBridge::from_listener(std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap());
+    {
+        let mut state = bridge.shared.lock().unwrap();
+        state.connected = true;
+        state.last_seen = now_ms();
+        state.real_pos = 3;
+        state.test_mode = true;
+        state.can_jump = true;
+        state.page_index = 3;
+        state.page_total = 10;
+        state.deck_epoch = 7;
+    }
+    app.wps_connected = true;
+    app.wps_navigation_ready = true;
+    go_prev(&rt, &mut app, Some(&bridge));
+    go_next(&rt, &mut app, Some(&bridge));
+    exit_presentation(&rt, &mut app, Some(&bridge));
+    app.wps_can_jump = true;
+    app.wps_deck_epoch = 7;
+    app.wps_page_index = 3;
+    app.wps_page_total = 10;
+    let mut picker = page_picker::PagePicker::new(3, 10, page_picker::Source::Wps(7));
+    picker.set_selected(5);
+    app.page_picker = Some(picker);
+    commit_page_picker(&rt, &mut app, Some(&bridge));
+    assert!(!app.wps_navigation_ready);
+    assert_eq!(app.current_slide, 1);
+    assert_eq!(keys.get(), 0);
+    assert!(bridge.shared.lock().unwrap().queue.is_empty());
 }
 
 #[test]
@@ -891,7 +930,9 @@ fn drag_reverses_immediately_at_an_edge_and_uses_the_release_position() {
         app.collapsed = collapsed;
         app.sb_y = 180;
         let sb = ui::sidebar_rect(&app, false);
-        on_press(&rt, &mut app, &mut ip, None, sb.x + sb.w / 2, sb.y + sb.h - 5, 1);
+        let press_y = if collapsed { sb.y + sb.h / 2 } else { sb.y + sb.h - 5 };
+        on_press(&rt, &mut app, &mut ip, None, sb.x + sb.w / 2, press_y, 1);
+        assert!(ip.dragging && ip.pending_ui.is_none(), "the tab centre must start dragging too");
         let outside_x = app.screen_w / 2;
         on_motion(&rt, &mut app, &mut ip, outside_x, -100);
         assert_eq!(app.sb_y, 0);
@@ -1076,6 +1117,9 @@ fn whiteboard_dot_controls_toggle_and_apply_the_size_slider() {
     app.whiteboard_dots = false;
     assert_eq!(
         ui::whiteboard_control_hit(&app, slider.x + 4, slider.y + 4),
-        None
+        Some(ui::WhiteboardControl::DotSize)
     );
+    on_press(&rt, &mut app, &mut ip, None, slider.x + 4, slider.y + 4, 1);
+    assert!(!ip.dot_slider);
+    assert_eq!(app.whiteboard_dot_size, 10, "a disabled slider must retain its value");
 }

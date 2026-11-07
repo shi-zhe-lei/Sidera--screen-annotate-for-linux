@@ -63,13 +63,15 @@ Description: Sidera 软件
 EOF
 
 # ---------- desktop 入口文件 ----------
+ICON_SHA="$(sha256sum ../sidera.png | cut -c1-12)"
+ICON_PATH="/usr/share/pixmaps/sidera-${ICON_SHA}.png"
 cat > "${PKG_DIR}/usr/share/applications/sidera.desktop" << EOF
 [Desktop Entry]
 Type=Application
 Name=Sidera
 Comment=Sidera软件
 Exec=sidera
-Icon=/usr/share/pixmaps/sidera.svg
+Icon=${ICON_PATH}
 Categories=Graphics;Utility;
 Terminal=false
 EOF
@@ -81,6 +83,8 @@ mkdir -p "${PKG_DIR}/usr/share/pixmaps"
 cp ../sidera.svg "${PKG_DIR}/usr/share/icons/hicolor/scalable/apps/sidera.svg"
 cp ../sidera.svg "${PKG_DIR}/usr/share/pixmaps/sidera.svg"
 cp ../sidera.png "${PKG_DIR}/usr/share/icons/hicolor/256x256/apps/sidera.png"
+cp ../sidera.png "${PKG_DIR}/usr/share/pixmaps/sidera.png"
+cp ../sidera.png "${PKG_DIR}${ICON_PATH}"
 
 # ---------- 打包（--root-owner-group 消除 owner 警告）----------
 dpkg-deb --build --root-owner-group "$PKG_DIR" "$PKG_DIR.deb"

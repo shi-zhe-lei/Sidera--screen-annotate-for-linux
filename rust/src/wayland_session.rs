@@ -24,6 +24,7 @@ struct SeatDevices {
     touch: Option<wl_touch::WlTouch>,
     keyboard: Option<ZwpVirtualKeyboardV1>,
     text_keyboard: Option<wl_keyboard::WlKeyboard>,
+    keyboard_output: Option<String>,
     mods: u32,
     virtual_pointers: HashMap<String, ZwlrVirtualPointerV1>,
     contacts: HashMap<i32, Contact>,
@@ -32,7 +33,7 @@ struct SeatDevices {
 }
 impl SeatDevices {
     fn new(seat: wl_seat::WlSeat) -> Self {
-        Self { seat, pointer: None, touch: None, keyboard: None, text_keyboard: None, mods: 0,
+        Self { seat, pointer: None, touch: None, keyboard: None, text_keyboard: None, keyboard_output: None, mods: 0,
             virtual_pointers: HashMap::new(), contacts: HashMap::new(), actions: Vec::new(), shapes: HashMap::new() }
     }
 }
@@ -230,9 +231,36 @@ fn evdev_char(key: u32, upper: bool) -> Option<char> {
         43 => ('\\', '|'), 44 => ('z', 'Z'), 45 => ('x', 'X'), 46 => ('c', 'C'),
         47 => ('v', 'V'), 48 => ('b', 'B'), 49 => ('n', 'N'), 50 => ('m', 'M'),
         51 => (',', '<'), 52 => ('.', '>'), 53 => ('/', '?'), 57 => (' ', ' '),
+        71=>('7','7'),72=>('8','8'),73=>('9','9'),74=>('-','-'),75=>('4','4'),
+        76=>('5','5'),77=>('6','6'),78=>('+','+'),79=>('1','1'),80=>('2','2'),
+        81=>('3','3'),82=>('0','0'),83=>('.','.'),
         _ => return None,
     };
     Some(if upper { shifted } else { lower })
+}
+
+pub(crate) fn text_key(key: u32, modifiers: u32) -> Option<crate::value_input::Key> {
+    use crate::value_input::Key;
+    Some(match key {
+        1 => Key::Escape,
+        28 | 96 => Key::Enter,
+        14 => Key::Backspace,
+        111 => Key::Delete,
+        105 => Key::Left,
+        106 => Key::Right,
+        102 => Key::Home,
+        107 => Key::End,
+        30 if modifiers & 4 != 0 => Key::SelectAll,
+        47 if modifiers & 4 != 0 => Key::Paste,
+        _ if modifiers & 4 == 0 => {
+            let mut ch = evdev_char(key, modifiers & 1 != 0)?;
+            if modifiers & 2 != 0 && ch.is_ascii_alphabetic() {
+                ch = if ch.is_ascii_uppercase() { ch.to_ascii_lowercase() } else { ch.to_ascii_uppercase() };
+            }
+            Key::Character(ch)
+        }
+        _ => return None,
+    })
 }
 
 impl wayland_client::Dispatch<wl_keyboard::WlKeyboard, ()> for WlState {
@@ -248,54 +276,21 @@ impl wayland_client::Dispatch<wl_keyboard::WlKeyboard, ()> for WlState {
             seat.text_keyboard.as_ref().is_some_and(|item| item == keyboard)
         }) else { return };
         match event {
-            wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
-                state.seats[index].mods = mods_depressed;
+            wl_keyboard::Event::Enter { surface, .. } => {
+                state.seats[index].keyboard_output = state.surface_id(&surface);
+            }
+            wl_keyboard::Event::Leave { .. } => {
+                state.seats[index].keyboard_output = None;
+                state.seats[index].mods = 0;
+            }
+            wl_keyboard::Event::Modifiers { mods_depressed, mods_latched, mods_locked, .. } => {
+                state.seats[index].mods = mods_depressed | mods_latched | (mods_locked & 2);
             }
             wl_keyboard::Event::Key { key, state: wayland_client::WEnum::Value(KeyState::Pressed), .. } => {
-                let mods = state.seats[index].mods;
-                let mut changed = false;
-                for output in state.desktop.outputs.values_mut() {
-                    if !output.app.process_block_open || !output.app.process_input_active {
-                        continue;
-                    }
-                    let ctrl = mods & 4 != 0;
-                    let shift = mods & 1 != 0;
-                    let caps = mods & 2 != 0;
-                    if key == 1 {
-                        output.app.process_input_active = false;
-                        output.rt.backend.set_text_input(false);
-                        changed = true;
-                    } else if key == 28 {
-                        let value = output.app.process_input.trim().to_string();
-                        if !value.is_empty() && value.chars().count() <= 256
-                            && !output.app.process_rules.iter().any(|rule| rule == &value)
-                            && output.app.process_rules.len() < 64
-                        {
-                            output.app.process_rules.push(value);
-                            let _ = crate::process_block::save_rules(&output.app.process_rules);
-                        }
-                        output.app.process_input.clear();
-                        changed = true;
-                    } else if key == 14 {
-                        output.app.process_input.pop();
-                        changed = true;
-                    } else if ctrl && key == 47 {
-                        if let Some(text) = crate::clipboard::get_text() {
-                            output.app.process_input = text.chars().take(256).collect();
-                            changed = true;
-                        }
-                    } else if !ctrl {
-                        if let Some(ch) = evdev_char(key, shift ^ caps) {
-                            if output.app.process_input.chars().count() < 256 {
-                                output.app.process_input.push(ch);
-                                changed = true;
-                            }
-                        }
-                    }
-                    if changed {
-                        output.rt.redraw_full(&output.app);
-                    }
-                    break;
+                if let (Some(id), Some(command)) = (
+                    state.seats[index].keyboard_output.clone(), text_key(key, state.seats[index].mods),
+                ) {
+                    state.desktop.value_key(&id, command);
                 }
             }
             _ => {}
@@ -338,6 +333,8 @@ impl SeatHandler for WlState {
             if let Some(touch) = self.seats[index].touch.take() { if touch.version() >= 3 { touch.release(); } }
         }
         if capability == Capability::Keyboard {
+            self.seats[index].keyboard_output = None;
+            self.seats[index].mods = 0;
             if let Some(keyboard) = self.seats[index].text_keyboard.take() {
                 if keyboard.version() >= 3 { keyboard.release(); }
             }
@@ -452,9 +449,15 @@ pub fn run(prepared:PreparedWayland,fonts:Fonts,icon:Option<Pixmap>,icon_big:Opt
     let handle = event_loop.handle();
     WaylandSource::new(conn.clone(),event_queue).insert(handle.clone())?;
     handle.insert_source(Timer::from_duration(Duration::from_millis(16)),|_,_,state:&mut WlState| {
+        let frame_started = std::time::Instant::now();
         state.desktop.tick();
         let _ = state.conn.flush();
-        TimeoutAction::ToDuration(Duration::from_millis(16))
+        let interval = Duration::from_millis(16);
+        TimeoutAction::ToDuration(if state.desktop.settings_animating() {
+            interval.saturating_sub(frame_started.elapsed())
+        } else {
+            interval
+        })
     })?;
     event_loop.run(None,&mut state, |_|{})?;
     Ok(())

@@ -2,6 +2,9 @@
 //! a desktop, starts WPS, reads saved settings or runs the application loop.
 #![allow(dead_code)]
 #[path = "../src/app.rs"] mod app;
+#[path = "../src/settings_state.rs"] mod settings_state;
+#[path = "../src/settings_panel.rs"] mod settings_panel;
+#[path = "../src/value_input.rs"] mod value_input;
 #[path = "../src/persistence.rs"] mod persistence;
 #[path = "../src/process_block.rs"] mod process_block;
 #[cfg(unix)]
@@ -30,6 +33,7 @@ use ui_theme::{c, Preference, Theme};
 fn fresh(preference: Preference) -> app::App {
     let mut a = app::App::new(Pixmap::new(1280, 900).unwrap(), 1280, 900);
     a.apply_theme(Theme { preference, system_dark: false, ..Default::default() });
+    a.settings_ui.theme_from = None;
     a.mode = 1;
     a.cur_color = 8;
     a.drawing_tools.set_expanded(true);
@@ -66,6 +70,29 @@ fn main() {
     });
     let icon = resize_icon(44);
     let intro_icon = resize_icon(84);
+
+    if std::env::args().nth(2).as_deref() == Some("--compact") {
+        for preference in [Preference::Light, Preference::Dark] {
+            let mut a = fresh(preference);
+            a.settings_open = true;
+            for tab in settings_state::Tab::ALL {
+                a.settings_ui.tab = tab;
+                capture(&a, &fonts, icon.as_ref(), ui::settings_rect(&a))
+                    .save_png(out.join(format!("{}-{}.png", preference.key(), tab.index()))).unwrap();
+            }
+            a.settings_ui.tab = settings_state::Tab::Appearance;
+            a.settings_ui.picker = Some(settings_state::ColorDraft::new(a.theme.accent.rgb()));
+            a.settings_ui.recent = vec![0x287A70,0x4263EB,0xAF526F];
+            capture(&a, &fonts, icon.as_ref(), settings_panel::picker_rect(&a))
+                .save_png(out.join(format!("{}-palette.png", preference.key()))).unwrap();
+            a.settings_ui.picker = None;
+            let mut editor=value_input::Editor::new(&a,value_input::Target::Setting(ui::SliderId::AutoExpand));
+            editor.opened_at=0;a.settings_ui.tab=settings_state::Tab::General;a.settings_ui.editor=Some(editor);
+            capture(&a, &fonts, icon.as_ref(), ui::settings_rect(&a))
+                .save_png(out.join(format!("{}-input.png", preference.key()))).unwrap();
+        }
+        return;
+    }
 
     if std::env::args().nth(2).as_deref() == Some("--settings") {
         for preference in [Preference::Light, Preference::Dark] {
