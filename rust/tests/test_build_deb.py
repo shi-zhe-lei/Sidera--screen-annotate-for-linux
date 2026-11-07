@@ -41,13 +41,22 @@ class BuildDebTests(unittest.TestCase):
         self.addCleanup(scratch.cleanup)
         repo = Path(scratch.name) / "repo with spaces"
         (repo / "rust").mkdir(parents=True)
+
         # Normalize the Windows checkout's CRLF in the isolated Linux copy.
         (repo / "rust/build_deb.sh").write_text(
             (REPO / "rust/build_deb.sh").read_text(encoding="utf-8"),
             encoding="utf-8",
         )
+
+        # Copy the systemd user service required by build_deb.sh.
+        shutil.copytree(
+            REPO / "rust/systemd",
+            repo / "rust/systemd",
+        )
+
         for name in ("sidera.svg", "sidera.png", "README.classroom.md", "LICENSE"):
             shutil.copyfile(REPO / name, repo / name)
+
         shutil.copytree(REPO / "wps-addin", repo / "wps-addin")
         shutil.copytree(REPO / "compat/gnome-extension", repo / "compat/gnome-extension")
         (repo / "tools").mkdir()
