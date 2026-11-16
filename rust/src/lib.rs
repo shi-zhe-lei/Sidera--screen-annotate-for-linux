@@ -124,6 +124,45 @@ pub enum WbSlider { Zoom, Size, Shape }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WbHandle { Move, Rotate }
 
+fn union_rect(a: Option<R>, b: Option<R>) -> Option<R> {
+    match (a, b) {
+        (None, other) | (other, None) => other,
+        (Some(a), Some(b)) => {
+            let x = a.x.min(b.x);
+            let y = a.y.min(b.y);
+            let x2 = (a.x + a.w).max(b.x + b.w);
+            let y2 = (a.y + a.h).max(b.y + b.h);
+            Some(R { x, y, w: x2 - x, h: y2 - y })
+        }
+    }
+}
+
+fn expand_rect(r: R, n: i32) -> R {
+    R { x: r.x - n, y: r.y - n, w: r.w + n * 2, h: r.h + n * 2 }
+}
+
+fn lasso_rect(points: &[(f32, f32)]) -> Option<R> {
+    let &(first_x, first_y) = points.first()?;
+    let (mut x0, mut y0, mut x1, mut y1) = (first_x, first_y, first_x, first_y);
+    for &(x, y) in &points[1..] {
+        x0 = x0.min(x); y0 = y0.min(y); x1 = x1.max(x); y1 = y1.max(y);
+    }
+    Some(expand_rect(R {
+        x: x0.floor() as i32, y: y0.floor() as i32,
+        w: (x1.ceil() - x0.floor()) as i32, h: (y1.ceil() - y0.floor()) as i32,
+    }, 4))
+}
+
+fn floating_rect(app: &App) -> Option<R> {
+    let sel = app.floating.as_ref()?;
+    let sc = app.scale.max(0.001);
+    let x = (sel.x as f64 / sc).floor() as i32;
+    let y = (sel.y as f64 / sc).floor() as i32;
+    let w = (sel.pixmap.width() as f64 / sc).ceil() as i32;
+    let h = (sel.pixmap.height() as f64 / sc).ceil() as i32;
+    Some(expand_rect(R { x, y, w, h }, 6))
+}
+
 pub struct Ip {
     pub dragging: bool,
     pub drag_start_y: i32,
@@ -141,6 +180,9 @@ pub struct Ip {
     pub wb_handle: Option<WbHandle>,
     pub wb_last: (i32, i32),
     pub wb_lasso: bool,
+    /// Displayed lasso/floating dirty bounds, for partial redraws.
+    pub wb_lasso_rect: Option<R>,
+    pub wb_sel_rect: Option<R>,
     pub wb_sel_drag: Option<(f32, f32)>,
     pub wb_start_angle: f32,
     pub wb_start_rotation: f32,
@@ -179,6 +221,8 @@ impl Default for Ip {
             wb_handle: None,
             wb_last: (0, 0),
             wb_lasso: false,
+            wb_lasso_rect: None,
+            wb_sel_rect: None,
             wb_sel_drag: None,
             wb_start_angle: 0.0,
             wb_start_rotation: 0.0,
@@ -1542,7 +1586,9 @@ fn handle_whiteboard_press(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32, 
     if app.select_mode && button == 3 {
         app.lasso.clear();
         app.select_mode = false;
-        rt.redraw_full(app);
+        let dirty = union_rect(ip.wb_lasso_rect.take(),
+            Some(ui::whiteboard_bar_rect(app)));
+        if let Some(r) = dirty { rt.redraw(app, r); }
         return true;
     }
     if button == 2 && app.coord.as_ref().is_some_and(|c| c.editing) {
@@ -1598,7 +1644,8 @@ fn handle_whiteboard_press(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32, 
         app.lasso.clear();
         app.lasso.push((x as f32, y as f32));
         ip.wb_lasso = true;
-        rt.redraw_full(app);
+        ip.wb_lasso_rect = lasso_rect(&app.lasso);
+        if let Some(r) = ip.wb_lasso_rect { rt.redraw(app, r); }
         return true;
     }
     if app.floating.is_some() && button == 1 {
@@ -1610,6 +1657,7 @@ fn handle_whiteboard_press(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32, 
         let bottom = top + sel.pixmap.height() as f32 / sc;
         if (x as f32) >= left && (x as f32) <= right && (y as f32) >= top && (y as f32) <= bottom {
             ip.wb_sel_drag = Some((x as f32, y as f32));
+            ip.wb_sel_rect = floating_rect(app);
             return true;
         }
         crate::selection::commit(app);
@@ -2030,16 +2078,28 @@ pub fn on_motion(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
                 }
             }
             ip.wb_last = (x, y);
-            rt.redraw_full(app);
+            let now = now_ms();
+            if now - ip.wb_redraw_at >= 16 {
+                ip.wb_redraw_at = now;
+                rt.redraw_full(app);
+            }
             return;
         }
         if ip.wb_lasso {
             if let Some(&(lx, ly)) = app.lasso.last() {
-                if (x as f32 - lx).abs() + (y as f32 - ly).abs() >= 2.0 {
+                let (dx, dy) = (x as f32 - lx, y as f32 - ly);
+                if dx * dx + dy * dy >= 9.0 && app.lasso.len() < 4096 {
                     app.lasso.push((x as f32, y as f32));
                 }
             }
-            rt.redraw_full(app);
+            let new = lasso_rect(&app.lasso);
+            let dirty = union_rect(ip.wb_lasso_rect, new);
+            let now = now_ms();
+            if now - ip.wb_redraw_at >= 16 {
+                ip.wb_redraw_at = now;
+                if let Some(r) = dirty { rt.redraw(app, r); }
+                ip.wb_lasso_rect = new;
+            }
             return;
         }
         if let Some((lx, ly)) = ip.wb_sel_drag {
@@ -2049,7 +2109,14 @@ pub fn on_motion(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
                 sel.y += ((y as f32 - ly) * sc).round() as i32;
             }
             ip.wb_sel_drag = Some((x as f32, y as f32));
-            rt.redraw_full(app);
+            let new = floating_rect(app);
+            let dirty = union_rect(ip.wb_sel_rect, new);
+            let now = now_ms();
+            if now - ip.wb_redraw_at >= 16 {
+                ip.wb_redraw_at = now;
+                if let Some(r) = dirty { rt.redraw(app, r); }
+                ip.wb_sel_rect = new;
+            }
             return;
         }
     }
@@ -2244,16 +2311,27 @@ pub fn on_release(rt: &Rt, app: &mut App, ip: &mut Ip, wps: Option<&WpsBridge>, 
         if ip.wb_lasso {
             ip.wb_lasso = false;
             if let Some(&(lx, ly)) = app.lasso.last() {
-                if (x as f32 - lx).abs() + (y as f32 - ly).abs() >= 2.0 {
+                let (dx, dy) = (x as f32 - lx, y as f32 - ly);
+                if dx * dx + dy * dy >= 4.0 {
                     app.lasso.push((x as f32, y as f32));
                 }
             }
             let lasso = app.lasso.clone();
+            let final_rect = lasso_rect(&lasso);
             app.floating = crate::selection::lift(app, &lasso);
             app.lasso.clear();
             app.select_mode = false;
+            let mut dirty = union_rect(ip.wb_lasso_rect.take(), final_rect);
+            dirty = union_rect(dirty, Some(ui::whiteboard_bar_rect(app)));
+            if app.floating.is_some() {
+                dirty = union_rect(dirty, floating_rect(app));
+                dirty = union_rect(dirty, Some(ui::selection_bar_rect(app)));
+            }
             apply_input_shape(rt, app);
-            rt.redraw_full(app);
+            match dirty {
+                Some(r) => rt.redraw(app, r),
+                None => rt.redraw_full(app),
+            }
             return;
         }
         if ip.wb_slider.take().is_some() || ip.wb_handle.take().is_some() {
@@ -2261,8 +2339,17 @@ pub fn on_release(rt: &Rt, app: &mut App, ip: &mut Ip, wps: Option<&WpsBridge>, 
             rt.redraw_full(app);
             return;
         }
-        if ip.wb_sel_drag.take().is_some() {
-            rt.redraw_full(app);
+        if let Some((lx, ly)) = ip.wb_sel_drag.take() {
+            let sc = app.scale.max(0.001) as f32;
+            if let Some(sel) = app.floating.as_mut() {
+                sel.x += ((x as f32 - lx) * sc).round() as i32;
+                sel.y += ((y as f32 - ly) * sc).round() as i32;
+            }
+            let dirty = union_rect(ip.wb_sel_rect.take(), floating_rect(app));
+            match dirty {
+                Some(r) => rt.redraw(app, r),
+                None => rt.redraw_full(app),
+            }
             return;
         }
     }

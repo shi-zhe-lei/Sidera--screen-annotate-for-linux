@@ -109,7 +109,7 @@ impl ConicKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConicDirection { Horizontal, Vertical, Up, Down, Left, Right }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoordGuide {
     pub origin_x: f32,
     pub origin_y: f32,
@@ -173,6 +173,8 @@ pub struct App {
     pub whiteboard: bool,
     pub whiteboard_bg_index: i32,
     pub coord: Option<CoordGuide>,
+    /// Cached background + grid layer for a static (non-editing) guide.
+    pub coord_layer: std::cell::RefCell<Option<crate::ui::CoordLayer>>,
     /// One guide per whiteboard page; the active copy lives in `coord`.
     pub coord_pages: HashMap<i32, CoordGuide>,
     pub coord_page: i32,
@@ -333,6 +335,7 @@ impl App {
             whiteboard: false,
             whiteboard_bg_index: 1,
             coord: None,
+            coord_layer: std::cell::RefCell::new(None),
             coord_pages: HashMap::new(),
             coord_page: 1,
             conic_menu: None,

@@ -399,6 +399,42 @@ fn rounded_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Pat
     pb.finish()
 }
 
+/// At fractional desktop scales a 1-logical-pixel line becomes 1.25/1.5
+/// device pixels and looks soft. Use exactly one device pixel for those thin
+/// strokes; integer scales keep their intended 1/2/3 device-pixel widths.
+fn crisp_line_width(tr: &Transform, w: f32) -> f32 {
+    let scale = (tr.sx.abs() + tr.sy.abs()) * 0.5;
+    if scale <= 0.0 || (scale - scale.round()).abs() < 0.01 {
+        return w;
+    }
+    let dev = w * scale;
+    if (0.6..1.8).contains(&dev) { 1.0 / scale } else { w }
+}
+
+/// Snap a thin rounded rectangle's edges to half device pixels. Only affects
+/// uniform, axis-aligned transforms and ~1-device-pixel strokes.
+fn snap_stroke_rect(tr: &Transform, r: R, width: f32) -> (f32, f32, f32, f32) {
+    let (x, y, w, h) = (r.x as f32, r.y as f32, r.w as f32, r.h as f32);
+    if tr.kx.abs() > 0.01 || tr.ky.abs() > 0.01 || tr.sx == 0.0 || tr.sy == 0.0
+        || (tr.sx - tr.sy).abs() > 0.01 {
+        return (x, y, w, h);
+    }
+    let dev_w = width * tr.sx.abs();
+    if (dev_w - 1.0).abs() > 0.2 {
+        return (x, y, w, h);
+    }
+    let snap = |v: f32| (v - 0.5).round() + 0.5;
+    let x0 = snap(x * tr.sx + tr.tx);
+    let y0 = snap(y * tr.sy + tr.ty);
+    let x1 = snap((x + w) * tr.sx + tr.tx);
+    let y1 = snap((y + h) * tr.sy + tr.ty);
+    let nx = (x0 - tr.tx) / tr.sx;
+    let ny = (y0 - tr.ty) / tr.sy;
+    let nw = ((x1 - tr.tx) / tr.sx - nx).max(1.0);
+    let nh = ((y1 - tr.ty) / tr.sy - ny).max(1.0);
+    (nx, ny, nw, nh)
+}
+
 /// Align 1-device-pixel horizontal/vertical lines to pixel centers. A stroke at
 /// an integer coordinate covers two rows/columns at 50% each and looks fuzzy;
 /// adding half a device pixel makes separators crisp without changing geometry.
@@ -436,7 +472,12 @@ impl<'a> Ctx<'a> {
         }
     }
     pub fn stroke_round(&mut self, r: R, radius: f32, c: Color, width: f32) {
-        if let Some(p) = rounded_path(r.x as f32, r.y as f32, r.w as f32, r.h as f32, radius) {
+        // A 1-device-pixel rounded border looks soft at fractional scales
+        // (125%/150%) when its edges land between pixels. Snap the path centre
+        // to half-pixel coordinates so the stroke covers exactly one pixel.
+        let width = crisp_line_width(&self.tr, width);
+        let (x, y, w, h) = snap_stroke_rect(&self.tr, r, width);
+        if let Some(p) = rounded_path(x, y, w, h, radius) {
             let st = Stroke {
                 width,
                 line_cap: LineCap::Round,
@@ -456,6 +497,7 @@ impl<'a> Ctx<'a> {
         }
     }
     pub fn stroke_line(&mut self, a: (f32, f32), b: (f32, f32), c: Color, w: f32) {
+        let w = crisp_line_width(&self.tr, w);
         let (a, b) = snap_axis_line(&self.tr, a, b, w);
         let st = Stroke {
             width: w,
@@ -1313,6 +1355,44 @@ pub fn set_autostart(on: bool) {
 
 // ---------------- 绘制 ----------------
 // ---------------- 绘制 ----------------
+#[derive(Clone, Copy, PartialEq)]
+pub struct CoordLayerKey {
+    w: i32,
+    h: i32,
+    scale: f64,
+    bg: i32,
+    palette: theme::Palette,
+    coord: crate::app::CoordGuide,
+}
+
+/// Full-screen background + grid cache for a static whiteboard guide.
+pub struct CoordLayer {
+    key: CoordLayerKey,
+    pixmap: Pixmap,
+}
+
+fn coord_layer_key(app: &App, coord: crate::app::CoordGuide) -> CoordLayerKey {
+    CoordLayerKey {
+        w: app.screen_w,
+        h: app.screen_h,
+        scale: app.scale,
+        bg: app.whiteboard_bg_index,
+        palette: app.palette(),
+        coord,
+    }
+}
+
+fn build_coord_layer(app: &App, fonts: &Fonts, key: CoordLayerKey) -> Option<Pixmap> {
+    let sc = app.scale as f32;
+    let pw = ((app.screen_w as f32) * sc).round().max(1.0) as u32;
+    let ph = ((app.screen_h as f32) * sc).round().max(1.0) as u32;
+    let mut pm = Pixmap::new(pw, ph)?;
+    pm.fill(app.whiteboard_bg_color());
+    let mut ctx = Ctx { palette: key.palette, pm: &mut pm, tr: Transform::from_scale(sc, sc) };
+    draw_coord_guide(fonts, &mut ctx, &key.coord, 0, 0, app.screen_w, app.screen_h);
+    Some(pm)
+}
+
 pub fn render_region(
     app: &App,
     fonts: &Fonts,
@@ -1349,10 +1429,27 @@ pub fn render_region(
 
     // 背景
     if app.whiteboard {
-        pm.fill(app.whiteboard_bg_color());
-        if let Some(coord) = &app.coord {
-            let mut ctx = Ctx { palette, pm: &mut pm, tr };
-            draw_coord_guide(fonts, &mut ctx, coord, x, y, x2, y2);
+        let mut cached = false;
+        if let Some(coord) = app.coord.filter(|coord| !coord.editing) {
+            let key = coord_layer_key(app, coord);
+            let mut cache = app.coord_layer.borrow_mut();
+            if cache.as_ref().is_none_or(|layer| layer.key != key) {
+                *cache = build_coord_layer(app, fonts, key).map(|pixmap| CoordLayer { key, pixmap });
+            }
+            if let Some(layer) = cache.as_ref() {
+                let dx = -((x as f32) * sc).round() as i32;
+                let dy = -((y as f32) * sc).round() as i32;
+                pm.draw_pixmap(dx, dy, layer.pixmap.as_ref(),
+                    &tiny_skia::PixmapPaint::default(), Transform::identity(), None);
+                cached = true;
+            }
+        }
+        if !cached {
+            pm.fill(app.whiteboard_bg_color());
+            if let Some(coord) = &app.coord {
+                let mut ctx = Ctx { palette, pm: &mut pm, tr };
+                draw_coord_guide(fonts, &mut ctx, coord, x, y, x2, y2);
+            }
         }
     }
 
@@ -1970,7 +2067,13 @@ fn draw_coord_guide(fonts: &Fonts, ctx: &mut Ctx, coord: &crate::app::CoordGuide
         v += step;
     }
     // Tick labels along the axes (upright, not rotated with the grid).
-    let mut u = (u0 / step).ceil() * step;
+    // Label every few grid lines: drawing a glyph for every line dominates
+    // software-rendering cost on 4K screens without adding teaching value.
+    let label_step = {
+        let count = ((u1 - u0) / step).max(1.0);
+        step * (count / 10.0).ceil().max(1.0)
+    };
+    let mut u = (u0 / label_step).ceil() * label_step;
     while u <= u1 {
         if u.abs() > 1e-4 {
             let p = crate::conic::to_screen(coord, u, 0.0);
@@ -1978,9 +2081,13 @@ fn draw_coord_guide(fonts: &Fonts, ctx: &mut Ctx, coord: &crate::app::CoordGuide
                 ctx.text(fonts, &format!("{u:.0}"), p.0 + 3.0, p.1 - 4.0, 11.0, c(palette.muted));
             }
         }
-        u += step;
+        u += label_step;
     }
-    let mut v = (v0 / step).ceil() * step;
+    let label_step = {
+        let count = ((v1 - v0) / step).max(1.0);
+        step * (count / 10.0).ceil().max(1.0)
+    };
+    let mut v = (v0 / label_step).ceil() * label_step;
     while v <= v1 {
         if v.abs() > 1e-4 {
             let p = crate::conic::to_screen(coord, 0.0, v);
@@ -1988,7 +2095,7 @@ fn draw_coord_guide(fonts: &Fonts, ctx: &mut Ctx, coord: &crate::app::CoordGuide
                 ctx.text(fonts, &format!("{v:.0}"), p.0 + 4.0, p.1 + 4.0, 11.0, c(palette.muted));
             }
         }
-        v += step;
+        v += label_step;
     }
     if coord.conic != crate::app::ConicKind::None {
         for branch in crate::conic::branches(coord, u0, u1, v0, v1) {
@@ -2387,6 +2494,23 @@ mod whiteboard_guide_tests {
                 assert!(!overlaps(wb_button_rect(&app, i), wb_button_rect(&app, if i == 4 { 0 } else { i + 1 })));
             }
         }
+    }
+
+    #[test]
+    fn static_guide_reuses_the_cached_layer() {
+        let fonts = Fonts::load();
+        let mut app = App::new(Pixmap::new(640, 360).unwrap(), 640, 360);
+        app.whiteboard = true;
+        app.coord = Some(crate::app::CoordGuide::new(640, 360,
+            crate::app::ConicKind::Ellipse, crate::app::ConicDirection::Horizontal));
+        app.coord.as_mut().unwrap().editing = false;
+        let first = render_region(&app, &fonts, None, 0, 0, 640, 360).unwrap();
+        assert!(app.coord_layer.borrow().is_some(), "static guide must be cached");
+        let second = render_region(&app, &fonts, None, 0, 0, 640, 360).unwrap();
+        assert_eq!(first.data(), second.data(), "cache must reproduce the same pixels");
+        app.coord.as_mut().unwrap().shape = 0.9;
+        let changed = render_region(&app, &fonts, None, 0, 0, 640, 360).unwrap();
+        assert_ne!(second.data(), changed.data(), "guide edits must invalidate the cache");
     }
 
     #[test]

@@ -230,11 +230,13 @@ impl Fonts {
         // outline itself is rendered correctly.
         static TEXT_SNAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let snap_enabled = *TEXT_SNAP.get_or_init(|| std::env::var_os("SIDERA_NO_TEXT_SNAP").is_none());
+        // Snap glyph origins to whole device pixels. This also helps at
+        // fractional desktop scales (125%/150%), where unsnapped origins make
+        // small CJK text look soft even though the outlines are correct.
         let snap = snap_enabled
             && transform.kx.abs() < 0.01 && transform.ky.abs() < 0.01
-            && (transform.sx - transform.sx.round()).abs() < 0.01
-            && (transform.sy - transform.sy.round()).abs() < 0.01
-            && transform.sx != 0.0 && transform.sy != 0.0;
+            && (transform.sx - transform.sy).abs() < 0.01
+            && transform.sx != 0.0;
         let mut caret = x;
         for ch in s.chars() {
             let Some(f) = self.pick(ch) else {

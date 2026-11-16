@@ -102,8 +102,10 @@ pub fn branches(coord: &CoordGuide, u0: f32, u1: f32, v0: f32, v1: f32) -> Vec<V
                 let t = -tmax + 2.0 * tmax * i as f32 / N as f32;
                 let (x, y) = (a * t.cosh(), b * t.sinh());
                 match coord.direction {
+                    // Vertical hyperbola: x = ±b·sinh(t), y = ±a·cosh(t) has
+                    // upper and lower branches, not left/right half-curves.
                     ConicDirection::Vertical => {
-                        left.push((-y, x)); right.push((y, x));
+                        left.push((y, x)); right.push((y, -x));
                     }
                     _ => {
                         left.push((-x, y)); right.push((x, y));
@@ -171,6 +173,23 @@ mod tests {
         let near = foci(&c)[0].0;
         c.size = 1.0;
         assert!(foci(&c)[0].0 > near);
+    }
+
+    #[test]
+    fn vertical_hyperbola_has_upper_and_lower_branches() {
+        let c = CoordGuide::new(300, 200, ConicKind::Hyperbola, ConicDirection::Vertical);
+        let branches = branches(&c, -10.0, 10.0, -10.0, 10.0);
+        assert_eq!(branches.len(), 2);
+        let mut upper = false;
+        let mut lower = false;
+        for branch in &branches {
+            let positive = branch.iter().filter(|(_, v)| *v > 0.01).count();
+            let negative = branch.iter().filter(|(_, v)| *v < -0.01).count();
+            assert!(positive == 0 || negative == 0, "a vertical branch cannot cross the axis");
+            upper |= positive > 0;
+            lower |= negative > 0;
+        }
+        assert!(upper && lower, "vertical hyperbola needs both halves");
     }
 
     #[test]
