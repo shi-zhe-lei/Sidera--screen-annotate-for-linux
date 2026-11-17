@@ -53,10 +53,15 @@ def main():
         path = artifacts / f"{suite}-TESTS-{architecture}.txt"
         if os.environ.get("REQUIRE_FULL_TESTS") == "1" or path.exists():
             report = path.read_text(encoding="utf-8")
-            result = re.search(r"test result: ok\. (\d+) passed; 0 failed;", report)
-            if not result or int(result[1]) < 1:
+            # test_rust.py runs every test executable. Some binaries (for
+            # example the bin target filtered to x11::) legitimately report
+            # "0 passed" before the library executable reports its results.
+            # Sum the whole report instead of trusting only the first line.
+            suite_passed = sum(int(m.group(1)) for m in
+                               re.finditer(r"test result: ok\. (\d+) passed; 0 failed;", report))
+            if suite_passed < 1:
                 raise ValueError(f"Successful {suite} test report is missing")
-            extra_tests.append(f"| Native isolated {suite} tests | {result[1]} passed; {path.name} |")
+            extra_tests.append(f"| Native isolated {suite} tests | {suite_passed} passed; {path.name} |")
 
     # Include the packaging/verification sources alongside the already-published
     # tagged application + vendored dependency archive. No executable is changed.
