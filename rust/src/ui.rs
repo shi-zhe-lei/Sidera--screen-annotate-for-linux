@@ -524,7 +524,7 @@ impl<'a> Ctx<'a> {
             self.pm.stroke_path(&p, &solid(c), &st, self.tr, None);
         }
     }
-    /// Yellow/black hazard dashes for the lasso selection outline.
+    /// Yellow/black hazard dashes for the rectangular selection outline.
     pub fn stroke_hazard(&mut self, points: &[(f32, f32)], closed: bool) {
         if points.len() < 2 { return; }
         let mut pb = PathBuilder::new();
@@ -1355,17 +1355,24 @@ pub fn set_autostart(on: bool) {
 
 // ---------------- 绘制 ----------------
 // ---------------- 绘制 ----------------
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoordLayerKey {
     w: i32,
     h: i32,
     scale: f64,
     bg: i32,
     palette: theme::Palette,
-    coord: crate::app::CoordGuide,
+    origin_x: f32,
+    origin_y: f32,
+    coord_scale: f32,
+    rotation: f32,
+    /// Plain coordinate guides use `size` for their finite grid extent.
+    extent: Option<f32>,
+    show_labels: bool,
 }
 
-/// Full-screen background + grid cache for a static whiteboard guide.
+/// Full-screen background + grid cache. The conic curve itself is drawn live,
+/// so changing shape/size during editing can reuse this layer.
 pub struct CoordLayer {
     key: CoordLayerKey,
     pixmap: Pixmap,
@@ -1378,18 +1385,25 @@ fn coord_layer_key(app: &App, coord: crate::app::CoordGuide) -> CoordLayerKey {
         scale: app.scale,
         bg: app.whiteboard_bg_index,
         palette: app.palette(),
-        coord,
+        origin_x: coord.origin_x,
+        origin_y: coord.origin_y,
+        coord_scale: coord.scale,
+        rotation: coord.rotation,
+        extent: (coord.conic == crate::app::ConicKind::None).then_some(coord.size),
+        show_labels: !coord.editing,
     }
 }
 
-fn build_coord_layer(app: &App, fonts: &Fonts, key: CoordLayerKey) -> Option<Pixmap> {
+fn build_coord_layer(app: &App, fonts: &Fonts, key: CoordLayerKey, coord: crate::app::CoordGuide) -> Option<Pixmap> {
     let sc = app.scale as f32;
     let pw = ((app.screen_w as f32) * sc).round().max(1.0) as u32;
     let ph = ((app.screen_h as f32) * sc).round().max(1.0) as u32;
     let mut pm = Pixmap::new(pw, ph)?;
     pm.fill(app.whiteboard_bg_color());
     let mut ctx = Ctx { palette: key.palette, pm: &mut pm, tr: Transform::from_scale(sc, sc) };
-    draw_coord_guide(fonts, &mut ctx, &key.coord, 0, 0, app.screen_w, app.screen_h);
+    if let Some(bounds) = coord_bounds(&coord, 0, 0, app.screen_w, app.screen_h) {
+        draw_coord_grid(fonts, &mut ctx, &coord, bounds, key.show_labels);
+    }
     Some(pm)
 }
 
@@ -1427,14 +1441,15 @@ pub fn render_region(
         return Some(pm);
     }
 
-    // 背景
+    // 背景 + 网格缓存；圆锥曲线每帧实时绘制，便于编辑时只更新曲线。
     if app.whiteboard {
         let mut cached = false;
-        if let Some(coord) = app.coord.filter(|coord| !coord.editing) {
+        if let Some(coord) = app.coord {
             let key = coord_layer_key(app, coord);
             let mut cache = app.coord_layer.borrow_mut();
             if cache.as_ref().is_none_or(|layer| layer.key != key) {
-                *cache = build_coord_layer(app, fonts, key).map(|pixmap| CoordLayer { key, pixmap });
+                *cache = build_coord_layer(app, fonts, key, coord)
+                    .map(|pixmap| CoordLayer { key, pixmap });
             }
             if let Some(layer) = cache.as_ref() {
                 let dx = -((x as f32) * sc).round() as i32;
@@ -1444,11 +1459,11 @@ pub fn render_region(
                 cached = true;
             }
         }
-        if !cached {
-            pm.fill(app.whiteboard_bg_color());
-            if let Some(coord) = &app.coord {
+        if !cached { pm.fill(app.whiteboard_bg_color()); }
+        if let Some(coord) = &app.coord {
+            if let Some(bounds) = coord_bounds(coord, x, y, x2, y2) {
                 let mut ctx = Ctx { palette, pm: &mut pm, tr };
-                draw_coord_guide(fonts, &mut ctx, coord, x, y, x2, y2);
+                draw_coord_curve(&mut ctx, coord, bounds);
             }
         }
     }
@@ -2032,22 +2047,28 @@ fn wb_label(ctx: &mut Ctx, fonts: &Fonts, r: R, text: &str, px: f32, color: Colo
     ctx.text_center(fonts, r, text, fit, color);
 }
 
-fn draw_coord_guide(fonts: &Fonts, ctx: &mut Ctx, coord: &crate::app::CoordGuide,
-    x: i32, y: i32, x2: i32, y2: i32) {
-    let palette = ctx.palette;
+fn coord_bounds(coord: &crate::app::CoordGuide,
+    x: i32, y: i32, x2: i32, y2: i32) -> Option<(f32, f32, f32, f32)> {
     let (mut u0, mut u1, mut v0, mut v1) = crate::conic::visible_bounds(coord,
         x as f32, y as f32, x2 as f32, y2 as f32);
     if coord.conic == crate::app::ConicKind::None {
-        // A plain coordinate guide is a finite sheet; the size slider sets its extent.
         let extent = 20.0 * crate::conic::size_scale(coord.size);
         u0 = u0.max(-extent); u1 = u1.min(extent);
         v0 = v0.max(-extent); v1 = v1.min(extent);
-        if u0 >= u1 || v0 >= v1 { return; }
+        if u0 >= u1 || v0 >= v1 { return None; }
     }
+    Some((u0, u1, v0, v1))
+}
+
+fn draw_coord_grid(fonts: &Fonts, ctx: &mut Ctx, coord: &crate::app::CoordGuide,
+    bounds: (f32, f32, f32, f32), show_labels: bool) {
+    let (u0, u1, v0, v1) = bounds;
+    let palette = ctx.palette;
     let mut step = if coord.scale >= 28.0 { 1.0 }
         else if coord.scale >= 14.0 { 2.0 }
         else if coord.scale >= 7.0 { 5.0 } else { 10.0 };
-    while (u1 - u0) / step > 110.0 || (v1 - v0) / step > 110.0 { step *= 2.0; }
+    let max_lines = if show_labels { 110.0 } else { 80.0 };
+    while (u1 - u0) / step > max_lines || (v1 - v0) / step > max_lines { step *= 2.0; }
     let grid = alpha(palette.muted, 70);
     let axis = alpha(palette.text, 190);
     let mut u = (u0 / step).floor() * step;
@@ -2066,9 +2087,7 @@ fn draw_coord_guide(fonts: &Fonts, ctx: &mut Ctx, coord: &crate::app::CoordGuide
         ctx.stroke_line(p0, p1, ink, width);
         v += step;
     }
-    // Tick labels along the axes (upright, not rotated with the grid).
-    // Label every few grid lines: drawing a glyph for every line dominates
-    // software-rendering cost on 4K screens without adding teaching value.
+    if !show_labels { return; }
     let label_step = {
         let count = ((u1 - u0) / step).max(1.0);
         step * (count / 10.0).ceil().max(1.0)
@@ -2077,9 +2096,7 @@ fn draw_coord_guide(fonts: &Fonts, ctx: &mut Ctx, coord: &crate::app::CoordGuide
     while u <= u1 {
         if u.abs() > 1e-4 {
             let p = crate::conic::to_screen(coord, u, 0.0);
-            if p.0 >= x as f32 && p.0 <= x2 as f32 && p.1 >= y as f32 && p.1 <= y2 as f32 {
-                ctx.text(fonts, &format!("{u:.0}"), p.0 + 3.0, p.1 - 4.0, 11.0, c(palette.muted));
-            }
+            ctx.text(fonts, &format!("{u:.0}"), p.0 + 3.0, p.1 - 4.0, 11.0, c(palette.muted));
         }
         u += label_step;
     }
@@ -2091,19 +2108,22 @@ fn draw_coord_guide(fonts: &Fonts, ctx: &mut Ctx, coord: &crate::app::CoordGuide
     while v <= v1 {
         if v.abs() > 1e-4 {
             let p = crate::conic::to_screen(coord, 0.0, v);
-            if p.0 >= x as f32 && p.0 <= x2 as f32 && p.1 >= y as f32 && p.1 <= y2 as f32 {
-                ctx.text(fonts, &format!("{v:.0}"), p.0 + 4.0, p.1 + 4.0, 11.0, c(palette.muted));
-            }
+            ctx.text(fonts, &format!("{v:.0}"), p.0 + 4.0, p.1 + 4.0, 11.0, c(palette.muted));
         }
         v += label_step;
     }
-    if coord.conic != crate::app::ConicKind::None {
-        for branch in crate::conic::branches(coord, u0, u1, v0, v1) {
-            let points: Vec<(f32, f32)> = branch.iter()
-                .map(|&(u, v)| crate::conic::to_screen(coord, u, v)).collect();
-            ctx.stroke_polyline(&points, c(palette.accent), 2.0,
-                coord.conic == crate::app::ConicKind::Ellipse);
-        }
+}
+
+fn draw_coord_curve(ctx: &mut Ctx, coord: &crate::app::CoordGuide,
+    bounds: (f32, f32, f32, f32)) {
+    let (u0, u1, v0, v1) = bounds;
+    if coord.conic == crate::app::ConicKind::None { return; }
+    let palette = ctx.palette;
+    for branch in crate::conic::branches(coord, u0, u1, v0, v1) {
+        let points: Vec<(f32, f32)> = branch.iter()
+            .map(|&(u, v)| crate::conic::to_screen(coord, u, v)).collect();
+        ctx.stroke_polyline(&points, c(palette.accent), 2.0,
+            coord.conic == crate::app::ConicKind::Ellipse);
     }
 }
 
@@ -2497,6 +2517,20 @@ mod whiteboard_guide_tests {
     }
 
     #[test]
+    fn x11_settings_keep_the_large_tabbed_window() {
+        let fonts = Fonts::load();
+        let mut app = App::new(Pixmap::new(1280, 900).unwrap(), 1280, 900);
+        app.settings_open = true;
+        let p = settings_rect(&app);
+        assert_eq!((p.w, p.h), (860, 620));
+        assert!(render_region(&app, &fonts, None, p.x, p.y, p.w, p.h).is_some());
+        for (_, r) in settings_controls(&app) {
+            assert!(r.x >= p.x && r.y >= p.y && r.x + r.w <= p.x + p.w && r.y + r.h <= p.y + p.h,
+                "control {r:?} escapes settings {p:?}");
+        }
+    }
+
+    #[test]
     fn static_guide_reuses_the_cached_layer() {
         let fonts = Fonts::load();
         let mut app = App::new(Pixmap::new(640, 360).unwrap(), 640, 360);
@@ -2508,9 +2542,12 @@ mod whiteboard_guide_tests {
         assert!(app.coord_layer.borrow().is_some(), "static guide must be cached");
         let second = render_region(&app, &fonts, None, 0, 0, 640, 360).unwrap();
         assert_eq!(first.data(), second.data(), "cache must reproduce the same pixels");
+        let before = app.coord_layer.borrow().as_ref().unwrap().key;
         app.coord.as_mut().unwrap().shape = 0.9;
         let changed = render_region(&app, &fonts, None, 0, 0, 640, 360).unwrap();
-        assert_ne!(second.data(), changed.data(), "guide edits must invalidate the cache");
+        assert_ne!(second.data(), changed.data(), "the live conic must repaint");
+        let after = app.coord_layer.borrow().as_ref().unwrap().key;
+        assert_eq!(before, after, "shape edits must reuse the grid cache");
     }
 
     #[test]

@@ -466,11 +466,9 @@ fn selection_lasso_moves_whiteboard_ink_and_can_commit() {
     on_release(&rt, &mut app, &mut ip, None, select.x + 4, select.y + 4, 1);
     assert!(app.select_mode);
     on_press(&rt, &mut app, &mut ip, None, 80, 80, 1);
-    on_motion(&rt, &mut app, &mut ip, 120, 80);
     on_motion(&rt, &mut app, &mut ip, 120, 120);
-    on_motion(&rt, &mut app, &mut ip, 80, 120);
-    on_release(&rt, &mut app, &mut ip, None, 80, 80, 1);
-    assert!(app.floating.is_some(), "lasso must lift the selected ink");
+    on_release(&rt, &mut app, &mut ip, None, 120, 120, 1);
+    assert!(app.floating.is_some(), "marquee must lift the selected ink");
     assert_eq!(app.canvas.data()[(100 * 640 + 100) * 4 + 3], 0);
     on_press(&rt, &mut app, &mut ip, None, 100, 100, 1);
     on_motion(&rt, &mut app, &mut ip, 130, 110);
@@ -523,11 +521,9 @@ fn whiteboard_selection_works_through_the_touch_path() {
     handle_touch(&rt, &mut app, &mut ip, None, 7, select.x + 5, select.y + 5, TouchKind::End, 0.0);
     assert!(app.select_mode);
     handle_touch(&rt, &mut app, &mut ip, None, 8, 80, 80, TouchKind::Begin, 1.0);
-    handle_touch(&rt, &mut app, &mut ip, None, 8, 120, 80, TouchKind::Update, 1.0);
     handle_touch(&rt, &mut app, &mut ip, None, 8, 120, 120, TouchKind::Update, 1.0);
-    handle_touch(&rt, &mut app, &mut ip, None, 8, 80, 120, TouchKind::Update, 1.0);
-    handle_touch(&rt, &mut app, &mut ip, None, 8, 80, 80, TouchKind::End, 0.0);
-    assert!(app.floating.is_some(), "the touch lasso must lift ink");
+    handle_touch(&rt, &mut app, &mut ip, None, 8, 120, 120, TouchKind::End, 0.0);
+    assert!(app.floating.is_some(), "the touch marquee must lift ink");
     assert_eq!(app.canvas.data()[(100 * 640 + 100) * 4 + 3], 0);
 }
 

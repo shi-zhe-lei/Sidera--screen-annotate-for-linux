@@ -233,10 +233,17 @@ impl Fonts {
         // Snap glyph origins to whole device pixels. This also helps at
         // fractional desktop scales (125%/150%), where unsnapped origins make
         // small CJK text look soft even though the outlines are correct.
-        let snap = snap_enabled
-            && transform.kx.abs() < 0.01 && transform.ky.abs() < 0.01
+        let uniform = transform.kx.abs() < 0.01 && transform.ky.abs() < 0.01
             && (transform.sx - transform.sy).abs() < 0.01
             && transform.sx != 0.0;
+        let snap = snap_enabled && uniform;
+        // Rasterize glyphs at a whole physical-pixel size too. A 13px logical
+        // font at 125% is 16.25 device pixels; rounding the outline size down
+        // to 16 removes the extra soft edge without changing the layout box.
+        let mut px = px;
+        if uniform && transform.sx > 0.0 {
+            px = ((px * transform.sx).round().max(1.0)) / transform.sx;
+        }
         let mut caret = x;
         for ch in s.chars() {
             let Some(f) = self.pick(ch) else {

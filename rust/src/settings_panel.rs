@@ -131,7 +131,7 @@ pub fn wrapped(fonts:&Fonts,value:&str,px:f32,width:i32)->Vec<String> {
 pub fn button(ctx:&mut Ctx,fonts:&Fonts,r:R,label:&str,primary:bool) {
     let p=ctx.palette;let visual=R {y:r.y+(r.h-r.h.min(32))/2,h:r.h.min(32),..r};
     ui::surface(ctx,visual,6.0,c(if primary {p.accent}else{p.paper}),c(if primary {p.accent}else{p.border}));
-    ctx.text_center(fonts,visual,&fitted(fonts,label,14.0,r.w-10),14.0,c(if primary {p.on_accent}else{p.text}));
+    ctx.text_center(fonts,visual,&fitted(fonts,label,15.0,r.w-10),15.0,c(if primary {p.on_accent}else{p.text}));
 }
 pub fn toggle(ctx:&mut Ctx,app:&App,r:R,control:ui::Control,on:bool) {
     let p=ctx.palette;let t=app.settings_ui.toggle_value(control,on);
@@ -141,8 +141,8 @@ pub fn toggle(ctx:&mut Ctx,app:&App,r:R,control:ui::Control,on:bool) {
 }
 fn card(ctx:&mut Ctx,fonts:&Fonts,r:R,title:&str,detail:&str,trailing:i32) {
     let p=ctx.palette;let x=r.x+14;let w=r.w-28-trailing;
-    if detail.is_empty() || r.h<46 {text(ctx,fonts,title,R {x,w,..r},15.0,p.text);}
-    else {text(ctx,fonts,title,R {x,y:r.y+(r.h-42)/2,w,h:23},15.0,p.text);text(ctx,fonts,detail,R {x,y:r.y+(r.h-42)/2+23,w,h:19},12.0,p.muted);}
+    if detail.is_empty() || r.h<46 {text(ctx,fonts,title,R {x,w,..r},17.0,p.text);}
+    else {text(ctx,fonts,title,R {x,y:r.y+(r.h-42)/2,w,h:23},17.0,p.text);text(ctx,fonts,detail,R {x,y:r.y+(r.h-42)/2+23,w,h:19},13.0,p.muted);}
 }
 fn wps_exit_notice(ctx:&mut Ctx,fonts:&Fonts,r:R) {
     let p=ctx.palette;
@@ -151,11 +151,11 @@ fn wps_exit_notice(ctx:&mut Ctx,fonts:&Fonts,r:R) {
     let top=if compact {(r.h-22)/2}else{10};
     icons::draw(ctx,Glyph::Exit,(r.x+14) as f32,(r.y+top+2) as f32,18.0,c(p.warning),c(p.warning));
     let title=R {x:r.x+44,y:r.y+top,w:r.w-58,h:22};
-    text(ctx,fonts,"操作前请退出 WPS",title,15.0,p.text);
+    text(ctx,fonts,"操作前请退出 WPS",title,16.0,p.text);
     if !compact {
-        let lines=wrapped(fonts,"请先保存课件并完全退出 WPS；修改完成后重新打开。",12.0,title.w);
+        let lines=wrapped(fonts,"请先保存课件并完全退出 WPS；修改完成后重新打开。",13.0,title.w);
         for (i,line) in lines.iter().take(((r.h-40)/16).max(0) as usize).enumerate() {
-            text(ctx,fonts,line,R {y:r.y+34+i as i32*16,h:16,..title},12.0,p.text);
+            text(ctx,fonts,line,R {y:r.y+34+i as i32*16,h:16,..title},13.0,p.text);
         }
     }
 }
@@ -167,14 +167,14 @@ fn contributors(ctx:&mut Ctx,fonts:&Fonts,r:R) {
         let left=inner.x+inner.w*index as i32/3;
         let right=inner.x+inner.w*(index as i32+1)/3;
         let width=(right-left-12).max(1);
-        let lines=wrapped(fonts,role,12.0,width);
+        let lines=wrapped(fonts,role,13.0,width);
         let top=r.y+(r.h-22-16*lines.len().min(2) as i32)/2;
         if index>0 {
             ctx.stroke_line((left as f32,(r.y+12) as f32),(left as f32,(r.y+r.h-12) as f32),alpha(palette.border,105),1.0);
         }
-        ctx.text_center(fonts,R {x:left+6,y:top,w:width,h:22},&fitted(fonts,name,15.0,width),15.0,c(palette.text));
+        ctx.text_center(fonts,R {x:left+6,y:top,w:width,h:22},&fitted(fonts,name,16.0,width),16.0,c(palette.text));
         for (line,label) in lines.iter().take(2).enumerate() {
-            ctx.text_center(fonts,R {x:left+6,y:top+22+line as i32*16,w:width,h:16},label,12.0,c(palette.muted));
+            ctx.text_center(fonts,R {x:left+6,y:top+22+line as i32*16,w:width,h:16},label,13.0,c(palette.muted));
         }
     }
 }
@@ -211,9 +211,9 @@ fn draw_content(app:&App,fonts:&Fonts,ctx:&mut Ctx,icon:Option<&Pixmap>) {
         text(ctx,fonts,"Sidera",R {x:p.x+58,y:p.y+21,w:94,h:24},17.0,palette.text);
         text(ctx,fonts,"偏好设置",R {x:p.x+58,y:p.y+45,w:94,h:18},11.0,palette.muted);
         text(ctx,fonts,crate::app::VERSION,R {x:p.x+20,y:p.y+p.h-40,w:132,h:20},10.0,palette.muted);
-        text(ctx,fonts,app.settings_ui.tab.label(),R {x:body.x,y:p.y+25,w:body.w,h:30},23.0,palette.text);
-        text(ctx,fonts,app.settings_ui.tab.subtitle(),R {x:body.x,y:p.y+58,w:body.w,h:20},12.0,palette.muted);
-    } else {text(ctx,fonts,"设置",R {x:p.x+18,y:p.y+10,w:p.w-174,h:28},20.0,palette.text);}
+        text(ctx,fonts,app.settings_ui.tab.label(),R {x:body.x,y:p.y+25,w:body.w,h:30},26.0,palette.text);
+        text(ctx,fonts,app.settings_ui.tab.subtitle(),R {x:body.x,y:p.y+58,w:body.w,h:20},14.0,palette.muted);
+    } else {text(ctx,fonts,"设置",R {x:p.x+18,y:p.y+10,w:p.w-174,h:28},22.0,palette.text);}
     let a=tab_rect(app,0);let b=tab_rect(app,1);let pos=app.settings_ui.nav_position();
     let active=R {x:a.x+((b.x-a.x) as f32*pos).round() as i32,y:a.y+((b.y-a.y) as f32*pos).round() as i32,..a};
     ctx.fill_round(active,6.0,c(theme::mix(palette.paper,palette.accent_light,0.62)));
@@ -222,8 +222,8 @@ fn draw_content(app:&App,fonts:&Fonts,ctx:&mut Ctx,icon:Option<&Pixmap>) {
         if wide {
             let glyph=match tab {Tab::Appearance=>Glyph::Pen,Tab::General=>Glyph::Settings,Tab::Addins=>Glyph::Document,Tab::About=>Glyph::Info};
             icons::draw(ctx,glyph,(r.x+12) as f32,(r.y+11) as f32,16.0,c(palette.muted),c(palette.muted));
-            text(ctx,fonts,tab.label(),R {x:r.x+40,w:r.w-48,..r},14.0,palette.text);
-        } else {ctx.text_center(fonts,r,tab.label(),13.0,c(palette.text));}
+            text(ctx,fonts,tab.label(),R {x:r.x+40,w:r.w-48,..r},15.0,palette.text);
+        } else {ctx.text_center(fonts,r,tab.label(),14.0,c(palette.text));}
     }
     let visible=(count(app.settings_ui.tab)-l.page*l.rows).min(l.rows);
     let group=R {h:visible as i32*l.stride,..rows_rect(app)};
@@ -259,19 +259,19 @@ fn draw_content(app:&App,fonts:&Fonts,ctx:&mut Ctx,icon:Option<&Pixmap>) {
             let detail=match s.id {SliderId::AutoExpand=>"收起后等待 1–20 分钟，默认 2 分钟".into(),SliderId::Position=>"从顶部到下方 · 也可拖动工具栏".into(),_=>format!("{}–{} {}",spec.min,spec.max,spec.unit)};
             let index=match s.id {SliderId::Alpha=>2,SliderId::Scale=>3,SliderId::Position=>4,SliderId::StartupDelay=>1,SliderId::AutoExpand=>2,SliderId::Threshold=>3,SliderId::EraseScale=>4};
             let r=row(app,index).unwrap();
-            if compact {text(ctx,fonts,s.label,R {x:r.x+12,y:r.y,w:r.w-24,h:22},13.0,palette.text);}else{card(ctx,fonts,r,s.label,&detail,286);}
+            if compact {text(ctx,fonts,s.label,R {x:r.x+12,y:r.y,w:r.w-24,h:22},15.0,palette.text);}else{card(ctx,fonts,r,s.label,&detail,286);}
             ctx.fill_round(s.track,1.5,c(palette.border));let x=s.track.x+(s.track.w as f32*s.t()).round() as i32;
             ctx.fill_round(R {w:(x-s.track.x).max(1),..s.track},1.5,c(palette.accent));
             let cy=(s.track.y+1) as f32;
             if app.press.is_some_and(|p|p.active&&p.control==ui::Control::Slider(s.id)){ctx.fill_circle(x as f32,cy,12.0,alpha(palette.accent,24));}
             ctx.fill_circle(x as f32,cy,6.0,c(palette.paper));ctx.stroke_round(R {x:x-6,y:cy as i32-6,w:12,h:12},6.0,c(palette.accent),1.5);
-            value_input::draw_value(app,fonts,ctx,Target::Setting(s.id),s.badge,13.0,"",spec.unit);
+            value_input::draw_value(app,fonts,ctx,Target::Setting(s.id),s.badge,15.0,"",spec.unit);
         }
         for (hit,r) in controls(app) {match hit {
             SetHit::Theme(preference)=>{
                 let selected=preference==app.theme.preference;let r=R {y:r.y+5,h:r.h-10,..r};
                 ui::surface(ctx,r,5.0,c(if selected {palette.accent_light}else{palette.surface}),c(if selected {palette.accent_line}else{palette.border}));
-                ctx.text_center(fonts,r,preference.label(),13.0,c(palette.text));
+                ctx.text_center(fonts,r,preference.label(),14.0,c(palette.text));
             }
             SetHit::ResetSlider(_)=>{icons::draw(ctx,Glyph::Reset,(r.x+(r.w-16)/2) as f32,(r.y+(r.h-16)/2) as f32,16.0,c(palette.muted),c(palette.muted));}
             SetHit::Logs=>card(ctx,fonts,r,"运行日志  ›","查看与清理记录",0),
@@ -286,7 +286,7 @@ fn draw_content(app:&App,fonts:&Fonts,ctx:&mut Ctx,icon:Option<&Pixmap>) {
             let visual=R {y:r.y+(r.h-32)/2,h:32,..r};
             ui::surface(ctx,visual,6.0,c(palette.danger_light),alpha(palette.danger,90));
             icons::draw(ctx,Glyph::Exit,(r.x+10) as f32,(r.y+(r.h-18)/2) as f32,18.0,c(palette.danger),c(palette.danger));
-            text(ctx,fonts,"退出 Sidera",R {x:r.x+36,w:r.w-42,..r},14.0,palette.danger);
+            text(ctx,fonts,"退出 Sidera",R {x:r.x+36,w:r.w-42,..r},15.0,palette.danger);
         }
         SetHit::Done=>button(ctx,fonts,r,"完成",true),
         SetHit::SettingsPage(delta)=>{ctx.text_center(fonts,r,if delta<0 {"‹"}else{"›"},20.0,c(if ui::control_enabled(app,ui::Control::Setting(hit)){palette.text}else{palette.disabled_ink}));}
@@ -299,7 +299,7 @@ fn draw_content(app:&App,fonts:&Fonts,ctx:&mut Ctx,icon:Option<&Pixmap>) {
         else if app.settings_ui.tab==Tab::Addins {"登记变更后需重新打开 WPS".into()}
         else{"更改即时生效 · 点击数值可输入".into()};
     let dx=if l.pages>1{90}else{0};
-    text(ctx,fonts,&caption,R {x:body.x+dx,y:p.y+p.h-50,w:(body.w-96-dx).max(1),h:36},11.0,
+    text(ctx,fonts,&caption,R {x:body.x+dx,y:p.y+p.h-50,w:(body.w-96-dx).max(1),h:36},12.0,
         if editing.is_some_and(|e|!e.error.is_empty()){palette.danger}else{palette.muted});
 }
 

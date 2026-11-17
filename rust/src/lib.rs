@@ -141,6 +141,15 @@ fn expand_rect(r: R, n: i32) -> R {
     R { x: r.x - n, y: r.y - n, w: r.w + n * 2, h: r.h + n * 2 }
 }
 
+fn marquee_points(start: (f32, f32), end: (f32, f32)) -> Vec<(f32, f32)> {
+    vec![
+        (start.0, start.1),
+        (end.0, start.1),
+        (end.0, end.1),
+        (start.0, end.1),
+    ]
+}
+
 fn lasso_rect(points: &[(f32, f32)]) -> Option<R> {
     let &(first_x, first_y) = points.first()?;
     let (mut x0, mut y0, mut x1, mut y1) = (first_x, first_y, first_x, first_y);
@@ -180,7 +189,8 @@ pub struct Ip {
     pub wb_handle: Option<WbHandle>,
     pub wb_last: (i32, i32),
     pub wb_lasso: bool,
-    /// Displayed lasso/floating dirty bounds, for partial redraws.
+    pub wb_sel_start: Option<(f32, f32)>,
+    /// Displayed selection/floating dirty bounds, for partial redraws.
     pub wb_lasso_rect: Option<R>,
     pub wb_sel_rect: Option<R>,
     pub wb_sel_drag: Option<(f32, f32)>,
@@ -221,6 +231,7 @@ impl Default for Ip {
             wb_handle: None,
             wb_last: (0, 0),
             wb_lasso: false,
+            wb_sel_start: None,
             wb_lasso_rect: None,
             wb_sel_rect: None,
             wb_sel_drag: None,
@@ -1585,6 +1596,7 @@ fn handle_whiteboard_press(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32, 
     }
     if app.select_mode && button == 3 {
         app.lasso.clear();
+        ip.wb_sel_start = None;
         app.select_mode = false;
         let dirty = union_rect(ip.wb_lasso_rect.take(),
             Some(ui::whiteboard_bar_rect(app)));
@@ -1641,8 +1653,9 @@ fn handle_whiteboard_press(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32, 
         return false;
     }
     if app.select_mode && button == 1 && !ui::whiteboard_ui_contains(app, x, y) {
-        app.lasso.clear();
-        app.lasso.push((x as f32, y as f32));
+        let start = (x as f32, y as f32);
+        app.lasso = marquee_points(start, start);
+        ip.wb_sel_start = Some(start);
         ip.wb_lasso = true;
         ip.wb_lasso_rect = lasso_rect(&app.lasso);
         if let Some(r) = ip.wb_lasso_rect { rt.redraw(app, r); }
@@ -2056,9 +2069,9 @@ pub fn on_motion(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
                 WbSlider::Size => apply_wb_size(app, x),
                 WbSlider::Shape => apply_wb_shape(app, x),
             }
-            // Full grid repaint is the expensive part; cap it to ~60 fps.
+            // Editing still redraws a full frame; cap it to ~50 fps on low-end CPUs.
             let now = now_ms();
-            if now - ip.wb_redraw_at >= 16 {
+            if now - ip.wb_redraw_at >= 20 {
                 ip.wb_redraw_at = now;
                 rt.redraw_full(app);
             }
@@ -2079,18 +2092,15 @@ pub fn on_motion(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
             }
             ip.wb_last = (x, y);
             let now = now_ms();
-            if now - ip.wb_redraw_at >= 16 {
+            if now - ip.wb_redraw_at >= 20 {
                 ip.wb_redraw_at = now;
                 rt.redraw_full(app);
             }
             return;
         }
         if ip.wb_lasso {
-            if let Some(&(lx, ly)) = app.lasso.last() {
-                let (dx, dy) = (x as f32 - lx, y as f32 - ly);
-                if dx * dx + dy * dy >= 9.0 && app.lasso.len() < 4096 {
-                    app.lasso.push((x as f32, y as f32));
-                }
+            if let Some(start) = ip.wb_sel_start {
+                app.lasso = marquee_points(start, (x as f32, y as f32));
             }
             let new = lasso_rect(&app.lasso);
             let dirty = union_rect(ip.wb_lasso_rect, new);
@@ -2310,11 +2320,8 @@ pub fn on_release(rt: &Rt, app: &mut App, ip: &mut Ip, wps: Option<&WpsBridge>, 
     if app.whiteboard {
         if ip.wb_lasso {
             ip.wb_lasso = false;
-            if let Some(&(lx, ly)) = app.lasso.last() {
-                let (dx, dy) = (x as f32 - lx, y as f32 - ly);
-                if dx * dx + dy * dy >= 4.0 {
-                    app.lasso.push((x as f32, y as f32));
-                }
+            if let Some(start) = ip.wb_sel_start.take() {
+                app.lasso = marquee_points(start, (x as f32, y as f32));
             }
             let lasso = app.lasso.clone();
             let final_rect = lasso_rect(&lasso);
