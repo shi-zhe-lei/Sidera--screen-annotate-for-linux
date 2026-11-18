@@ -75,8 +75,22 @@ pkg_parse_arch() {
 }
 
 # 找到容器构建出来的二进制（找不到则退回本机 release）
+#
+# 交叉编译（--target）时 cargo 把产物放在 <target-dir>/<triple>/release/，
+# 而不是 <target-dir>/release/。aarch64 必须先看 triple 目录，否则会误用
+# 早期 qemu 构建残留下来的旧二进制（产物日期看起来很新，内容却是旧的）。
 pkg_find_bin() {
-  local bin="$REPO/rust/target/container-$SRC_ARCH/release/sidera"
-  [ -f "$bin" ] || bin="$REPO/rust/target/release/sidera"
-  printf '%s' "$bin"
+  local triple
+  case "$SRC_ARCH" in
+    aarch64) triple=aarch64-unknown-linux-gnu;;
+    *)       triple=x86_64-unknown-linux-gnu;;
+  esac
+  local base="$REPO/rust/target/container-$SRC_ARCH"
+  local bin
+  for bin in "$base/$triple/release/sidera" "$base/release/sidera" "$REPO/rust/target/release/sidera"; do
+    if [ -f "$bin" ]; then
+      printf '%s' "$bin"
+      return 0
+    fi
+  done
 }

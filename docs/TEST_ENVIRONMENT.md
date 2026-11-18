@@ -110,9 +110,9 @@ make -C cpp -j4 WITH_WAYLAND=1
 
 ## 打包与构建输入
 
-`rust/build_deb.sh amd64|arm64` 优先取对应 `target/container-<arch>/release/sidera`（`build_aarch64.sh` 的交叉产物也在 `target/container-aarch64/`），再取 `target/release/sidera`。务必确认被选中的是本次构建，尤其使用独立 CARGO_TARGET_DIR 时需将待打包文件放到脚本约定目录。
+`rust/build_deb.sh amd64|arm64` 按 `target/container-<arch>/<triple>/release/sidera` → `target/container-<arch>/release/sidera` → `target/release/sidera` 的顺序取二进制。`build_aarch64.sh` 的交叉产物在 `target/container-aarch64/aarch64-unknown-linux-gnu/release/`，必须先查这一层；否则会命中早期构建残留的 `target/container-aarch64/release/sidera`，得到“日期新、内容旧”的包。务必确认被选中的是本次构建，尤其使用独立 CARGO_TARGET_DIR 时需将待打包文件放到脚本约定目录。
 
-三个 DEB 脚本均调用 `tools/deb_dependencies.py`，用 readelf 检查 ELF，再由 dpkg-shlibdeps 计算实际动态依赖，另加登记需要的 Python 3。需要匹配架构的 Debian/Ubuntu 库和 dpkg-dev；不能跨环境猜依赖。通过 `SIDERA_VERSION` 指定本地包版本，失败不得删除旧包，成功后原子替换输出。
+三个 DEB 脚本均调用 `tools/deb_dependencies.py`，用 readelf 检查 ELF，再由 dpkg-shlibdeps 计算实际动态依赖，另加登记需要的 Python 3。二进制无效时停止打包；主机缺少 dpkg 库清单（Arch/Fedora 等）时退回固定依赖并打印警告，不能当作已验证的依赖声明。通过 `SIDERA_VERSION` 指定本地包版本，失败不得删除旧包，成功后原子替换输出。
 
 ```sh
 cd rust

@@ -19,7 +19,13 @@
 #
 # 产物：
 #   target/container-aarch64/release/sidera
-#   ../sidera_3.2-Electro-stable_arm64.deb（打包时）
+#   <repo>/sidera_3.2-Electro-stable_arm64.deb
+#   rust/dist/sidera-3.2-Electro.stable.aarch64.rpm
+#   rust/dist/sidera-3.2_electro_stable-1-aarch64.pkg.tar.zst
+#
+# 注意：本脚本会先交叉编译再打包。只跑 build_deb.sh / build_rpm.sh /
+#       build_arch.sh 不会重新编译，只会把 target/container-aarch64 里的
+#       旧二进制重新封装，得到“新日期、旧内容”的包。
 # ============================================================
 set -e
 
@@ -82,15 +88,29 @@ echo "==> 编译 aarch64（amd64 容器交叉编译）..."
 
 # ---------- 打包（从容器编译好的二进制，主机打包）----------
 if [ "$NO_PKG" -eq 0 ]; then
+  DEB_FALLBACK_DEPENDS="libc6 (>= 2.30), libgcc-s1, python3"
   echo "==> 打包 arm64：DEB..."
+  # build_deb.sh 内部已能自动回退依赖；这里再显式重试一次，兼容旧版脚本。
   if ! ./build_deb.sh aarch64; then
-    echo "==> 自动依赖计算失败（可能不是 Debian/Ubuntu 主机），改用固定依赖重试 DEB..."
-    SIDERA_DEB_DEPENDS="libc6 (>= 2.30), libgcc-s1, python3" ./build_deb.sh aarch64
+    echo "==> DEB 打包失败，改用固定运行依赖重试..."
+    if ! SIDERA_DEB_DEPENDS="$DEB_FALLBACK_DEPENDS" ./build_deb.sh aarch64; then
+      echo "错误: DEB 打包失败，已中止。" >&2
+      echo "      不继续打包 RPM/Arch，避免留下“只有其他格式更新”的半新产物。" >&2
+      exit 1
+    fi
   fi
   echo "==> 打包 arm64：RPM..."
   ./build_rpm.sh aarch64
   echo "==> 打包 arm64：Arch..."
   ./build_arch.sh aarch64
+
+  echo ""
+  echo "========== 产物 =========="
+  for f in "../sidera_3.2-Electro-stable_arm64.deb" \
+           dist/sidera-3.2-Electro.stable.aarch64.rpm \
+           dist/sidera-3.2_electro_stable-1-aarch64.pkg.tar.zst; do
+    [ -f "$f" ] && ls -lh "$f"
+  done
 else
   echo "==> 已跳过打包（--no-pkg）"
 fi

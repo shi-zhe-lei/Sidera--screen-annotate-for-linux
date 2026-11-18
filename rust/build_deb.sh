@@ -4,7 +4,10 @@
 #   用法: ./build_deb.sh [amd64|aarch64]
 #   产物: <repo>/sidera_3.2-Electro-stable_<amd64|arm64>.deb
 #
-# 依赖：dpkg-dev、binutils、python3；必须能解析目标架构的系统库
+# 依赖：dpkg-dev（dpkg-deb）、binutils、python3
+#       默认用 dpkg-shlibdeps 从 ELF 推导运行依赖；主机缺少目标库清单时
+#       （如 Arch/Fedora）自动退回固定依赖并打印警告；
+#       也可用 SIDERA_DEB_DEPENDS 显式指定依赖。
 # 前置：先用 ./build_container.sh <arch> 编译出二进制
 #       （或普通 cargo build --release，用架构匹配的 target/release 兜底）
 #
@@ -31,8 +34,15 @@ VERSION="${SIDERA_VERSION:-3.2-Electro-stable}"
 dpkg --validate-version "$VERSION" || exit 1
 [[ "$VERSION" != */* && "$VERSION" != *[[:space:]]* ]] || exit 1
 
-# 优先容器构建产物，其次普通 release
-BIN="$HERE/target/container-$SRC_ARCH/release/sidera"
+# 优先容器构建产物，其次普通 release。
+# 交叉编译（--target）产物在 <target-dir>/<triple>/release/，必须先于
+# <target-dir>/release/ 查找，否则 aarch64 会误用早期构建残留的旧文件。
+case "$SRC_ARCH" in
+  aarch64) TRIPLE=aarch64-unknown-linux-gnu;;
+  *)       TRIPLE=x86_64-unknown-linux-gnu;;
+esac
+BIN="$HERE/target/container-$SRC_ARCH/$TRIPLE/release/sidera"
+[ -f "$BIN" ] || BIN="$HERE/target/container-$SRC_ARCH/release/sidera"
 [ -f "$BIN" ] || BIN="$HERE/target/release/sidera"
 if [ ! -f "$BIN" ]; then
   echo "错误: 找不到 $SRC_ARCH 二进制，请先运行: ./build_container.sh $ARG"
@@ -67,16 +77,45 @@ if ! LC_ALL=C awk -v expected="$ELF_MACHINE" '
   exit 1
 fi
 
+# 固定兜底依赖：仅在无法从 ELF 推导时使用（例如 Arch/Fedora 主机上“容器编译 + 主机打包”）。
+# 它未经实际二进制校验；正式发布仍应在目标架构的 Debian/Ubuntu 上重新打包复核。
+FALLBACK_DEPENDS="libc6 (>= 2.30), libgcc-s1, python3"
+
+DEPS_ERR=""
 if [ -n "${SIDERA_DEB_DEPENDS:-}" ]; then
   # 显式指定依赖（用于非 Debian/Ubuntu 主机做“容器编译 + 主机打包”）
   DEPENDS="$SIDERA_DEB_DEPENDS"
 else
-  # 严格模式：ELF 不合法 / 依赖无法确定时直接失败（不静默回退）
-  DEPENDS="$(python3 "$REPO/tools/deb_dependencies.py" "$BIN" "$DEB_ARCH")"
+  # 优先从 ELF 严格推导；只有“环境无法推导”才退回固定依赖，
+  # 二进制本身无效时仍然直接失败，绝不静默放行。
+  DEPS_ERR="$(mktemp "${TMPDIR:-/tmp}/sidera-deb-deps.XXXXXXXX")"
+  DEPS_STATUS=0
+  DEPENDS="$(python3 "$REPO/tools/deb_dependencies.py" "$BIN" "$DEB_ARCH" 2>"$DEPS_ERR")" \
+    || DEPS_STATUS=$?
+  if [ "$DEPS_STATUS" -eq 0 ] && [ -n "$DEPENDS" ]; then
+    rm -f -- "$DEPS_ERR"; DEPS_ERR=""
+  elif [ "$DEPS_STATUS" -eq 3 ]; then
+    # 退出码 3：二进制本身无效（架构不符、没有动态依赖等）。必须拒绝打包。
+    echo "错误: 二进制不能作为 $DEB_ARCH 包，停止打包：" >&2
+    sed 's/^/       /' "$DEPS_ERR" >&2
+    rm -f -- "$DEPS_ERR"; DEPS_ERR=""
+    exit 1
+  else
+    DEPENDS="$FALLBACK_DEPENDS"
+    {
+      echo ""
+      echo "警告: 无法从 ELF 推导运行依赖（通常是 Arch/Fedora 等非 Debian 主机）。"
+      echo "      改用固定依赖: $DEPENDS"
+      echo "      该依赖未经实际二进制校验；正式发布请在目标架构的 Debian/Ubuntu 上重新打包。"
+      sed 's/^/      | /' "$DEPS_ERR"
+      echo ""
+    } >&2
+    rm -f -- "$DEPS_ERR"; DEPS_ERR=""
+  fi
 fi
 OUTPUT="$REPO/${PKG_NAME}_${VERSION}_${DEB_ARCH}.deb"
 PKG_DIR="$(mktemp -d "$REPO/.sidera-package.XXXXXXXX")"
-trap 'rm -rf -- "$PKG_DIR"; rm -f -- "$PKG_DIR.deb"' EXIT
+trap 'rm -rf -- "$PKG_DIR"; rm -f -- "$PKG_DIR.deb"; [ -z "${DEPS_ERR:-}" ] || rm -f -- "$DEPS_ERR"' EXIT
 echo "==> 打包 $BIN -> $OUTPUT"
 
 mkdir -p "$PKG_DIR/DEBIAN" \

@@ -2,6 +2,13 @@
 
 记录本仓库 `custom` 分支的用户可见变化。上游发行版请查看[原项目](https://github.com/offduckling4825/Sidera--screen-annotate-for-linux/releases)。
 
+## 未发布 · 打包脚本修复（2026-11-18）
+
+- 修复 aarch64 包一直是旧二进制的问题：交叉编译产物实际在 `target/container-aarch64/aarch64-unknown-linux-gnu/release/`，打包脚本却读取 `target/container-aarch64/release/` 里早期构建的残留文件，于是 rpm/Arch/DEB 日期是新的、内容是旧的。现在按 triple 子目录优先查找，`build_container.sh` 也会校验产物存在。
+- `build_deb.sh` 在主机缺少 dpkg 库清单（Arch/Fedora 等）时自动退回固定依赖并打印警告，不再直接失败而留下旧包；二进制本身无效（架构不符、没有动态依赖）仍照旧拒绝打包。
+- `build_amd64.sh` / `build_aarch64.sh` 在 DEB 失败时立即中止，不再继续打包 RPM/Arch，避免出现只有部分格式更新的产物；结束时列出全部产物路径。
+- 同步更正 `CONTRIBUTING.md`、`docs/TEST_ENVIRONMENT.md` 中关于产物路径与依赖推导的说明。
+
 ## 3.2-Electro-stable 图形编辑与课堂修复（2026-11-13）
 
 - 白板坐标系/圆锥曲线改为每页独立保存：翻页切换显示，退出白板清除；“清空当前页”只清用户笔迹，不删除图形。

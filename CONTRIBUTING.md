@@ -49,9 +49,9 @@ cargo check --tests --examples --locked
 
 ### 打包与系统兼容性
 
-`rust/build_deb.sh amd64` 或 `arm64` 会先检查 ELF 架构，并优先选择 `target/container-<arch>/release/sidera`，再回退到 `target/release/sidera`。打包前核对实际被选中的文件，避免取到旧二进制。
+`rust/build_deb.sh amd64` 或 `arm64` 会先检查 ELF 架构，并按 `target/container-<arch>/<triple>/release/sidera` → `target/container-<arch>/release/sidera` → `target/release/sidera` 的顺序选择二进制。交叉编译产物位于 triple 子目录（如 `container-aarch64/aarch64-unknown-linux-gnu/release/`），漏掉这一层会误取早期构建残留的旧文件。打包前核对实际被选中的文件，避免取到旧二进制。
 
-当前三个打包入口由 `tools/deb_dependencies.py` 校验 ELF，并用 dpkg-shlibdeps 生成实际依赖；需要匹配架构的库和 dpkg-dev。依赖无法确定时停止，保留已有包。通过 `SIDERA_VERSION` 指定包版本；不能手工降低 libc 声明来伪装兼容。已发布 custom.29 的历史元数据与重建流程见[发布说明](docs/releases/2026-10-24-custom29.md)。
+当前三个打包入口由 `tools/deb_dependencies.py` 校验 ELF，并用 dpkg-shlibdeps 生成实际依赖。二进制本身无效（架构不符、没有动态依赖）时停止并保留已有包；主机缺少 dpkg 库清单（Arch/Fedora 等）时退回固定依赖并打印警告，该依赖未经实际二进制校验，正式发布仍应在目标架构的 Debian/Ubuntu 上重新打包。通过 `SIDERA_VERSION` 指定包版本；不能手工降低 libc 声明来伪装兼容。已发布 custom.29 的历史元数据与重建流程见[发布说明](docs/releases/2026-10-24-custom29.md)。
 
 容器脚本需要仓库外准备的 `amd64-sysroot/` 或 `aarch64-sysroot/`、匹配 Rust 工具链、bubblewrap；ARM64 还需要对应的 QEMU / binfmt 配置。这些材料不包含在 Git 仓库。更低系统库构建和 ARM64 均需独立验证后才能发布。
 

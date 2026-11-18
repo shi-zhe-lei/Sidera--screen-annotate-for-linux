@@ -159,14 +159,22 @@ bwrap \
   "${EXTRA_ENV[@]}" \
   "$CARGO" "${BUILD_ARGS[@]}"
 
-echo "==> 完成: $ROOT/target/$OUT/release/sidera"
-file "$ROOT/target/$OUT/release/sidera"
+# 交叉编译（--target）产物的实际位置：<target-dir>/<triple>/release/
+if [ -n "$TARGET" ]; then
+  OUT_BIN="$ROOT/target/$OUT/$TARGET/release/sidera"
+else
+  OUT_BIN="$ROOT/target/$OUT/release/sidera"
+fi
+[ -f "$OUT_BIN" ] || { echo "错误: 编译后找不到二进制 $OUT_BIN" >&2; exit 1; }
+
+echo "==> 完成: $OUT_BIN"
+file "$OUT_BIN"
 {
   printf 'toolchain=%s-%s\n' "$TOOLCHAIN" "$TRIPLE"
   printf 'target=%s\n' "${TARGET:-$TRIPLE}"
   printf 'source=%s\n' "$(git -C "$REPO" rev-parse HEAD)"
   git -C "$REPO" status --porcelain
-  sha256sum "$ROOT/Cargo.lock" "$ROOT/target/$OUT/release/sidera"
+  sha256sum "$ROOT/Cargo.lock" "$OUT_BIN"
   [ ! -f "$SYSROOT/var/lib/dpkg/status" ] || sha256sum "$SYSROOT/var/lib/dpkg/status"
   [ ! -f "$SYSROOT/etc/os-release" ] || cat "$SYSROOT/etc/os-release"
   if [ -n "$TARGET_SYSROOT" ]; then
@@ -179,6 +187,6 @@ file "$ROOT/target/$OUT/release/sidera"
 # 检查最高 glibc 依赖
 if command -v readelf >/dev/null; then
   echo -n "最高 GLIBC 依赖: "
-  readelf -V "$ROOT/target/$OUT/release/sidera" 2>/dev/null \
+  readelf -V "$OUT_BIN" 2>/dev/null \
     | grep -oE "GLIBC_[0-9.]+" | sort -uV | tail -1
 fi
