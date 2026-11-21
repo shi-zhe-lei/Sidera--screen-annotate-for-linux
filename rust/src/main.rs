@@ -684,8 +684,28 @@ fn run_application() -> Result<(), Box<dyn std::error::Error>> {
 }
 }
 
+/// 收紧 glibc 的内存归还策略。
+///
+/// 默认情况下每个线程各有一个 arena，释放掉的整屏 Pixmap 会留在原线程的
+/// arena 里不还给系统；反复翻页、开合白板之后 RSS 只涨不落。这里限制 arena
+/// 数量，并把"大块内存"和"堆顶回收"的阈值降下来，让大块内存用完立刻归还。
+/// 只影响 glibc；非 glibc 平台保持默认分配器。
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn tune_allocator() {
+    const KIB: libc::c_int = 1024;
+    unsafe {
+        // 9 个线程各开一个 arena 没有意义：并发分配远小于这个规模。
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 128 * KIB);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 128 * KIB);
+    }
+}
+
 #[cfg(unix)]
 fn main() -> std::process::ExitCode {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    tune_allocator();
+
     if std::env::args().any(|arg| arg == "--blocker") {
         return std::process::ExitCode::from(
             sidera_core::process_block::run_blocker() as u8,

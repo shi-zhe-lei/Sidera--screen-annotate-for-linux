@@ -1169,11 +1169,10 @@ fn handle_process_hit(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
     rt.redraw_full(app);
 }
 
-/// Real X11 keeps its overlay panel. Under XWayland an independent Wayland
-/// surface can follow the monitor scale even when the overlay is upscaled.
+/// Prefer the pixel-aligned overlay unless the user requests a native window.
 #[cfg(unix)]
-fn use_native_settings(native_x11: bool, force_overlay: bool, force_native: bool) -> bool {
-    force_native || (!force_overlay && !native_x11)
+fn use_native_settings(force_overlay: bool, force_native: bool) -> bool {
+    force_native && !force_overlay
 }
 
 pub fn open_settings(rt: &Rt, app: &mut App) {

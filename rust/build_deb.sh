@@ -2,7 +2,7 @@
 # ============================================================
 # Rust 版 Sidera DEB 打包脚本
 #   用法: ./build_deb.sh [amd64|aarch64]
-#   产物: <repo>/sidera_3.2-Electro-stable_<amd64|arm64>.deb
+#   产物: <repo>/sidera_3.2-Electro-stable~beta1_<amd64|arm64>.deb
 #
 # 依赖：dpkg-dev（dpkg-deb）、binutils、python3
 #       默认用 dpkg-shlibdeps 从 ELF 推导运行依赖；主机缺少目标库清单时
@@ -28,9 +28,10 @@ case "$ARG" in
 esac
 
 PKG_NAME="sidera"
-# 注意：dpkg 要求 Version 以数字开头，故采用 "3.2-Electro-stable"；
+# 注意：dpkg 要求 Version 以数字开头，故采用 "3.2-Electro-stable~beta1"；
+#       "~" 表示低于正式版，之后发 3.2-Electro-stable 会被视为升级。
 # 如需改版本只改这里即可。
-VERSION="${SIDERA_VERSION:-3.2-Electro-stable}"
+VERSION="${SIDERA_VERSION:-3.2-Electro-stable~beta1}"
 dpkg --validate-version "$VERSION" || exit 1
 [[ "$VERSION" != */* && "$VERSION" != *[[:space:]]* ]] || exit 1
 

@@ -3,11 +3,56 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use image::ImageEncoder;
 use tiny_skia::{IntSize, Pixmap};
 
+/// 进程级页缓存上限。以前是"每个实例 32 MiB"，而每个输出各有批注和白板
+/// 两份缓存，内存上限会随屏幕数量相乘；这里改成全进程共享一份预算。
+#[cfg(not(test))]
+const GLOBAL_BUDGET: usize = 64 * 1024 * 1024;
+static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// 单元测试各自构造私有缓存，关掉全局预算以免互相干扰。
+#[cfg(test)]
+fn global_budget() -> usize { usize::MAX }
+#[cfg(not(test))]
+fn global_budget() -> usize { GLOBAL_BUDGET }
+
+fn live_bytes() -> usize { LIVE_BYTES.load(Ordering::Relaxed) }
+
+/// 是否需要把页快照落盘：本实例超份额，或全进程超总预算。
+fn should_spill(local_bytes: usize, local_budget: usize, live: usize, limit: usize) -> bool {
+    local_bytes > local_budget || live > limit
+}
+
+fn account_add(bytes: usize) {
+    if bytes > 0 { LIVE_BYTES.fetch_add(bytes, Ordering::Relaxed); }
+}
+
+fn account_sub(bytes: usize) {
+    if bytes == 0 { return; }
+    let mut current = LIVE_BYTES.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_sub(bytes);
+        match LIVE_BYTES.compare_exchange_weak(
+            current, next, Ordering::Relaxed, Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 enum Snapshot { Png(Vec<u8>), Raw(Pixmap), File(PathBuf) }
+
+fn snapshot_len(snapshot: &Snapshot) -> usize {
+    match snapshot {
+        Snapshot::Png(data) => data.len(),
+        Snapshot::Raw(pixmap) => pixmap.data().len(),
+        Snapshot::File(_) => 0,
+    }
+}
 pub struct PageCache {
     pages: BTreeMap<i32, Snapshot>,
     directory: Option<PathBuf>,
@@ -21,10 +66,14 @@ impl PageCache {
     #[cfg(test)]
     pub fn is_empty(&self) -> bool { self.pages.is_empty() }
     pub fn remove(&mut self, page: &i32) {
-        if let Some(Snapshot::File(path)) = self.pages.remove(page) { let _ = fs::remove_file(path); }
+        if let Some(snapshot) = self.pages.remove(page) {
+            account_sub(snapshot_len(&snapshot));
+            if let Snapshot::File(path) = snapshot { let _ = fs::remove_file(path); }
+        }
     }
     pub fn clear(&mut self) {
         for snapshot in self.pages.values() {
+            account_sub(snapshot_len(snapshot));
             if let Snapshot::File(path) = snapshot { let _ = fs::remove_file(path); }
         }
         self.pages.clear();
@@ -48,22 +97,23 @@ impl PageCache {
             Ok(()) => Snapshot::Png(data),
             Err(error) => { log::warn!("笔迹压缩失败，保留原始快照：{error}"); Snapshot::Raw(pixmap) }
         };
+        let new_len = snapshot_len(&snapshot);
         self.remove(&page);
         self.pages.insert(page, snapshot);
-        let mut bytes: usize = self.pages.values().map(|s| match s {
-            Snapshot::Png(data) => data.len(), Snapshot::Raw(p) => p.data().len(), Snapshot::File(_) => 0,
-        }).sum();
-        if bytes <= self.budget { return; }
+        account_add(new_len);
+        let mut bytes: usize = self.pages.values().map(snapshot_len).sum();
+        if !should_spill(bytes, self.budget, live_bytes(), global_budget()) { return; }
         let directory = match self.directory() {
             Ok(path) => path,
             Err(error) => { log::warn!("临时缓存不可用，笔迹继续保留在内存：{error}"); return; }
         };
         for (key, snapshot) in self.pages.iter_mut() {
-            if bytes <= self.budget { break; }
+            if !should_spill(bytes, self.budget, live_bytes(), global_budget()) { break; }
             if let Snapshot::Png(data) = snapshot {
+                let len = data.len();
                 let path = directory.join(format!("{key}.png"));
                 match crate::persistence::atomic_write(&path, data) {
-                    Ok(()) => { bytes -= data.len(); *snapshot = Snapshot::File(path); }
+                    Ok(()) => { bytes -= len; account_sub(len); *snapshot = Snapshot::File(path); }
                     Err(error) => { log::warn!("写入缓存失败，笔迹继续保留在内存：{error}"); break; }
                 }
             }
@@ -134,5 +184,12 @@ mod tests {
         let mut pixmap = Pixmap::new(8, 8).unwrap(); pixmap.fill(tiny_skia::Color::WHITE);
         cache.insert(30, pixmap.clone());
         assert_eq!(cache.get(&30).unwrap().data(), pixmap.data());
+    }
+    #[test]
+    fn spill_decision_honours_local_and_global_budgets() {
+        // 双屏时总占用会超过单实例份额：只要全进程超预算就要落盘。
+        assert!(!should_spill(10, 100, 10, 100));
+        assert!(should_spill(101, 100, 10, 1_000));
+        assert!(should_spill(10, 100, 101, 100));
     }
 }

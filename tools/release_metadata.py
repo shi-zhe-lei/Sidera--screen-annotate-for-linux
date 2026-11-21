@@ -17,6 +17,15 @@ def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def highest_glibc(binary):
+    """二进制实际要求的最高 glibc 版本（决定它能装多老系统）。"""
+    found = re.findall(r"GLIBC_(\d+)\.(\d+)", output("readelf", "-V", str(binary)))
+    if not found:
+        return None
+    major, minor = max((int(a), int(b)) for a, b in found)
+    return (major, minor)
+
+
 def main():
     source, artifacts = (Path(value).resolve(strict=True) for value in sys.argv[1:])
     tools_root = Path(__file__).resolve().parents[1]
@@ -25,10 +34,11 @@ def main():
     architecture = os.environ.get("DEB_ARCH", "arm64")
     machine = {"amd64": "Advanced Micro Devices X86-64", "arm64": "AArch64"}[architecture]
     legacy = re.fullmatch(r"v3\.0-Electro-testing-custom[0-9]{8}\.[0-9]+", tag)
-    current = re.fullmatch(r"v3\.2-Electro(-stable|\.rc(\.[0-9]+)?)", tag)
+    current = re.fullmatch(r"v3\.2-Electro(-stable(-beta[0-9]+)?|\.rc(\.[0-9]+)?)", tag)
     if not (legacy or current):
         raise ValueError("Invalid release tag")
-    if version != tag[1:].replace("-custom", "+custom"):
+    # 标签里用 '-beta', 包版本用 '~beta'（git 标签不能含 '~'）。
+    if version != tag[1:].replace("-custom", "+custom").replace("-beta", "~beta"):
         raise ValueError("Package version does not match release tag")
     commit = output("git", "-C", str(source), "rev-parse", "HEAD")
     if commit != output("git", "-C", str(source), "rev-parse", f"refs/tags/{tag}^{{commit}}"):
@@ -43,6 +53,18 @@ def main():
     header = output("readelf", "-h", str(binary))
     if not re.search(r"Machine:\s+" + re.escape(machine) + r"\s*$", header, re.MULTILINE):
         raise ValueError("Executable architecture mismatch")
+    # 发布门禁：编译器所在系统的 glibc 决定最低可运行系统。超过上限说明
+    # 构建环境选错了（例如在 22.04/24.04 上原生编译），包会装不进 20.04/麒麟。
+    glibc_limit_text = os.environ.get("MAX_GLIBC", "2.31")
+    glibc_limit = tuple(int(part) for part in glibc_limit_text.split("."))
+    glibc = highest_glibc(binary)
+    if glibc is None:
+        raise ValueError("Cannot determine the glibc baseline of the packaged executable")
+    if glibc > glibc_limit:
+        raise ValueError(
+            f"Executable requires GLIBC_{glibc[0]}.{glibc[1]}, above MAX_GLIBC={glibc_limit_text}; "
+            "rebuild in a matching low-ABI environment (Ubuntu 20.04 container)")
+    glibc_text = f"{glibc[0]}.{glibc[1]}"
     dependencies = output("dpkg-deb", "-f", str(package), "Depends")
     tests = (artifacts / f"STARTUP-TESTS-{architecture}.txt").read_text(encoding="utf-8")
     passed = re.search(r"Ran (\d+) tests in [\d.]+s\s+OK\s*$", tests)
@@ -81,8 +103,9 @@ The application sources match the release tag recorded below.
 | Application source | `{commit}` |
 | Packaging / verification source | `{support_commit}` |
 | Architecture | Native {architecture} / {machine} (no emulation) |
-| Build OS | {output('lsb_release', '-ds')} |
+| Build OS | {os.environ.get('SIDERA_BUILD_IMAGE') or output('lsb_release', '-ds')} |
 | System libc | {output('getconf', 'GNU_LIBC_VERSION')} |
+| Highest GLIBC required | `{glibc_text}` (limit `{glibc_limit_text}`) |
 | Rust | {output('rustc', '+' + os.environ['RUST_VERSION'], '--version')} |
 | Cargo | {output('cargo', '+' + os.environ['RUST_VERSION'], '--version')} |
 | Package version | `{version}` |

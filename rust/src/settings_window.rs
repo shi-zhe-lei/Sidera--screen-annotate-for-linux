@@ -35,16 +35,13 @@ impl Window {
         let native_x11 = x11.is_some_and(|backend| !backend.x11.is_xwayland);
         let force_overlay = std::env::var_os("SIDERA_SETTINGS_OVERLAY").is_some();
         let force_native = std::env::var_os("SIDERA_SETTINGS_NATIVE").is_some();
-        if !crate::use_native_settings(native_x11, force_overlay, force_native) {
+        if !crate::use_native_settings(force_overlay, force_native) {
             return Ok(None);
         }
         if !native_x11 {
             let decorations = if x11.is_some() { Decorations::Panel } else { Decorations::TitleBar };
             match WaylandWindow::open(app, decorations) {
                 Ok(window) => return Ok(Some(Rc::new(Self::Wayland(window)))),
-                // A compatibility session without access to xdg-shell still
-                // has its original X11 overlay available.
-                Err(error) if x11.is_some() && !force_native => return Err(error),
                 Err(error) => log::info!("原生设置窗口不可用：{error}"),
             }
         }

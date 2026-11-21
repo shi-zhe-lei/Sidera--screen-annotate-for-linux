@@ -1,6 +1,6 @@
 [package]
 name = "sidera-windows"
-version = "3.2.0-Electro-stable"
+version = "3.2.0-Electro-stable-beta1"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "Sidera Windows port - Win32 overlay backend (work in progress)"

@@ -9,7 +9,7 @@
 | 本地 WSL Ubuntu 26.04 amd64 | Rust/Cargo 1.93.1、GCC 15.2、Qt 5.15.18、Python 3.14、bubblewrap、Xvfb、Sway 1.11/wlroots 0.19.2 | 编译、接口及私有图形协议检查；不等于真实桌面体验 |
 | Windows / NAS 工作区 | PowerShell、Node 24.19；custom 分支 | 编辑、Node 模拟测试；Linux 构建使用本地文件系统副本 |
 | VMware Ubuntu 26.04.1 amd64 | GNOME 50.1 Wayland、glibc 2.43；已覆盖安装含小屏幕设置修复、主题功能且保留白板底色的 custom.35，扩展文件版本 6 | 37 个安装文件校验通过、原有配置保留；2026-10-25 用户确认下列三组功能在此虚拟机上没有问题 |
-| GitHub 原生 Ubuntu 22.04 amd64 / ARM64 | 3.2-Electro-stable 发布构建基线；Rust 1.93.1 | 发布工作流分别编译、检查主题与私有协议，再验证包内程序；实际结果见 Release 的 BUILDINFO |
+| GitHub runner + Ubuntu 20.04 容器 amd64 / ARM64 | 3.2-Electro-stable~beta1 发布构建基线；Rust 1.93.1 | 发布工作流分别编译、检查主题与私有协议，再验证包内程序；实际结果见 Release 的 BUILDINFO |
 | 学校银河麒麟 V10 SP1 | Phytium D2000/8 E8C、ARM64、UKUI 原生 X11、glibc 2.31、Qt 5.12；报告已装上游 2.6 | U 盘另备 custom.35 低 ABI 构建；QEMU + glibc 2.31 下 107 项普通 Rust、16 项启动检查通过，不是学校硬件验收；有图形窗口不代表 Wayland |
 | Ubuntu 24.04 / GNOME 46–49 / KDE / 原生 ARM64 | 缺少完整当前版本验收 | 不预填为已支持或已通过 |
 
@@ -113,6 +113,8 @@ make -C cpp -j4 WITH_WAYLAND=1
 `rust/build_deb.sh amd64|arm64` 按 `target/container-<arch>/<triple>/release/sidera` → `target/container-<arch>/release/sidera` → `target/release/sidera` 的顺序取二进制。`build_aarch64.sh` 的交叉产物在 `target/container-aarch64/aarch64-unknown-linux-gnu/release/`，必须先查这一层；否则会命中早期构建残留的 `target/container-aarch64/release/sidera`，得到“日期新、内容旧”的包。务必确认被选中的是本次构建，尤其使用独立 CARGO_TARGET_DIR 时需将待打包文件放到脚本约定目录。
 
 三个 DEB 脚本均调用 `tools/deb_dependencies.py`，用 readelf 检查 ELF，再由 dpkg-shlibdeps 计算实际动态依赖，另加登记需要的 Python 3。二进制无效时停止打包；主机缺少 dpkg 库清单（Arch/Fedora 等）时退回固定依赖并打印警告，不能当作已验证的依赖声明。通过 `SIDERA_VERSION` 指定本地包版本，失败不得删除旧包，成功后原子替换输出。
+
+包的最低运行基线由**构建环境的 glibc** 决定，不是由打包脚本决定。发布流程在 `ubuntu:20.04` 容器内编译（`ubuntu-22.04` runner 只负责测试），`tools/release_metadata.py` 再从实际 ELF 读出最高 `GLIBC_x.y`，超过 `MAX_GLIBC`（默认 `2.31`）直接失败。不要把 22.04 / 24.04 主机上的原生编译产物当作发布包。
 
 ```sh
 cd rust

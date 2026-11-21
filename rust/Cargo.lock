@@ -1695,7 +1695,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sidera"
-version = "3.2.0-Electro-stable"
+version = "3.2.0-Electro-stable-beta1"
 dependencies = [
  "ab_glyph",
  "ab_glyph_rasterizer",
@@ -1710,6 +1710,7 @@ dependencies = [
  "image",
  "libc",
  "log",
+ "memmap2",
  "quick-xml",
  "serde_json",
  "sha1",

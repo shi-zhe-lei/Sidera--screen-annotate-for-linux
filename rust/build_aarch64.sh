@@ -19,7 +19,7 @@
 #
 # 产物：
 #   target/container-aarch64/release/sidera
-#   <repo>/sidera_3.2-Electro-stable_arm64.deb
+#   <repo>/sidera_3.2-Electro-stable~beta1_arm64.deb
 #   rust/dist/sidera-3.2-Electro.stable.aarch64.rpm
 #   rust/dist/sidera-3.2_electro_stable-1-aarch64.pkg.tar.zst
 #
@@ -106,9 +106,9 @@ if [ "$NO_PKG" -eq 0 ]; then
 
   echo ""
   echo "========== 产物 =========="
-  for f in "../sidera_3.2-Electro-stable_arm64.deb" \
-           dist/sidera-3.2-Electro.stable.aarch64.rpm \
-           dist/sidera-3.2_electro_stable-1-aarch64.pkg.tar.zst; do
+  for f in "../sidera_3.2-Electro-stable~beta1_arm64.deb" \
+           dist/sidera-3.2-Electro.stable~beta1.aarch64.rpm \
+           dist/sidera-3.2_electro_stable_beta1-1-aarch64.pkg.tar.zst; do
     [ -f "$f" ] && ls -lh "$f"
   done
 else
