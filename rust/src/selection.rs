@@ -113,13 +113,27 @@ pub fn lift(app: &mut App, lasso: &[(f32, f32)]) -> Option<FloatingSelection> {
     })
 }
 
+/// Anchor movement in physical pixels, including at fractional display scales.
+pub fn move_to_pointer(app: &mut App, offset: (i32, i32), x: i32, y: i32) {
+    let Some(sel) = app.floating.as_mut() else { return };
+    let scale = app.scale as f32;
+    let max_x = app.canvas.width().saturating_sub(sel.pixmap.width()) as i32;
+    let max_y = app.canvas.height().saturating_sub(sel.pixmap.height()) as i32;
+    sel.x = ((x as f32 * scale).round() as i32 - offset.0).clamp(0, max_x);
+    sel.y = ((y as f32 * scale).round() as i32 - offset.1).clamp(0, max_y);
+}
+
 pub fn commit(app: &mut App) {
     let Some(sel) = app.floating.take() else { return };
     let cw = app.canvas.width() as i32;
     let ch = app.canvas.height() as i32;
     let x1 = (sel.x + sel.pixmap.width() as i32).min(cw);
     let y1 = (sel.y + sel.pixmap.height() as i32).min(ch);
-    app.save_undo_rect(sel.x.max(0), sel.y.max(0), x1, y1);
+    if (sel.x, sel.y) == (sel.origin_x, sel.origin_y) {
+        app.discard_last_undo();
+    } else {
+        app.save_undo_rect(sel.x.max(0), sel.y.max(0), x1, y1);
+    }
     app.canvas.draw_pixmap(sel.x, sel.y, sel.pixmap.as_ref(),
         &PixmapPaint { blend_mode: BlendMode::SourceOver, ..Default::default() },
         Transform::identity(), None);
