@@ -4,11 +4,18 @@
 // ============================================================
 use ab_glyph::{Font, FontArc, OutlineCurve, PxScale, ScaleFont};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Shader, Transform};
+
+#[path = "text/hinted.rs"]
+mod hinted;
+use hinted::SettingsGlyphs;
 
 #[derive(Clone)]
 pub struct Fonts {
     pub list: Vec<FontArc>,
+    settings: bool,
+    glyphs: Arc<Mutex<SettingsGlyphs>>,
 }
 
 fn score(path: &str) -> i32 {
@@ -160,17 +167,37 @@ impl Fonts {
                 log::warn!("[字体] 缺少中文字形，请安装 fonts-noto-cjk 或等效中文字体");
             }
         }
-        Fonts { list }
+        Self::new(list)
     }
+
+    fn new(list: Vec<FontArc>) -> Self {
+        Self { list, settings: false, glyphs: Arc::default() }
+    }
+
+    pub(crate) fn for_settings(&self) -> Self {
+        Self { settings: true, ..self.clone() }
+    }
+
     fn pick(&self, ch: char) -> Option<&FontArc> {
         self.list.iter().find(|f| f.glyph_id(ch).0 != 0)
+    }
+
+    fn face_scale(&self, face: &FontArc, px: f32) -> PxScale {
+        // Settings use em pixels, as desktop toolkits do. ab_glyph takes the
+        // full ascent-to-descent height, which is 1.448 em in the bundled CJK face.
+        if self.settings {
+            if let Some(em) = face.units_per_em().filter(|em| *em > 0.0) {
+                return PxScale::from(px * (face.height_unscaled() / em));
+            }
+        }
+        PxScale::from(px)
     }
 
     pub fn text_width(&self, s: &str, px: f32) -> f32 {
         let mut w = 0.0;
         for ch in s.chars() {
             if let Some(f) = self.pick(ch) {
-                let sf = f.as_scaled(PxScale::from(px));
+                let sf = f.as_scaled(self.face_scale(f, px));
                 let gid = sf.glyph_id(ch);
                 w += sf.h_advance(gid);
             } else {
@@ -186,7 +213,7 @@ impl Fonts {
         let mut caret = 0.0;
         for ch in s.chars() {
             let Some(font) = self.pick(ch) else { caret += px * 0.5; continue };
-            let scaled = font.as_scaled(PxScale::from(px));
+            let scaled = font.as_scaled(self.face_scale(font, px));
             let glyph = scaled.glyph_id(ch);
             if let Some(outline) = font.outline(glyph) {
                 let scale = scaled.h_scale_factor();
@@ -225,45 +252,47 @@ impl Fonts {
             anti_alias: true,
             ..Default::default()
         };
-        // At integer device scales, snap each glyph origin to a whole pixel.
-        // Fractional origins make small CJK text look soft even when the
-        // outline itself is rendered correctly.
         static TEXT_SNAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let snap_enabled = *TEXT_SNAP.get_or_init(|| std::env::var_os("SIDERA_NO_TEXT_SNAP").is_none());
-        // Snap glyph origins to whole device pixels. This also helps at
-        // fractional desktop scales (125%/150%), where unsnapped origins make
-        // small CJK text look soft even though the outlines are correct.
         let uniform = transform.kx.abs() < 0.01 && transform.ky.abs() < 0.01
             && (transform.sx - transform.sy).abs() < 0.01
             && transform.sx != 0.0;
         let snap = snap_enabled && uniform;
-        // Rasterize glyphs at a whole physical-pixel size too. A 13px logical
-        // font at 125% is 16.25 device pixels; rounding the outline size down
-        // to 16 removes the extra soft edge without changing the layout box.
-        let mut px = px;
-        if uniform && transform.sx > 0.0 {
-            px = ((px * transform.sx).round().max(1.0)) / transform.sx;
-        }
+        // Preferences measure in logical ems at every scale. The toolbar still
+        // uses its original pixel-rounded icons and labels.
+        let raster_px = if !self.settings && uniform && transform.sx > 0.0 {
+            (px * transform.sx).round().max(1.0) / transform.sx
+        } else { px };
+        let mut hinted = (self.settings && snap && transform.sx > 0.0).then(|| {
+            self.glyphs.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
         let mut caret = x;
         for ch in s.chars() {
             let Some(f) = self.pick(ch) else {
-                caret += px * 0.5;
+                caret += raster_px * 0.5;
                 continue;
             };
-            let sf = f.as_scaled(PxScale::from(px));
+            let sf = f.as_scaled(self.face_scale(f, raster_px));
             let gid = sf.glyph_id(ch);
-            let adv = sf.h_advance(gid);
+            let origin = caret;
+            caret += sf.h_advance(gid);
+            if ch.is_whitespace() { continue; }
+            let device_x = transform.sx * origin + transform.tx;
+            let device_y = transform.sy * baseline_y + transform.ty;
+            if let Some(cache) = hinted.as_mut() {
+                if cache.draw(pm, f, gid.0, px * transform.sx, device_x, device_y, col).is_some() {
+                    continue;
+                }
+            }
             // 必须与 ab_glyph 的 h_advance 用同一个缩放因子（px / height_unscaled），
             // 否则字宽与字形大小不一致 → 字挤在一起。
             let sc = sf.h_scale_factor();
             if let Some(ol) = f.outline(gid) {
                 let (gx, gy) = if snap {
-                    let dx = transform.sx * caret + transform.tx;
-                    let dy = transform.sy * baseline_y + transform.ty;
-                    ((dx.round() - transform.tx) / transform.sx,
-                     (dy.round() - transform.ty) / transform.sy)
+                    let x = if self.settings { origin } else { (device_x.round() - transform.tx) / transform.sx };
+                    (x, (device_y.round() - transform.ty) / transform.sy)
                 } else {
-                    (caret, baseline_y)
+                    (origin, baseline_y)
                 };
                 let map = |p: &ab_glyph::Point| (gx + p.x * sc, gy - p.y * sc);
                 let mut pb = PathBuilder::new();
@@ -308,7 +337,6 @@ impl Fonts {
                     pm.fill_path(&path, &paint, FillRule::Winding, transform, None);
                 }
             }
-            caret += adv;
         }
     }
 }
@@ -316,6 +344,35 @@ impl Fonts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_labels_keep_their_metrics_and_rasterize_at_device_positions() {
+        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/assets/fonts/NotoSansCJKsc-Regular.otf")).unwrap();
+        let settings = Fonts::new(vec![FontArc::try_from_vec(bytes).unwrap()]).for_settings();
+        for px in [12.0, 13.0, 14.0, 20.0] {
+            // Each of these three ideographs has a one-em advance in the bundled face.
+            assert!((settings.text_width("设置页", px) - 3.0 * px).abs() < 0.01);
+        }
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let render = |dx, color| {
+                let mut pm = Pixmap::new(220, 60).unwrap();
+                settings.draw(&mut pm, "设置 1.25×", 4.0, 22.0, 13.0, color,
+                    Transform::from_row(scale, 0.0, 0.0, scale, dx, 0.0));
+                pm
+            };
+            let ink = render(0.0, Color::WHITE);
+            assert!(ink.pixels().iter().any(|p| p.alpha() > 0));
+            assert_ne!(ink.data(), render(0.25, Color::WHITE).data(), "lost fractional origin at {scale}");
+            let shifted = render(1.0, Color::BLACK);
+            for (a, b) in ink.pixels().chunks_exact(220).zip(shifted.pixels().chunks_exact(220)) {
+                for (white, black) in a[..219].iter().zip(&b[1..]) {
+                    assert_eq!(white.alpha(), black.alpha(), "coverage changed after moving one pixel at {scale}");
+                    assert_eq!(black.red(), 0, "cached ink survived a theme change");
+                }
+            }
+        }
+    }
 
     #[test]
     fn renders_text() {
@@ -346,7 +403,7 @@ mod tests {
 
     #[test]
     fn missing_glyphs_reserve_the_same_width_as_drawing() {
-        let fonts = Fonts { list: Vec::new() };
+        let fonts = Fonts::new(Vec::new());
         assert_eq!(fonts.text_width("画笔A", 20.0), 30.0);
     }
 }

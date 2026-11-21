@@ -5,6 +5,15 @@ use crate::{app::{App, now_ms}, settings_state::{self as state, DialogHit, Picke
     value_input::{self, Target}};
 use tiny_skia::{Pixmap, PixmapPaint, Transform};
 
+const PANEL_RADIUS: f32 = 14.0;
+const SIDEBAR_WIDTH: i32 = 168;
+const MAX_FORM_WIDTH: i32 = 720;
+const PAGE_TITLE: f32 = 20.0;
+const ROW_LABEL: f32 = 14.0;
+const CONTROL_LABEL: f32 = 13.0;
+const DETAIL: f32 = 12.0;
+const INSPECTOR_TEXT: f32 = 13.0;
+
 fn inset(r:R,n:i32)->R {R {x:r.x+n,y:r.y+n,w:(r.w-n*2).max(1),h:(r.h-n*2).max(1)}}
 pub fn available_size(app: &App) -> (i32, i32) {
     app.settings_ui.window_size().unwrap_or((app.screen_w, app.screen_h))
@@ -17,13 +26,25 @@ pub fn rect(app:&App)->R {
     let w=860.min((app.screen_w-24).max(1));let h=620.min((app.screen_h-24).max(1));
     R {x:(app.screen_w-w)/2,y:(app.screen_h-h)/2,w,h}
 }
-fn has_sidebar(app:&App)->bool {
-    let p=rect(app);p.w>=680&&p.h>=400
+fn shows_sidebar(panel: R) -> bool {
+    panel.w >= 680 && panel.h >= 400
 }
-pub fn content_rect(app:&App)->R {
-    let p=rect(app);let wide=has_sidebar(app);
-    let left=if wide {192}else{16};let top=if wide {94}else{90};
-    R {x:p.x+left,y:p.y+top,w:p.w-left-20,h:(p.h-top-64).max(40)}
+fn has_sidebar(app: &App) -> bool {
+    shows_sidebar(rect(app))
+}
+fn form_bounds(panel: R) -> R {
+    let (left, top) = if shows_sidebar(panel) { (SIDEBAR_WIDTH + 24, 94) } else { (16, 90) };
+    let available = (panel.w - left - 20).max(1);
+    let width = available.min(MAX_FORM_WIDTH);
+    R {
+        x: panel.x + left + (available - width) / 2,
+        y: panel.y + top,
+        w: width,
+        h: (panel.h - top - 64).max(40),
+    }
+}
+pub fn content_rect(app: &App) -> R {
+    form_bounds(rect(app))
 }
 pub fn tab_rect(app:&App,index:usize)->R {
     let p=rect(app);
@@ -34,6 +55,16 @@ fn quit_rect(app:&App)->R {
     let p=rect(app);
     if has_sidebar(app) {R {x:p.x+16,y:p.y+p.h-96,w:136,h:44}}
     else {R {x:p.x+p.w-136,y:p.y+8,w:120,h:36}}
+}
+#[cfg(unix)]
+pub(crate) fn window_drag_region(app: &App) -> Option<R> {
+    if !app.settings_open || app.process_block_open || app.show_diag || app.confirm_quit
+        || app.settings_ui.dialog.is_some() || app.settings_ui.picker.is_some() {
+        return None;
+    }
+    let panel = rect(app);
+    let right = if has_sidebar(app) { panel.x + panel.w } else { quit_rect(app).x };
+    Some(R { w: right - panel.x, h: tab_rect(app, 0).y - panel.y, ..panel })
 }
 fn count(tab:Tab)->usize {match tab {Tab::Appearance=>5,Tab::General=>6,Tab::Addins=>3,Tab::About=>5}}
 fn addins_notice_rect(app:&App)->Option<R> {
@@ -90,10 +121,11 @@ pub fn controls(app:&App)->Vec<(SetHit,R)> {
         }
     }
     let footer=p.y+p.h-52;
+    let body=content_rect(app);
     out.push((SetHit::Quit,quit_rect(app)));
-    out.push((SetHit::Done,R {x:p.x+p.w-96,y:footer,w:76,h:40}));
+    out.push((SetHit::Done,R {x:body.x+body.w-76,y:footer,w:76,h:40}));
     if layout(app).pages>1 {
-        for (delta,dx) in [(-1,0),(1,42)] {out.push((SetHit::SettingsPage(delta),R {x:content_rect(app).x+dx,y:footer,w:38,h:40}));}
+        for (delta,dx) in [(-1,0),(1,42)] {out.push((SetHit::SettingsPage(delta),R {x:body.x+dx,y:footer,w:38,h:40}));}
     }
     for s in sliders(app){out.push((SetHit::EditSlider(s.id),s.badge));out.push((SetHit::ResetSlider(s.id),s.reset));}
     out
@@ -128,10 +160,10 @@ fn text(ctx:&mut Ctx,fonts:&Fonts,value:&str,r:R,px:f32,rgb:u32) {
 pub fn wrapped(fonts:&Fonts,value:&str,px:f32,width:i32)->Vec<String> {
     let mut out=Vec::new();for paragraph in value.lines(){let mut line=String::new();for ch in paragraph.chars(){let mut next=line.clone();next.push(ch);if !line.is_empty()&&fonts.text_width(&next,px)>width.max(1) as f32 {out.push(line);line=String::new();}line.push(ch);}out.push(line);}out
 }
-pub fn button(ctx:&mut Ctx,fonts:&Fonts,r:R,label:&str,primary:bool) {
+pub fn button(ctx:&mut Ctx,fonts:&Fonts,r:R,label:&str,primary:bool,size:f32) {
     let p=ctx.palette;let visual=R {y:r.y+(r.h-r.h.min(32))/2,h:r.h.min(32),..r};
     ui::surface(ctx,visual,6.0,c(if primary {p.accent}else{p.paper}),c(if primary {p.accent}else{p.border}));
-    ctx.text_center(fonts,visual,&fitted(fonts,label,15.0,r.w-10),15.0,c(if primary {p.on_accent}else{p.text}));
+    ctx.text_center(fonts,visual,&fitted(fonts,label,size,r.w-10),size,c(if primary {p.on_accent}else{p.text}));
 }
 pub fn toggle(ctx:&mut Ctx,app:&App,r:R,control:ui::Control,on:bool) {
     let p=ctx.palette;let t=app.settings_ui.toggle_value(control,on);
@@ -141,8 +173,12 @@ pub fn toggle(ctx:&mut Ctx,app:&App,r:R,control:ui::Control,on:bool) {
 }
 fn card(ctx:&mut Ctx,fonts:&Fonts,r:R,title:&str,detail:&str,trailing:i32) {
     let p=ctx.palette;let x=r.x+14;let w=r.w-28-trailing;
-    if detail.is_empty() || r.h<46 {text(ctx,fonts,title,R {x,w,..r},17.0,p.text);}
-    else {text(ctx,fonts,title,R {x,y:r.y+(r.h-42)/2,w,h:23},17.0,p.text);text(ctx,fonts,detail,R {x,y:r.y+(r.h-42)/2+23,w,h:19},13.0,p.muted);}
+    if detail.is_empty() || r.h<46 {text(ctx,fonts,title,R {x,w,..r},ROW_LABEL,p.text);}
+    else {
+        let top = r.y + (r.h - 38) / 2;
+        text(ctx,fonts,title,R {x,y:top,w,h:21},ROW_LABEL,p.text);
+        text(ctx,fonts,detail,R {x,y:top+21,w,h:17},DETAIL,p.muted);
+    }
 }
 fn wps_exit_notice(ctx:&mut Ctx,fonts:&Fonts,r:R) {
     let p=ctx.palette;
@@ -203,17 +239,18 @@ fn draw_icon(ctx:&mut Ctx,icon:Option<&Pixmap>,x:i32,y:i32,size:f32) {
 pub fn draw(app:&App,fonts:&Fonts,ctx:&mut Ctx,icon:Option<&Pixmap>) {layer(app,ctx,opacity(app),|ctx|draw_content(app,fonts,ctx,icon));}
 fn draw_content(app:&App,fonts:&Fonts,ctx:&mut Ctx,icon:Option<&Pixmap>) {
     let p=rect(app);let palette=ctx.palette;let wide=has_sidebar(app);let body=content_rect(app);let l=layout(app);
-    ui::panel(ctx,p,14.0,1.0);
     if wide {
-        ctx.fill_round(R {x:p.x+1,y:p.y+1,w:166,h:p.h-2},13.0,c(theme::mix(palette.paper,palette.surface,0.65)));
-        ctx.stroke_line(((p.x+168) as f32,(p.y+18) as f32),((p.x+168) as f32,(p.y+p.h-18) as f32),alpha(palette.border,150),1.0);
+        ui::panel_with_sidebar(ctx, p, PANEL_RADIUS, SIDEBAR_WIDTH);
         draw_icon(ctx,icon,p.x+20,p.y+24,28.0);
-        text(ctx,fonts,"Sidera",R {x:p.x+58,y:p.y+21,w:94,h:24},17.0,palette.text);
-        text(ctx,fonts,"偏好设置",R {x:p.x+58,y:p.y+45,w:94,h:18},11.0,palette.muted);
-        text(ctx,fonts,crate::app::VERSION,R {x:p.x+20,y:p.y+p.h-40,w:132,h:20},10.0,palette.muted);
-        text(ctx,fonts,app.settings_ui.tab.label(),R {x:body.x,y:p.y+25,w:body.w,h:30},26.0,palette.text);
-        text(ctx,fonts,app.settings_ui.tab.subtitle(),R {x:body.x,y:p.y+58,w:body.w,h:20},14.0,palette.muted);
-    } else {text(ctx,fonts,"设置",R {x:p.x+18,y:p.y+10,w:p.w-174,h:28},22.0,palette.text);}
+        text(ctx,fonts,"Sidera",R {x:p.x+58,y:p.y+21,w:94,h:24},ROW_LABEL,palette.text);
+        text(ctx,fonts,"偏好设置",R {x:p.x+58,y:p.y+45,w:94,h:18},12.0,palette.muted);
+        text(ctx,fonts,crate::app::VERSION,R {x:p.x+20,y:p.y+p.h-40,w:132,h:20},11.0,palette.muted);
+        text(ctx,fonts,app.settings_ui.tab.label(),R {x:body.x,y:p.y+25,w:body.w,h:30},PAGE_TITLE,palette.text);
+        text(ctx,fonts,app.settings_ui.tab.subtitle(),R {x:body.x,y:p.y+58,w:body.w,h:20},DETAIL,palette.muted);
+    } else {
+        ui::panel(ctx,p,PANEL_RADIUS,1.0);
+        text(ctx,fonts,"设置",R {x:p.x+18,y:p.y+10,w:p.w-174,h:28},PAGE_TITLE,palette.text);
+    }
     let a=tab_rect(app,0);let b=tab_rect(app,1);let pos=app.settings_ui.nav_position();
     let active=R {x:a.x+((b.x-a.x) as f32*pos).round() as i32,y:a.y+((b.y-a.y) as f32*pos).round() as i32,..a};
     ctx.fill_round(active,6.0,c(theme::mix(palette.paper,palette.accent_light,0.62)));
@@ -222,8 +259,13 @@ fn draw_content(app:&App,fonts:&Fonts,ctx:&mut Ctx,icon:Option<&Pixmap>) {
         if wide {
             let glyph=match tab {Tab::Appearance=>Glyph::Pen,Tab::General=>Glyph::Settings,Tab::Addins=>Glyph::Document,Tab::About=>Glyph::Info};
             icons::draw(ctx,glyph,(r.x+12) as f32,(r.y+11) as f32,16.0,c(palette.muted),c(palette.muted));
-            text(ctx,fonts,tab.label(),R {x:r.x+40,w:r.w-48,..r},15.0,palette.text);
-        } else {ctx.text_center(fonts,r,tab.label(),14.0,c(palette.text));}
+            text(ctx,fonts,tab.label(),R {x:r.x+40,w:r.w-48,..r},CONTROL_LABEL,palette.text);
+        } else {
+            let selection = (1.0 - (pos - tab.index() as f32).abs()).max(0.0);
+            let border = theme::mix(palette.border, palette.accent_line, selection);
+            ctx.stroke_round(inset(r, 1), 5.0, c(border), 1.0);
+            ctx.text_center(fonts,r,tab.label(),CONTROL_LABEL,c(palette.text));
+        }
     }
     let visible=(count(app.settings_ui.tab)-l.page*l.rows).min(l.rows);
     let group=R {h:visible as i32*l.stride,..rows_rect(app)};
@@ -259,19 +301,19 @@ fn draw_content(app:&App,fonts:&Fonts,ctx:&mut Ctx,icon:Option<&Pixmap>) {
             let detail=match s.id {SliderId::AutoExpand=>"收起后等待 1–20 分钟，默认 2 分钟".into(),SliderId::Position=>"从顶部到下方 · 也可拖动工具栏".into(),_=>format!("{}–{} {}",spec.min,spec.max,spec.unit)};
             let index=match s.id {SliderId::Alpha=>2,SliderId::Scale=>3,SliderId::Position=>4,SliderId::StartupDelay=>1,SliderId::AutoExpand=>2,SliderId::Threshold=>3,SliderId::EraseScale=>4};
             let r=row(app,index).unwrap();
-            if compact {text(ctx,fonts,s.label,R {x:r.x+12,y:r.y,w:r.w-24,h:22},15.0,palette.text);}else{card(ctx,fonts,r,s.label,&detail,286);}
+            if compact {text(ctx,fonts,s.label,R {x:r.x+12,y:r.y,w:r.w-24,h:22},ROW_LABEL,palette.text);}else{card(ctx,fonts,r,s.label,&detail,286);}
             ctx.fill_round(s.track,1.5,c(palette.border));let x=s.track.x+(s.track.w as f32*s.t()).round() as i32;
             ctx.fill_round(R {w:(x-s.track.x).max(1),..s.track},1.5,c(palette.accent));
             let cy=(s.track.y+1) as f32;
             if app.press.is_some_and(|p|p.active&&p.control==ui::Control::Slider(s.id)){ctx.fill_circle(x as f32,cy,12.0,alpha(palette.accent,24));}
             ctx.fill_circle(x as f32,cy,6.0,c(palette.paper));ctx.stroke_round(R {x:x-6,y:cy as i32-6,w:12,h:12},6.0,c(palette.accent),1.5);
-            value_input::draw_value(app,fonts,ctx,Target::Setting(s.id),s.badge,15.0,"",spec.unit);
+            value_input::draw_value(app,fonts,ctx,Target::Setting(s.id),s.badge,CONTROL_LABEL,"",spec.unit);
         }
         for (hit,r) in controls(app) {match hit {
             SetHit::Theme(preference)=>{
                 let selected=preference==app.theme.preference;let r=R {y:r.y+5,h:r.h-10,..r};
                 ui::surface(ctx,r,5.0,c(if selected {palette.accent_light}else{palette.surface}),c(if selected {palette.accent_line}else{palette.border}));
-                ctx.text_center(fonts,r,preference.label(),14.0,c(palette.text));
+                ctx.text_center(fonts,r,preference.label(),CONTROL_LABEL,c(palette.text));
             }
             SetHit::ResetSlider(_)=>{icons::draw(ctx,Glyph::Reset,(r.x+(r.w-16)/2) as f32,(r.y+(r.h-16)/2) as f32,16.0,c(palette.muted),c(palette.muted));}
             SetHit::Logs=>card(ctx,fonts,r,"运行日志  ›","查看与清理记录",0),
@@ -279,17 +321,27 @@ fn draw_content(app:&App,fonts:&Fonts,ctx:&mut Ctx,icon:Option<&Pixmap>) {
             _=>{},
         }}
     });
-    ctx.stroke_line((body.x as f32,(p.y+p.h-62) as f32),((p.x+p.w-20) as f32,(p.y+p.h-62) as f32),alpha(palette.border,110),1.0);
+    ctx.stroke_line((body.x as f32,(p.y+p.h-62) as f32),((body.x+body.w) as f32,(p.y+p.h-62) as f32),alpha(palette.border,110),1.0);
     for (hit,r) in controls(app) {match hit {
         SetHit::Quit=>{
             if wide {ctx.stroke_line(((r.x+4) as f32,(r.y-12) as f32),((r.x+r.w-4) as f32,(r.y-12) as f32),alpha(palette.border,150),1.0);}
             let visual=R {y:r.y+(r.h-32)/2,h:32,..r};
             ui::surface(ctx,visual,6.0,c(palette.danger_light),alpha(palette.danger,90));
             icons::draw(ctx,Glyph::Exit,(r.x+10) as f32,(r.y+(r.h-18)/2) as f32,18.0,c(palette.danger),c(palette.danger));
-            text(ctx,fonts,"退出 Sidera",R {x:r.x+36,w:r.w-42,..r},15.0,palette.danger);
+            text(ctx,fonts,"退出 Sidera",R {x:r.x+36,w:r.w-42,..r},CONTROL_LABEL,palette.danger);
         }
-        SetHit::Done=>button(ctx,fonts,r,"完成",true),
-        SetHit::SettingsPage(delta)=>{ctx.text_center(fonts,r,if delta<0 {"‹"}else{"›"},20.0,c(if ui::control_enabled(app,ui::Control::Setting(hit)){palette.text}else{palette.disabled_ink}));}
+        SetHit::Done=>button(ctx,fonts,r,"完成",true,CONTROL_LABEL),
+        SetHit::SettingsPage(delta) => {
+            let enabled = ui::control_enabled(app, ui::Control::Setting(hit));
+            let (ink, border) = if enabled {
+                (palette.text, c(palette.border))
+            } else {
+                (palette.disabled_ink, alpha(palette.disabled_border, 190))
+            };
+            let visual = R { y: r.y + (r.h - 32) / 2, h: 32, ..r };
+            ctx.stroke_round(inset(visual, 1), 5.0, border, 1.0);
+            ctx.text_center(fonts, r, if delta < 0 { "‹" } else { "›" }, 20.0, c(ink));
+        }
         _=>{},
     }}
     let editing=app.settings_ui.editor.as_ref().filter(|e|matches!(e.target,Target::Setting(_)));
@@ -357,7 +409,8 @@ pub fn draw_overlay(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
     layer(app,ctx, opacity, |ctx| {
         let palette = ctx.palette;
         let (width, height) = available_size(app);
-        ctx.fill_round(R { x: 0, y: 0, w: width, h: height }, 0.0, alpha(0, if app.theme.dark() { 140 } else { 80 }));
+        let radius = if app.settings_ui.window_size().is_some() { PANEL_RADIUS } else { 0.0 };
+        ctx.fill_round(R { x: 0, y: 0, w: width, h: height }, radius, alpha(0, if app.theme.dark() { 140 } else { 80 }));
         if let Some(dialog) = app.settings_ui.dialog {
             let p = dialog_rect(app); ui::panel(ctx, p, 12.0, 1.0);
             let body_bottom = if dialog.requires_wps_exit() {
@@ -391,7 +444,7 @@ pub fn draw_overlay(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
                     let r=R {y:r.y+6,h:r.h-12,..r};
                     ui::surface(ctx,r,6.0,c(fill),alpha(ink,140));
                     ctx.text_center(fonts,r,&fitted(fonts,dialog.action(),14.0,r.w-12),14.0,c(palette.text));
-                } else { button(ctx, fonts, r, if hit == DialogHit::Cancel { "取消" } else { dialog.action() }, hit == DialogHit::Continue); }
+                } else { button(ctx, fonts, r, if hit == DialogHit::Cancel { "取消" } else { dialog.action() }, hit == DialogHit::Continue, CONTROL_LABEL); }
             }
         } else if let Some(draft) = &app.settings_ui.picker {
             let p = picker_rect(app); ui::panel(ctx, p, 12.0, 1.0);
@@ -428,7 +481,7 @@ pub fn draw_overlay(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
                         ctx.fill_circle((r.x+r.w/2) as f32,(r.y+r.h/2) as f32,11.0,c(rgb));
                         if rgb == draft.rgb() { icons::draw(ctx,Glyph::Check,(r.x+r.w/2-10) as f32,(r.y+r.h/2-10) as f32,20.0,theme::on_color(c(rgb)),c(rgb)); }
                     }
-                    PickerHit::Cancel => button(ctx,fonts,r,"取消",false),
+                    PickerHit::Cancel => button(ctx,fonts,r,"取消",false,CONTROL_LABEL),
                     PickerHit::Apply => {
                         let r=R {y:r.y+4,h:r.h-8,..r};
                         ui::surface(ctx,r,6.0,c(draft.rgb()),c(palette.border));
@@ -474,7 +527,9 @@ pub fn inspector_lines(app: &App, fonts: &Fonts) -> std::rc::Rc<Vec<String>> {
     if let Some((cached_key, lines)) = app.settings_ui.inspector_cache.borrow().as_ref() {
         if *cached_key == key { return lines.clone(); }
     }
-    let lines = std::rc::Rc::new(wrapped(fonts, &app.diag_text, 13.0, width));
+    // Paging input and painting both go through this cache. Input callers
+    // can supply the overlay fonts, so always wrap with the settings metrics.
+    let lines = std::rc::Rc::new(wrapped(&fonts.for_settings(), &app.diag_text, INSPECTOR_TEXT, width));
     *app.settings_ui.inspector_cache.borrow_mut() = Some((key, lines.clone()));
     lines
 }
@@ -522,7 +577,7 @@ pub fn draw_inspector(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
             for (i,line) in lines.iter().skip(page*size).take(size).enumerate() {
                 let y = body.y + i as i32*20 + offset;
                 if y < body.y || y + 20 > body.y + body.h { continue; }
-                text(ctx,fonts,line,R {y,h:20,..body},13.0,
+                text(ctx,fonts,line,R {y,h:20,..body},INSPECTOR_TEXT,
                     if line.contains("[ERROR]") { palette.danger } else { palette.text });
             }
         };
@@ -540,7 +595,7 @@ pub fn draw_inspector(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
         draw_inspector_pager(app,fonts,ctx,page,pages);
         for (hit,r) in inspector_controls(app) {
             let label=match hit {SetHit::InspectorPage(_)=>continue,SetHit::ClearLog=>"清空日志",_=>"关闭"};
-            button(ctx,fonts,r,label,hit==SetHit::InspectorClose);
+            button(ctx,fonts,r,label,hit==SetHit::InspectorClose,CONTROL_LABEL);
         }
     });
 }
@@ -674,7 +729,7 @@ pub fn draw_process(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
                 }
                 _ => {
                     let label=match hit {H::Add=>"添加",H::Paste=>"粘贴",H::Scan=>"刷新列表",_=>"完成"};
-                    button(ctx,fonts,r,label,matches!(hit,H::Done|H::Add));
+                    button(ctx,fonts,r,label,matches!(hit,H::Done|H::Add),CONTROL_LABEL);
                 }
             }
         }
@@ -714,6 +769,19 @@ mod tests {
 
     fn app(w: i32, h: i32) -> App {
         App::new(Pixmap::new(w as u32, h as u32).unwrap(), w, h)
+    }
+
+    #[test]
+    fn form_keeps_labels_and_controls_together_when_the_window_grows() {
+        let bounds = |w, h| form_bounds(R { x: 0, y: 0, w, h });
+        let compact = bounds(860, 620);
+        assert_eq!((compact.x, compact.w), (192, 648));
+        let narrow = bounds(420, 320);
+        assert_eq!((narrow.x, narrow.w), (16, 384));
+        let large = bounds(1688, 860);
+        assert_eq!(large.w, MAX_FORM_WIDTH);
+        assert_eq!(large.x - compact.x, 1688 - 20 - large.x - large.w);
+        assert_eq!(large.y, compact.y);
     }
 
     fn assert_controls_inside_and_disjoint(controls: &[(PickerHit, R)], outer: R) {

@@ -383,18 +383,20 @@ fn solid(c: Color) -> Paint<'static> {
     }
 }
 
-fn rounded_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
-    let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
+fn rounded_path(x: f32, y: f32, w: f32, h: f32, left: f32, right: f32) -> Option<tiny_skia::Path> {
+    let max_radius = (w.min(h) / 2.0).max(0.0);
+    let left = left.clamp(0.0, max_radius);
+    let right = right.clamp(0.0, max_radius);
     let mut pb = PathBuilder::new();
-    pb.move_to(x + r, y);
-    pb.line_to(x + w - r, y);
-    pb.quad_to(x + w, y, x + w, y + r);
-    pb.line_to(x + w, y + h - r);
-    pb.quad_to(x + w, y + h, x + w - r, y + h);
-    pb.line_to(x + r, y + h);
-    pb.quad_to(x, y + h, x, y + h - r);
-    pb.line_to(x, y + r);
-    pb.quad_to(x, y, x + r, y);
+    pb.move_to(x + left, y);
+    pb.line_to(x + w - right, y);
+    pb.quad_to(x + w, y, x + w, y + right);
+    pb.line_to(x + w, y + h - right);
+    pb.quad_to(x + w, y + h, x + w - right, y + h);
+    pb.line_to(x + left, y + h);
+    pb.quad_to(x, y + h, x, y + h - left);
+    pb.line_to(x, y + left);
+    pb.quad_to(x, y, x + left, y);
     pb.close();
     pb.finish()
 }
@@ -466,7 +468,10 @@ pub struct Ctx<'a> {
 
 impl<'a> Ctx<'a> {
     pub fn fill_round(&mut self, r: R, radius: f32, c: Color) {
-        if let Some(p) = rounded_path(r.x as f32, r.y as f32, r.w as f32, r.h as f32, radius) {
+        self.fill_round_sides(r, radius, radius, c);
+    }
+    fn fill_round_sides(&mut self, r: R, left: f32, right: f32, c: Color) {
+        if let Some(p) = rounded_path(r.x as f32, r.y as f32, r.w as f32, r.h as f32, left, right) {
             self.pm
                 .fill_path(&p, &solid(c), FillRule::Winding, self.tr, None);
         }
@@ -477,7 +482,7 @@ impl<'a> Ctx<'a> {
         // to half-pixel coordinates so the stroke covers exactly one pixel.
         let width = crisp_line_width(&self.tr, width);
         let (x, y, w, h) = snap_stroke_rect(&self.tr, r, width);
-        if let Some(p) = rounded_path(x, y, w, h, radius) {
+        if let Some(p) = rounded_path(x, y, w, h, radius, radius) {
             let st = Stroke {
                 width,
                 line_cap: LineCap::Round,
@@ -570,8 +575,31 @@ impl<'a> Ctx<'a> {
 // shadows behind when a popup closes or a toolbar moves.
 pub(crate) fn surface(ctx: &mut Ctx, r: R, radius: f32, fill: Color, border: Color) {
     ctx.fill_round(r, radius, fill);
-    ctx.stroke_round(R { x: r.x + 1, y: r.y + 1, w: r.w - 2, h: r.h - 2 },
-        (radius - 1.0).max(1.0), border, 1.0);
+    ctx.stroke_round(surface_outline(r), (radius - 1.0).max(1.0), border, 1.0);
+}
+
+fn surface_outline(r: R) -> R {
+    R { x: r.x + 1, y: r.y + 1, w: r.w - 2, h: r.h - 2 }
+}
+
+pub(crate) fn panel_with_sidebar(ctx: &mut Ctx, r: R, radius: f32, sidebar_width: i32) {
+    let palette = ctx.palette;
+    let frame = surface_outline(r);
+    let inner_radius = (radius - 1.0).max(1.0);
+    let seam = r.x + sidebar_width;
+    ctx.fill_round(r, radius, c(palette.paper));
+    let sidebar = R { w: seam - frame.x, ..frame };
+    ctx.fill_round_sides(sidebar, inner_radius, 0.0, c(theme::mix(palette.paper, palette.surface, 0.65)));
+
+    // End the divider on the same device-pixel centers as the frame. Painting
+    // the shared outline last keeps both junctions flush at fractional scales.
+    let width = crisp_line_width(&ctx.tr, 1.0);
+    let (_, top, _, height) = snap_stroke_rect(&ctx.tr, frame, width);
+    let (start, _) = snap_axis_line(&ctx.tr, (seam as f32, top), (seam as f32, top + height), width);
+    if let Some(divider) = tiny_skia::Rect::from_xywh(start.0 - width / 2.0, top, width, height) {
+        ctx.pm.fill_rect(divider, &solid(alpha(palette.border, 150)), ctx.tr, None);
+    }
+    ctx.stroke_round(frame, inner_radius, c(palette.border), 1.0);
 }
 
 pub(crate) fn panel(ctx: &mut Ctx, r: R, radius: f32, opacity: f32) {
@@ -1182,7 +1210,7 @@ pub fn draw_confirm(app:&App,fonts:&Fonts,ctx:&mut Ctx) {
                 let r=R {y:r.y+6,h:r.h-12,..r};
                 surface(ctx,r,6.0,c(palette.danger_light),c(palette.danger));
                 ctx.text_center(fonts,r,"确定退出",14.0,c(palette.text));
-            } else {crate::settings_panel::button(ctx,fonts,r,"取消",false);}
+            } else {crate::settings_panel::button(ctx,fonts,r,"取消",false,14.0);}
         }
     });
 }
@@ -1244,7 +1272,7 @@ pub fn draw_input_group_prompt(app:&App,fonts:&Fonts,ctx:&mut Ctx) {
         ctx.text(fonts,line,(p.x+24) as f32,(p.y+78+i as i32*25) as f32,14.0,c(palette.muted));
     }
     for (hit,r) in input_group_prompt_controls(app) {
-        crate::settings_panel::button(ctx,fonts,r,match hit {PromptHit::Authorize=>"授权",PromptHit::Close if app.input_group_state==0=>"稍后",_=>"关闭"},hit==PromptHit::Authorize);
+        crate::settings_panel::button(ctx,fonts,r,match hit {PromptHit::Authorize=>"授权",PromptHit::Close if app.input_group_state==0=>"稍后",_=>"关闭"},hit==PromptHit::Authorize,15.0);
     }
 }
 
@@ -1585,19 +1613,7 @@ pub fn render_region(
             draw_eraser_popup(app, fonts, &mut ctx);
         }
         if app.page_picker.is_some() { draw_page_picker(app, fonts, &mut ctx); }
-        if app.settings_open {
-            draw_settings(app, fonts, &mut ctx, icon);
-        }
-        if app.process_block_open {
-            draw_process_block(app, fonts, &mut ctx);
-        }
-        if app.confirm_quit {
-            draw_confirm(app, fonts, &mut ctx);
-        }
-        if app.show_diag {
-            draw_diag(app, fonts, &mut ctx);
-        }
-        crate::settings_panel::draw_overlay(app, fonts, &mut ctx);
+        draw_preferences(app, fonts, &mut ctx, icon);
         if app.show_input_group_prompt {
             draw_input_group_prompt(app, fonts, &mut ctx);
         }
@@ -1612,23 +1628,38 @@ pub fn render_region(
 pub fn draw_settings_window(
     app: &App, fonts: &Fonts, icon: Option<&Pixmap>, pixmap: &mut Pixmap, scale: f32,
 ) {
+    draw_settings_surface(app, fonts, icon, pixmap, scale, c(app.palette().paper));
+}
+
+pub(crate) fn draw_settings_surface(
+    app: &App, fonts: &Fonts, icon: Option<&Pixmap>, pixmap: &mut Pixmap, scale: f32, background: Color,
+) {
     let palette = app.palette();
-    pixmap.fill(c(palette.paper));
+    pixmap.fill(background);
     let mut ctx = Ctx { palette, pm: pixmap, tr: Transform::from_scale(scale, scale) };
+    draw_preferences(app, fonts, &mut ctx, icon);
+    draw_press_feedback(app, &mut ctx);
+}
+
+fn draw_preferences(app: &App, fonts: &Fonts, ctx: &mut Ctx, icon: Option<&Pixmap>) {
+    if !app.settings_open && !app.process_block_open && !app.show_diag && !app.confirm_quit
+        && app.settings_ui.dialog.is_none() && app.settings_ui.picker.is_none() {
+        return;
+    }
+    let fonts = &fonts.for_settings();
     if app.settings_open {
-        draw_settings(app, fonts, &mut ctx, icon);
+        draw_settings(app, fonts, ctx, icon);
     }
     if app.process_block_open {
-        draw_process_block(app, fonts, &mut ctx);
+        draw_process_block(app, fonts, ctx);
     }
     if app.show_diag {
-        draw_diag(app, fonts, &mut ctx);
+        draw_diag(app, fonts, ctx);
     }
     if app.confirm_quit {
-        draw_confirm(app, fonts, &mut ctx);
+        draw_confirm(app, fonts, ctx);
     }
-    crate::settings_panel::draw_overlay(app, fonts, &mut ctx);
-    draw_press_feedback(app, &mut ctx);
+    crate::settings_panel::draw_overlay(app, fonts, ctx);
 }
 
 fn draw_launch_piece(app: &App, ctx: &mut Ctx, target: R, visible: R, r: R,

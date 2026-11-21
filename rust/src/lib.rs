@@ -1169,11 +1169,11 @@ fn handle_process_hit(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
     rt.redraw_full(app);
 }
 
-/// X11 defaults to the 3.1 overlay panel because managed windows are blurred
-/// by UKUI/KWin; Wayland keeps the native window. Explicit env overrides win.
+/// Real X11 keeps its overlay panel. Under XWayland an independent Wayland
+/// surface can follow the monitor scale even when the overlay is upscaled.
 #[cfg(unix)]
-fn use_native_settings(x11_backend: bool, force_overlay: bool, force_native: bool) -> bool {
-    force_native || (!force_overlay && !x11_backend)
+fn use_native_settings(native_x11: bool, force_overlay: bool, force_native: bool) -> bool {
+    force_native || (!force_overlay && !native_x11)
 }
 
 pub fn open_settings(rt: &Rt, app: &mut App) {
@@ -1201,25 +1201,18 @@ pub fn open_settings(rt: &Rt, app: &mut App) {
     close_all_popups(rt, app);
     #[cfg(unix)]
     {
-        let force_overlay = std::env::var_os("SIDERA_SETTINGS_OVERLAY").is_some();
-        let force_native = std::env::var_os("SIDERA_SETTINGS_NATIVE").is_some();
-        // 3.1 drew settings on the override-redirect overlay and was sharp on
-        // UKUI/KWin X11. The managed native window introduced in 3.2 is blurred
-        // by some X11 compositors, so X11 defaults back to the overlay path.
-        // SIDERA_SETTINGS_NATIVE=1 opts back into the native window.
-        let x11_backend = rt.backend.as_any().is::<crate::x11::X11Plat>();
-        let use_native = use_native_settings(x11_backend, force_overlay, force_native);
-        if !use_native || app.launch.active() || app.show_input_group_prompt {
+        if app.launch.active() || app.show_input_group_prompt {
             crate::diag_log::info("设置窗口：使用覆盖层绘制");
         } else {
             match settings_window::Window::open(rt, app) {
-                Ok(window) => {
+                Ok(Some(window)) => {
                     app.settings_ui.window = Some(window);
                     crate::diag_log::info("设置窗口：使用原生窗口");
                     // The annotation canvas stays intact while the preferences
                     // window is open. Clear only its presentation surface.
                     rt.render(app, R { x: 0, y: 0, w: app.screen_w, h: app.screen_h });
                 }
+                Ok(None) => crate::diag_log::info("设置窗口：使用覆盖层绘制"),
                 Err(error) => {
                     log::info!("独立设置窗口不可用，使用原有设置面板：{error}");
                     crate::diag_log::warn(&format!("设置窗口回退到覆盖层：{error}"));

@@ -40,8 +40,31 @@ use crate::{app::App, settings_window::WindowEvent, ui::{self, Ctx, R},
 
 const BORDER: i32 = 7;
 const TITLE: i32 = 40;
-const MIN_WIDTH: u32 = (360 + BORDER * 2) as u32;
-const MIN_HEIGHT: u32 = (340 + TITLE + BORDER) as u32;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Decorations {
+    Panel,
+    TitleBar,
+}
+
+impl Decorations {
+    fn insets(self) -> (i32, i32) {
+        match self {
+            Self::Panel => (0, 0),
+            Self::TitleBar => (BORDER, TITLE),
+        }
+    }
+
+    fn content_size(self, (width, height): (i32, i32)) -> (i32, i32) {
+        let (border, title) = self.insets();
+        ((width - 2 * border).max(1), (height - title - border).max(1))
+    }
+
+    fn content_point(self, x: i32, y: i32) -> (i32, i32) {
+        let (border, title) = self.insets();
+        (x - border, y - title)
+    }
+}
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -88,11 +111,15 @@ struct State {
     pool: SlotPool,
     buffers: [Option<Buffer>; 2],
     size: (i32, i32),
+    decorations: Decorations,
+    panel_drag_region: Option<R>,
     scale: f64,
     configured: bool,
     dirty: bool,
     maximized: bool,
-    fractional: Option<WpFractionalScaleV1>,
+    // Keep the protocol object for the lifetime of the window.
+    _fractional: Option<WpFractionalScaleV1>,
+    received_preferred_scale: bool,
     viewport: Option<WpViewport>,
     activation_retry: bool,
     repeat_rate: i32,
@@ -101,7 +128,7 @@ struct State {
 }
 
 impl WaylandWindow {
-    pub(crate) fn open(app: &App) -> Result<Self> {
+    pub(crate) fn open(app: &App, decorations: Decorations) -> Result<Self> {
         let connection = Connection::connect_to_env()?;
         let (globals, event_queue) = registry_queue_init(&connection)?;
         let queue = event_queue.handle();
@@ -112,14 +139,20 @@ impl WaylandWindow {
         let shm = Shm::bind(&globals, &queue)?;
         let pool = SlotPool::new(4096, &shm)?;
         let surface = compositor.create_surface(&queue);
-        let fractional = globals.bind::<WpFractionalScaleManagerV1, _, _>(&queue, 1..=1, ()).ok()
-            .map(|manager| manager.get_fractional_scale(&surface, &queue, ()));
         let viewport = globals.bind::<WpViewporter, _, _>(&queue, 1..=1, ()).ok()
             .map(|viewporter| viewporter.get_viewport(&surface, &queue, ()));
+        let fractional = viewport.as_ref().and_then(|_| {
+            let manager = globals.bind::<WpFractionalScaleManagerV1, _, _>(&queue, 1..=1, ()).ok()?;
+            Some(manager.get_fractional_scale(&surface, &queue, ()))
+        });
+        let scale = crate::wayland::render_scale(app.scale, viewport.is_some(), surface.version());
         let window = shell.create_window(surface, WindowDecorations::ClientOnly, &queue);
         window.set_title("Sidera · 偏好设置");
         window.set_app_id("sidera");
-        window.set_min_size(Some((MIN_WIDTH, MIN_HEIGHT)));
+        let (border, title) = decorations.insets();
+        let min_width = 360 + 2 * border;
+        let min_height = 340 + title + border;
+        window.set_min_size(Some((min_width as u32, min_height as u32)));
         window.commit();
         connection.flush()?;
         let state = State {
@@ -127,10 +160,11 @@ impl WaylandWindow {
             seats: SeatState::new(&globals, &queue), outputs: OutputState::new(&globals, &queue),
             shm, activation: ActivationState::bind(&globals, &queue).ok(),
             devices: Vec::new(), touch: None, events: Vec::new(), pool, buffers: [None, None],
-            size: ((860 + BORDER * 2).min(app.screen_w - 24).max(MIN_WIDTH as i32),
-                (620 + TITLE + BORDER).min(app.screen_h - 24).max(MIN_HEIGHT as i32)),
-            scale: 1.0, configured: false, dirty: true, maximized: false,
-            fractional, viewport, activation_retry: false,
+            size: ((860 + 2 * border).min(app.screen_w - 24).max(min_width),
+                (620 + title + border).min(app.screen_h - 24).max(min_height)),
+            decorations, panel_drag_region: None,
+            scale, configured: false, dirty: true, maximized: false,
+            _fractional: fractional, received_preferred_scale: false, viewport, activation_retry: false,
             repeat_rate: 25, repeat_delay: 600, repeat: None,
         };
         let result = Self {
@@ -154,17 +188,20 @@ impl WaylandWindow {
     }
 
     pub(crate) fn logical_size(&self) -> (i32, i32) {
-        let (width, height) = self.transport.borrow().state.size;
-        ((width - 2 * BORDER).max(1), (height - TITLE - BORDER).max(1))
+        let transport = self.transport.borrow();
+        transport.state.decorations.content_size(transport.state.size)
     }
 
     pub(crate) fn invalidate(&self) {
         self.transport.borrow_mut().state.dirty = true;
     }
 
-    pub(crate) fn events(&self) -> Result<Vec<WindowEvent>> {
+    pub(crate) fn events(&self, app: &App) -> Result<Vec<WindowEvent>> {
+        // Layout reads logical_size() from this window.
+        let drag_region = crate::settings_panel::window_drag_region(app);
         let mut transport = self.transport.borrow_mut();
         let Transport { event_loop, state, .. } = &mut *transport;
+        state.panel_drag_region = drag_region;
         event_loop.dispatch(Duration::ZERO, state)?;
         let now = Instant::now();
         while let Some(repeat) = state.repeat.as_mut() {
@@ -180,27 +217,29 @@ impl WaylandWindow {
     pub(crate) fn paint(&self, rt: &Rt, app: &App) {
         // Drawing the common UI consults logical_size(), so release the
         // transport borrow before calling the renderer.
-        let (size, scale, viewport, buffer) = {
+        let (size, decorations, render_scale, buffer) = {
             let mut transport = self.transport.borrow_mut();
             let state = &mut transport.state;
             if !state.configured || !state.dirty { return; }
             let Some(buffer) = state.available_buffer() else { return };
-            (state.size, state.scale, state.viewport.is_some(), buffer)
+            (state.size, state.decorations, state.scale, buffer)
         };
-        // Without wp_viewport a fractional scale cannot be represented, so use
-        // the nearest integer buffer scale instead.
-        let render_scale = if viewport { scale.clamp(1.0, 4.0) } else { scale.round().clamp(1.0, 4.0) };
         let (width, height) = size;
-        let body_w = (((width - 2 * BORDER) as f64) * render_scale).round().max(1.0) as u32;
-        let body_h = (((height - TITLE - BORDER) as f64) * render_scale).round().max(1.0) as u32;
-        let frame_w = ((width as f64) * render_scale).round().max(1.0) as u32;
-        let frame_h = ((height as f64) * render_scale).round().max(1.0) as u32;
+        let (content_w, content_h) = decorations.content_size(size);
+        let pixels = |logical: i32| (f64::from(logical) * render_scale).round().max(1.0) as u32;
+        let (body_w, body_h) = (pixels(content_w), pixels(content_h));
         let mut body_cache = self.body.borrow_mut();
         if body_cache.as_ref().is_none_or(|body| body.width() != body_w || body.height() != body_h) {
             *body_cache = Pixmap::new(body_w, body_h);
         }
         let Some(body) = body_cache.as_mut() else { return };
+        if decorations == Decorations::Panel {
+            ui::draw_settings_surface(app, &rt.fonts, rt.icon.as_ref(), body, render_scale as f32, tiny_skia::Color::TRANSPARENT);
+            self.present(body, buffer);
+            return;
+        }
         ui::draw_settings_window(app, &rt.fonts, rt.icon.as_ref(), body, render_scale as f32);
+        let (frame_w, frame_h) = (pixels(width), pixels(height));
         let mut frame_cache = self.frame.borrow_mut();
         if frame_cache.as_ref().is_none_or(|frame| frame.width() != frame_w || frame.height() != frame_h) {
             *frame_cache = Pixmap::new(frame_w, frame_h);
@@ -212,13 +251,17 @@ impl WaylandWindow {
         let title = (TITLE as f64 * render_scale).round() as i32;
         frame.draw_pixmap(border, title, body.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
         let mut ctx = Ctx { palette, pm: frame, tr: Transform::from_scale(render_scale as f32, render_scale as f32) };
-        ctx.text(&rt.fonts, "Sidera · 偏好设置", 16.0, 25.0, 14.0, c(palette.text));
+        ctx.text(&rt.fonts.for_settings(), "Sidera · 偏好设置", 16.0, 25.0, 14.0, c(palette.text));
         let close = close_rect(width);
         ctx.fill_round(close, 5.0, alpha(palette.border, 100));
         let x = (close.x + close.w / 2) as f32;
         let y = (close.y + close.h / 2) as f32;
         ctx.stroke_line((x - 4.0, y - 4.0), (x + 4.0, y + 4.0), c(palette.text), 1.5);
         ctx.stroke_line((x - 4.0, y + 4.0), (x + 4.0, y - 4.0), c(palette.text), 1.5);
+        self.present(frame, buffer);
+    }
+
+    fn present(&self, frame: &Pixmap, buffer: usize) {
         let mut transport = self.transport.borrow_mut();
         if let Err(error) = transport.state.present(frame, buffer) {
             log::warn!("无法绘制 Wayland 设置窗口：{error}");
@@ -244,13 +287,13 @@ impl State {
         if self.buffers[index].as_ref().is_none_or(|buffer|
             buffer.height() != height || buffer.stride() != width * 4) {
             self.buffers[index] = None;
-            let (buffer, _) = self.pool.create_buffer(width, height, width * 4, wl_shm::Format::Xrgb8888)?;
+            let (buffer, _) = self.pool.create_buffer(width, height, width * 4, wl_shm::Format::Argb8888)?;
             self.buffers[index] = Some(buffer);
         }
         let buffer = self.buffers[index].as_ref().unwrap();
         let Some(bytes) = buffer.canvas(&mut self.pool) else { return Ok(()) };
         for (dst, src) in bytes.chunks_exact_mut(4).zip(frame.data().chunks_exact(4)) {
-            dst.copy_from_slice(&[src[2], src[1], src[0], 255]);
+            dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
         }
         let surface = self.window.wl_surface();
         if let Some(viewport) = self.viewport.as_ref() {
@@ -286,14 +329,16 @@ impl State {
 
     /// Return true when the press belongs to the shared settings contents.
     fn press(&mut self, seat: &wl_seat::WlSeat, serial: u32, x: i32, y: i32) -> bool {
+        let titled = self.decorations == Decorations::TitleBar;
         if let Some(edge) = self.resize_edge(x, y) {
             self.window.resize(seat, serial, edge);
-        } else if close_rect(self.size.0).contains(x, y) {
+        } else if titled && close_rect(self.size.0).contains(x, y) {
             self.events.push(WindowEvent::Close);
-        } else if y < TITLE {
+        } else if (titled && y < TITLE) || (!titled && self.panel_drag_region.is_some_and(|r| r.contains(x, y))) {
             self.window.move_(seat, serial);
         } else {
-            self.events.push(WindowEvent::Press(x - BORDER, y - TITLE));
+            let (cx, cy) = self.decorations.content_point(x, y);
+            self.events.push(WindowEvent::Press(cx, cy));
             return true;
         }
         false
@@ -336,9 +381,9 @@ impl WindowHandler for State {
 
 impl CompositorHandler for State {
     fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &wl_surface::WlSurface, factor: i32) {
-        // wp_fractional_scale_v1 supersedes the integer surface scale when present.
-        if self.fractional.is_some() { return; }
-        let factor = if surface.version() >= 3 { f64::from(factor.clamp(1, 4)) } else { 1.0 };
+        // Use output scale while waiting for the surface's first preference.
+        if self.received_preferred_scale { return; }
+        let factor = crate::wayland::render_scale(f64::from(factor), self.viewport.is_some(), surface.version());
         if crate::app::valid_geometry(self.size.0, self.size.1, factor) {
             self.scale = factor;
             self.dirty = true;
@@ -414,7 +459,7 @@ impl PointerHandler for State {
         for event in events {
             if &event.surface != self.window.wl_surface() { continue; }
             let (x, y) = (event.position.0 as i32, event.position.1 as i32);
-            let (local_x, local_y) = (x - BORDER, y - TITLE);
+            let (local_x, local_y) = self.decorations.content_point(x, y);
             match event.kind {
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                     let cursor = match self.resize_edge(x, y) {
@@ -432,7 +477,7 @@ impl PointerHandler for State {
                 PointerEventKind::Leave { .. } => self.events.push(WindowEvent::Motion(-1, -1)),
                 PointerEventKind::Press { button: 0x110, serial, .. } => { self.press(&seat, serial, x, y); }
                 PointerEventKind::Release { button: 0x110, .. } => self.events.push(WindowEvent::Release(local_x, local_y)),
-                PointerEventKind::Axis { vertical, .. } if y >= TITLE => {
+                PointerEventKind::Axis { vertical, .. } if local_y >= 0 => {
                     let pages = if vertical.discrete != 0 { f64::from(vertical.discrete) } else { vertical.absolute / 40.0 };
                     self.events.push(WindowEvent::Scroll(local_x, local_y, pages));
                 }
@@ -452,13 +497,14 @@ impl Dispatch<wl_touch::WlTouch, ()> for State {
                     .map(|device| device.seat.clone()) else { return };
                 let (x, y) = (x as i32, y as i32);
                 if state.press(&seat, serial, x, y) {
-                    state.touch = Some((touch.clone(), id, x - BORDER, y - TITLE));
+                    let (cx, cy) = state.decorations.content_point(x, y);
+                    state.touch = Some((touch.clone(), id, cx, cy));
                 }
             }
             wl_touch::Event::Motion { id, x, y, .. } => {
                 if let Some((active, contact, cx, cy)) = &mut state.touch {
                     if active == touch && *contact == id {
-                        (*cx, *cy) = (x as i32 - BORDER, y as i32 - TITLE);
+                        (*cx, *cy) = state.decorations.content_point(x as i32, y as i32);
                         state.events.push(WindowEvent::Motion(*cx, *cy));
                     }
                 }
@@ -533,6 +579,7 @@ impl Dispatch<WpFractionalScaleV1, ()> for State {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
             let factor = (scale as f64 / 120.0).clamp(1.0, 4.0);
             if crate::app::valid_geometry(state.size.0, state.size.1, factor) {
+                state.received_preferred_scale = true;
                 state.scale = factor;
                 state.dirty = true;
             }

@@ -182,7 +182,7 @@ fn shm_layout(w: i32, h: i32) -> Option<(i32, usize)> {
     Some((stride, len as usize))
 }
 
-fn render_scale(requested: f64, viewport: bool, surface_version: u32) -> f64 {
+pub(crate) fn render_scale(requested: f64, viewport: bool, surface_version: u32) -> f64 {
     let scale = if requested.is_finite() { requested.clamp(1.0, 4.0) } else { 1.0 };
     if viewport {
         scale

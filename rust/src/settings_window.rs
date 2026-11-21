@@ -11,7 +11,7 @@ use x11rb::protocol::{randr, xproto, Event};
 use x11rb::wrapper::ConnectionExt as _;
 
 use crate::{app::App, ui, x11::{XResult, X11}, Ip, Rt, WpsBridge};
-use crate::settings_wayland::WaylandWindow;
+use crate::settings_wayland::{Decorations, WaylandWindow};
 
 pub(crate) enum Window {
     X11(Box<X11Window>),
@@ -30,14 +30,26 @@ pub(crate) enum WindowEvent {
 }
 
 impl Window {
-    pub(crate) fn open(rt: &Rt, app: &App) -> XResult<Rc<Self>> {
-        if !rt.backend.as_any().is::<crate::x11::X11Plat>() {
-            match WaylandWindow::open(app) {
-                Ok(window) => return Ok(Rc::new(Self::Wayland(window))),
+    pub(crate) fn open(rt: &Rt, app: &App) -> XResult<Option<Rc<Self>>> {
+        let x11 = rt.backend.as_any().downcast_ref::<crate::x11::X11Plat>();
+        let native_x11 = x11.is_some_and(|backend| !backend.x11.is_xwayland);
+        let force_overlay = std::env::var_os("SIDERA_SETTINGS_OVERLAY").is_some();
+        let force_native = std::env::var_os("SIDERA_SETTINGS_NATIVE").is_some();
+        if !crate::use_native_settings(native_x11, force_overlay, force_native) {
+            return Ok(None);
+        }
+        if !native_x11 {
+            let decorations = if x11.is_some() { Decorations::Panel } else { Decorations::TitleBar };
+            match WaylandWindow::open(app, decorations) {
+                Ok(window) => return Ok(Some(Rc::new(Self::Wayland(window)))),
+                // A compatibility session without access to xdg-shell still
+                // has its original X11 overlay available.
+                Err(error) if x11.is_some() && !force_native => return Err(error),
                 Err(error) => log::info!("原生设置窗口不可用：{error}"),
             }
         }
-        Ok(Rc::new(Self::X11(Box::new(X11Window::open(app, rt.backend.device_pixel_ratio())?))))
+        let window = X11Window::open(app, rt.backend.device_pixel_ratio())?;
+        Ok(Some(Rc::new(Self::X11(Box::new(window)))))
     }
 
     pub(crate) fn raise(&self) {
@@ -68,10 +80,10 @@ impl Window {
         }
     }
 
-    fn events(&self) -> XResult<Vec<WindowEvent>> {
+    fn events(&self, app: &App) -> XResult<Vec<WindowEvent>> {
         match self {
             Self::X11(window) => window.events(),
-            Self::Wayland(window) => window.events(),
+            Self::Wayland(window) => window.events(app),
         }
     }
 }
@@ -197,8 +209,8 @@ impl X11Window {
         // compositor to bypass it whenever the desktop supports the hint.
         if std::env::var_os("SIDERA_SETTINGS_KEEP_COMPOSITOR").is_none() {
             x11.conn.change_property32(PropMode::REPLACE, id, bypass,
-                AtomEnum::CARDINAL, &[2])?.check()?;
-            crate::diag_log::info("设置窗口：请求合成器 bypass（_NET_WM_BYPASS_COMPOSITOR=2）");
+                AtomEnum::CARDINAL, &[1])?.check()?;
+            crate::diag_log::info("设置窗口：请求合成器 bypass（_NET_WM_BYPASS_COMPOSITOR=1）");
         }
         x11.conn.map_window(id)?.check()?;
         x11.conn.flush()?;
@@ -390,7 +402,7 @@ pub(crate) fn close(rt: &Rt, app: &mut App, ip: &mut Ip) {
 /// Returns true when a settings window supplied input to this display's App.
 pub(crate) fn poll(rt: &Rt, app: &mut App, ip: &mut Ip, wps: Option<&WpsBridge>) -> bool {
     let Some(window) = app.settings_ui.window.clone() else { return false };
-    let events = match window.events() {
+    let events = match window.events(app) {
         Ok(events) => events,
         Err(error) => {
             log::warn!("设置窗口连接已断开：{error}");
