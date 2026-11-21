@@ -115,6 +115,9 @@ pub enum WhiteboardControl {
     ZoomSlider,
     SizeSlider,
     ShapeSlider,
+    Value(crate::conic::Parameter),
+    ParameterTab(crate::conic::Parameter),
+    ResetView,
     Done,
     Delete,
     SelDone,
@@ -148,19 +151,8 @@ pub fn control_enabled(app: &App, control: Control) -> bool {
     }
     if matches!(control, Control::PageCount(_)) { return app.page_picker_context().is_some(); }
     if matches!(control, Control::Sidebar(Btn::Restore, _)) { return app.can_restore_cleared(); }
-    if matches!(control, Control::Whiteboard(
-        WhiteboardControl::ZoomSlider | WhiteboardControl::SizeSlider
-        | WhiteboardControl::ShapeSlider | WhiteboardControl::Done | WhiteboardControl::Delete
-    )) {
-        let editing = app.whiteboard && app.coord.is_some_and(|c| c.editing);
-        return editing && match control {
-            Control::Whiteboard(WhiteboardControl::ShapeSlider) =>
-                app.coord.is_some_and(|c| c.conic != crate::app::ConicKind::None),
-            _ => true,
-        };
-    }
-    if matches!(control, Control::Whiteboard(WhiteboardControl::SelDone | WhiteboardControl::SelCancel)) {
-        return app.whiteboard && app.floating.is_some();
+    if let Control::Whiteboard(hit) = control {
+        return whiteboard::control_bounds(app, hit).is_some();
     }
     true
 }
@@ -214,20 +206,18 @@ pub fn control_at(app: &App, x: i32, y: i32) -> Option<Control> {
         return settings_slider_hit(app, x, y).map(|s| Control::Slider(s.id))
             .or_else(|| settings_hit(app, x, y).map(Control::Setting));
     }
-    if app.whiteboard {
-        if let Some(hit) = whiteboard_hit(app, x, y) { return Some(Control::Whiteboard(hit)); }
-    }
     if app.page_picker.is_some() && page_picker_rect(app).contains(x, y) {
         return page_picker_hit(app, x, y).map(Control::PagePicker);
     }
-    if app.pen_popup_visible {
-        if let Some(hit) = pen_popup_hit(app, x, y) { return Some(Control::Popup(hit)); }
+    if app.pen_popup_visible && pen_popup_rect(app).contains(x, y) {
+        return pen_popup_hit(app, x, y).map(Control::Popup);
     }
-    if app.eraser_popup_visible {
-        if let Some(hit) = eraser_popup_hit(app, x, y) { return Some(Control::Popup(hit)); }
+    if app.eraser_popup_visible && eraser_popup_rect(app).contains(x, y) {
+        return eraser_popup_hit(app, x, y).map(Control::Popup);
     }
     page_count_at(app, x, y).map(Control::PageCount)
         .or_else(|| sidebar_button_at(app, x, y).map(|(b, right)| Control::Sidebar(b, right)))
+        .or_else(|| whiteboard_hit(app, x, y).map(Control::Whiteboard))
 }
 
 pub fn control_rect(app: &App, control: Control) -> Option<R> {
@@ -266,22 +256,7 @@ pub fn control_rect(app: &App, control: Control) -> Option<R> {
         Control::Sidebar(b, right) => sidebar_buttons(app, right).into_iter().find(|(k, _)| *k == b).map(|(_, r)| r),
         Control::Setting(hit) if app.settings_open => settings_controls(app).into_iter().find(|(k, _)| *k == hit).map(|(_, r)| r),
         Control::Slider(id) if app.settings_open => settings_sliders(app).into_iter().find(|s| s.id == id).map(|s| s.hit),
-        Control::Whiteboard(WhiteboardControl::Empty) if app.whiteboard => Some(wb_button_rect(app, 0)),
-        Control::Whiteboard(WhiteboardControl::Ellipse) if app.whiteboard => Some(wb_button_rect(app, 1)),
-        Control::Whiteboard(WhiteboardControl::Hyperbola) if app.whiteboard => Some(wb_button_rect(app, 2)),
-        Control::Whiteboard(WhiteboardControl::Parabola) if app.whiteboard => Some(wb_button_rect(app, 3)),
-        Control::Whiteboard(WhiteboardControl::Select) if app.whiteboard => Some(wb_button_rect(app, 4)),
-        Control::Whiteboard(WhiteboardControl::Direction(kind, direction)) if app.whiteboard => {
-            kind.directions().iter().position(|(d, _)| *d == direction)
-                .map(|index| direction_option_rect(app, kind, index))
-        }
-        Control::Whiteboard(WhiteboardControl::ZoomSlider) if app.whiteboard => Some(wb_zoom_slider_rect(app)),
-        Control::Whiteboard(WhiteboardControl::SizeSlider) if app.whiteboard => Some(wb_size_slider_rect(app)),
-        Control::Whiteboard(WhiteboardControl::ShapeSlider) if app.whiteboard => Some(wb_shape_slider_rect(app)),
-        Control::Whiteboard(WhiteboardControl::Done) if app.whiteboard => Some(wb_done_rect(app)),
-        Control::Whiteboard(WhiteboardControl::Delete) if app.whiteboard => Some(wb_delete_rect(app)),
-        Control::Whiteboard(WhiteboardControl::SelDone) if app.whiteboard => Some(selection_done_rect(app)),
-        Control::Whiteboard(WhiteboardControl::SelCancel) if app.whiteboard => Some(selection_cancel_rect(app)),
+        Control::Whiteboard(hit) => whiteboard::control_bounds(app, hit),
         Control::Popup(PopupHit::Color(i)) if app.pen_popup_visible && i < 10 => {
             let p = pen_popup_rect(app);
             Some(R { x: p.x + 16 + (i % 4) as i32 * 48, y: p.y + 46 + (i / 4) as i32 * 48, w: 38, h: 38 })
@@ -529,19 +504,18 @@ impl<'a> Ctx<'a> {
             self.pm.stroke_path(&p, &solid(c), &st, self.tr, None);
         }
     }
-    /// Yellow/black hazard dashes for the rectangular selection outline.
-    pub fn stroke_hazard(&mut self, points: &[(f32, f32)], closed: bool) {
+    /// Alternate contrasting strokes so the selection remains visible over handwriting.
+    pub fn stroke_selection(&mut self, points: &[(f32, f32)], closed: bool) {
         if points.len() < 2 { return; }
         let mut pb = PathBuilder::new();
         pb.move_to(points[0].0, points[0].1);
         for &(x, y) in &points[1..] { pb.line_to(x, y); }
         if closed { pb.close(); }
         let Some(p) = pb.finish() else { return };
-        for (color, offset) in [(Color::from_rgba8(255, 193, 7, 255), 0.0f32),
-                                (Color::from_rgba8(15, 15, 15, 255), 8.0f32)] {
+        for (color, offset) in [(c(self.palette.accent), 0.0f32), (c(self.palette.paper), 6.0f32)] {
             let st = Stroke {
                 width: 2.0,
-                dash: StrokeDash::new(vec![8.0, 8.0], offset),
+                dash: StrokeDash::new(vec![6.0, 6.0], offset),
                 line_cap: tiny_skia::LineCap::Butt,
                 ..Default::default()
             };
@@ -890,128 +864,39 @@ pub fn eraser_popup_hit(app: &App, x: i32, y: i32) -> Option<PopupHit> {
 }
 
 
-pub fn whiteboard_bar_rect(app: &App) -> R {
-    let w = 560.min((app.screen_w - 32).max(240));
-    R { x: (app.screen_w - w) / 2, y: app.screen_h - 74, w, h: 58 }
+#[path = "ui/whiteboard.rs"]
+mod whiteboard;
+pub use whiteboard::{direction_menu_rect, selection_bar_rect, whiteboard_bar_rect,
+    whiteboard_edit_bar_rect, whiteboard_hit, whiteboard_ui_contains};
+use whiteboard::draw_whiteboard_controls;
+pub(crate) fn whiteboard_fraction_at(app: &App, p: crate::conic::Parameter, x: i32) -> f32 {
+    whiteboard::fraction_at(app, p, x)
+}
+pub(crate) fn whiteboard_panel_contains(app: &App, x: i32, y: i32) -> bool {
+    whiteboard::panel_contains(app, x, y)
+}
+pub(crate) fn whiteboard_value_rect(app: &App, field: crate::conic::Parameter) -> Option<R> {
+    whiteboard::control_bounds(app, WhiteboardControl::Value(field))
 }
 
-const WB_BUTTONS: [(crate::app::ConicKind, &str); 4] = [
-    (crate::app::ConicKind::None, "空坐标系"),
-    (crate::app::ConicKind::Ellipse, "椭圆"),
-    (crate::app::ConicKind::Hyperbola, "双曲线"),
-    (crate::app::ConicKind::Parabola, "抛物线"),
-];
-
-fn wb_button_rect(app: &App, index: usize) -> R {
-    let bar = whiteboard_bar_rect(app);
-    let pad = 12;
-    let gap = 6;
-    const BUTTONS: i32 = 5;
-    let bw = ((bar.w - pad * 2 - gap * (BUTTONS - 1)) / BUTTONS).max(1);
-    R { x: bar.x + pad + index as i32 * (bw + gap), y: bar.y + 8, w: bw, h: 42 }
+fn board_palette(app: &App) -> theme::Palette {
+    let preference = if app.whiteboard_bg_index == 0 { theme::Preference::Dark } else { theme::Preference::Light };
+    theme::Theme { preference, ..app.theme }.palette()
 }
-
-fn wb_shape_index(kind: crate::app::ConicKind) -> Option<usize> {
-    match kind {
-        crate::app::ConicKind::Ellipse => Some(1),
-        crate::app::ConicKind::Hyperbola => Some(2),
-        crate::app::ConicKind::Parabola => Some(3),
-        crate::app::ConicKind::None => None,
-    }
-}
-
-pub fn direction_menu_rect(app: &App, kind: crate::app::ConicKind) -> R {
-    let Some(index) = wb_shape_index(kind) else { return R { x: 0, y: 0, w: 1, h: 1 } };
-    let button = wb_button_rect(app, index);
-    let count = kind.directions().len() as i32;
-    let w = 136;
-    let h = count * 42 + 12;
-    let x = (button.x + button.w / 2 - w / 2).clamp(0, (app.screen_w - w).max(0));
-    let y = (button.y - h - 8).clamp(8, (app.screen_h - h).max(8));
-    R { x, y, w, h }
-}
-
-fn direction_option_rect(app: &App, kind: crate::app::ConicKind, index: usize) -> R {
-    let menu = direction_menu_rect(app, kind);
-    R { x: menu.x + 6, y: menu.y + 6 + index as i32 * 42, w: menu.w - 12, h: 38 }
-}
-
-pub fn selection_bar_rect(app: &App) -> R {
-    let bar = whiteboard_bar_rect(app);
-    R { x: (app.screen_w - 220) / 2, y: (bar.y - 66).max(8), w: 220, h: 52 }
-}
-
-fn selection_cancel_rect(app: &App) -> R {
-    let bar = selection_bar_rect(app);
-    R { x: bar.x + 8, y: bar.y + 7, w: 96, h: 38 }
-}
-
-fn selection_done_rect(app: &App) -> R {
-    let bar = selection_bar_rect(app);
-    R { x: bar.x + bar.w - 104, y: bar.y + 7, w: 96, h: 38 }
-}
-
-fn wb_has_conic(app: &App) -> bool {
-    app.coord.is_some_and(|c| c.conic != crate::app::ConicKind::None)
-}
-
-pub fn whiteboard_edit_bar_rect(app: &App) -> R {
-    let bar = whiteboard_bar_rect(app);
-    let has_conic = wb_has_conic(app);
-    let w = if has_conic { 760 } else { 600 };
-    let w = w.min((app.screen_w - 32).max(420));
-    R { x: (app.screen_w - w) / 2, y: (bar.y - 86).max(8), w, h: 68 }
-}
-
-fn wb_done_rect(app: &App) -> R {
-    let bar = whiteboard_edit_bar_rect(app);
-    R { x: bar.x + bar.w - 84, y: bar.y + 15, w: 72, h: 38 }
-}
-
-fn wb_delete_rect(app: &App) -> R {
-    let done = wb_done_rect(app);
-    R { x: done.x - 82, y: done.y, w: 72, h: 38 }
-}
-
-fn wb_slider_count(app: &App) -> i32 {
-    if wb_has_conic(app) { 3 } else { 2 }
-}
-
-fn wb_slider_slot(app: &App, index: i32) -> R {
-    let bar = whiteboard_edit_bar_rect(app);
-    let left = bar.x + 16;
-    let right = (wb_delete_rect(app).x - 16).max(left + 60);
-    let n = wb_slider_count(app);
-    let gap = 16;
-    let w = ((right - left - gap * (n - 1)) / n).max(40);
-    R { x: left + index * (w + gap), y: bar.y + 6, w, h: 54 }
-}
-
-fn wb_slider_track(slot: R) -> R {
-    R { x: slot.x, y: slot.y + 30, w: slot.w, h: 18 }
-}
-
-fn wb_zoom_slider_rect(app: &App) -> R {
-    wb_slider_track(wb_slider_slot(app, 0))
-}
-
-fn wb_shape_slider_rect(app: &App) -> R {
-    wb_slider_track(wb_slider_slot(app, 1))
-}
-
-fn wb_size_slider_rect(app: &App) -> R {
-    let index = if wb_has_conic(app) { 2 } else { 1 };
-    wb_slider_track(wb_slider_slot(app, index))
-}
+#[cfg(test)]
+use whiteboard::{wb_button_rect, wb_slider_rect, wb_action_rect};
 
 pub fn coord_origin(app: &App) -> Option<(f32, f32)> {
     app.coord.as_ref().map(|c| (c.origin_x, c.origin_y))
 }
 
 pub fn coord_rotate_handle(app: &App) -> Option<(f32, f32)> {
-    // Fixed screen-space handle above the origin: the conic foci can sit on
-    // either axis, so an axis-aligned handle would often overlap them.
-    app.coord.as_ref().map(|c| (c.origin_x, c.origin_y - 76.0))
+    app.coord.as_ref().map(|c| {
+        let (sin, cos) = c.rotation.sin_cos();
+        let dy = if whiteboard::top_editor(app) { 40.0 } else { -50.0 };
+        let dx = if dy > 0.0 { 40.0 } else { 50.0 };
+        (c.origin_x + dx * cos - dy * sin, c.origin_y + dx * sin + dy * cos)
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1032,75 +917,6 @@ pub fn coord_handle_at(app: &App, x: i32, y: i32) -> Option<CoordHandle> {
     None
 }
 
-pub fn whiteboard_hit(app: &App, x: i32, y: i32) -> Option<WhiteboardControl> {
-    if !app.whiteboard { return None; }
-    if let Some(kind) = app.conic_menu {
-        for (i, (_, _)) in kind.directions().iter().enumerate() {
-            if direction_option_rect(app, kind, i).contains(x, y) {
-                return Some(WhiteboardControl::Direction(kind, kind.directions()[i].0));
-            }
-        }
-    }
-    if app.coord.as_ref().is_some_and(|c| c.editing) && app.conic_menu.is_none() {
-        if wb_done_rect(app).contains(x, y) { return Some(WhiteboardControl::Done); }
-        if wb_delete_rect(app).contains(x, y) { return Some(WhiteboardControl::Delete); }
-        if wb_zoom_slider_rect(app).contains(x, y) { return Some(WhiteboardControl::ZoomSlider); }
-        if wb_size_slider_rect(app).contains(x, y) { return Some(WhiteboardControl::SizeSlider); }
-        if wb_has_conic(app) && wb_shape_slider_rect(app).contains(x, y) {
-            return Some(WhiteboardControl::ShapeSlider);
-        }
-    }
-    if app.floating.is_some() {
-        if selection_cancel_rect(app).contains(x, y) { return Some(WhiteboardControl::SelCancel); }
-        if selection_done_rect(app).contains(x, y) { return Some(WhiteboardControl::SelDone); }
-    }
-    for (i, (kind, _)) in WB_BUTTONS.iter().enumerate() {
-        if wb_button_rect(app, i).contains(x, y) {
-            return Some(match kind {
-                crate::app::ConicKind::None => WhiteboardControl::Empty,
-                crate::app::ConicKind::Ellipse => WhiteboardControl::Ellipse,
-                crate::app::ConicKind::Hyperbola => WhiteboardControl::Hyperbola,
-                crate::app::ConicKind::Parabola => WhiteboardControl::Parabola,
-            });
-        }
-    }
-    if wb_button_rect(app, 4).contains(x, y) { return Some(WhiteboardControl::Select); }
-    None
-}
-
-pub fn whiteboard_ui_contains(app: &App, x: i32, y: i32) -> bool {
-    if !app.whiteboard { return false; }
-    if whiteboard_bar_rect(app).contains(x, y) { return true; }
-    if let Some(kind) = app.conic_menu {
-        if direction_menu_rect(app, kind).contains(x, y) { return true; }
-    }
-    if app.coord.as_ref().is_some_and(|c| c.editing) && app.conic_menu.is_none()
-        && whiteboard_edit_bar_rect(app).contains(x, y) { return true; }
-    if app.floating.is_some() && selection_bar_rect(app).contains(x, y) { return true; }
-    if let Some(c) = app.coord.as_ref().filter(|c| c.editing && app.conic_menu.is_none()) {
-        let near = |p: (f32, f32), radius: f32| {
-            let dx = x as f32 - p.0; let dy = y as f32 - p.1;
-            dx * dx + dy * dy <= radius * radius
-        };
-        if near((c.origin_x, c.origin_y), 20.0) { return true; }
-        if let Some(p) = coord_rotate_handle(app) { if near(p, 18.0) { return true; } }
-    }
-    false
-}
-
-fn slider_value(rect: R, x: i32) -> f32 {
-    ((x - rect.x) as f32 / rect.w.max(1) as f32).clamp(0.0, 1.0)
-}
-
-pub fn coord_zoom_at(app: &App, x: i32) -> f32 {
-    12.0 + slider_value(wb_zoom_slider_rect(app), x) * 108.0
-}
-pub fn coord_size_at(app: &App, x: i32) -> f32 {
-    slider_value(wb_size_slider_rect(app), x)
-}
-pub fn coord_shape_at(app: &App, x: i32) -> f32 {
-    slider_value(wb_shape_slider_rect(app), x)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ProcessHit {
@@ -1412,7 +1228,7 @@ fn coord_layer_key(app: &App, coord: crate::app::CoordGuide) -> CoordLayerKey {
         h: app.screen_h,
         scale: app.scale,
         bg: app.whiteboard_bg_index,
-        palette: app.palette(),
+        palette: board_palette(app),
         origin_x: coord.origin_x,
         origin_y: coord.origin_y,
         coord_scale: coord.scale,
@@ -1431,6 +1247,7 @@ fn build_coord_layer(app: &App, fonts: &Fonts, key: CoordLayerKey, coord: crate:
     let mut ctx = Ctx { palette: key.palette, pm: &mut pm, tr: Transform::from_scale(sc, sc) };
     if let Some(bounds) = coord_bounds(&coord, 0, 0, app.screen_w, app.screen_h) {
         draw_coord_grid(fonts, &mut ctx, &coord, bounds, key.show_labels);
+        draw_axis_ends(&mut ctx, &fonts.for_settings(), &coord, app.screen_w, app.screen_h);
     }
     Some(pm)
 }
@@ -1504,8 +1321,8 @@ pub fn render_region(
         }
         if !cached { pm.fill(app.whiteboard_bg_color()); }
         if let Some(coord) = &app.coord {
-            if let Some(bounds) = coord_bounds(coord, x, y, x2, y2) {
-                let mut ctx = Ctx { palette, pm: &mut pm, tr };
+            if let Some(bounds) = coord_bounds(coord, 0, 0, app.screen_w, app.screen_h) {
+                let mut ctx = Ctx { palette: board_palette(app), pm: &mut pm, tr };
                 draw_coord_curve(&mut ctx, coord, bounds);
             }
         }
@@ -1528,10 +1345,11 @@ pub fn render_region(
                 &tiny_skia::PixmapPaint { blend_mode: BlendMode::SourceOver, ..Default::default() },
                 Transform::identity(), None);
         }
-        let mut ctx = Ctx { palette, pm: &mut pm, tr };
-        draw_coord_foci(app, fonts, &mut ctx);
+        let mut ctx = Ctx { palette: board_palette(app), pm: &mut pm, tr };
+        let board_fonts = fonts.for_settings();
+        draw_coord_foci(app, &board_fonts, &mut ctx);
         draw_selection_outline(app, &mut ctx);
-        draw_coord_handles(app, fonts, &mut ctx);
+        draw_coord_handles(app, &mut ctx);
     }
 
     if app.launch.active() {
@@ -1590,14 +1408,9 @@ pub fn render_region(
             let s = format!("第 {} 页 / {}", app.current_slide, crate::app::CACHE_BOARD);
             let mut page_ink = theme::on_color(app.whiteboard_bg_color());
             page_ink.set_alpha(0.70);
-            ctx.text(
-                fonts,
-                &s,
-                16.0,
-                app.screen_h as f32 - 22.0,
-                20.0,
-                page_ink,
-            );
+            if whiteboard_bar_rect(app).x as f32 > fonts.text_width(&s, 20.0) + 24.0 {
+                ctx.text(fonts, &s, 16.0, app.screen_h as f32 - 22.0, 20.0, page_ink);
+            }
             if crate::app::now_ms() < app.wb_limit_msg_until {
                 let r = R {
                     x: 0,
@@ -2142,7 +1955,7 @@ fn draw_coord_grid(fonts: &Fonts, ctx: &mut Ctx, coord: &crate::app::CoordGuide,
     while u <= u1 {
         if u.abs() > 1e-4 {
             let p = crate::conic::to_screen(coord, u, 0.0);
-            ctx.text(fonts, &format!("{u:.0}"), p.0 + 3.0, p.1 - 4.0, 11.0, c(palette.muted));
+            ctx.text(fonts, &format!("{u:.0}"), p.0 + 3.0, p.1 - 4.0, 13.0, c(palette.muted));
         }
         u += label_step;
     }
@@ -2154,9 +1967,31 @@ fn draw_coord_grid(fonts: &Fonts, ctx: &mut Ctx, coord: &crate::app::CoordGuide,
     while v <= v1 {
         if v.abs() > 1e-4 {
             let p = crate::conic::to_screen(coord, 0.0, v);
-            ctx.text(fonts, &format!("{v:.0}"), p.0 + 4.0, p.1 + 4.0, 11.0, c(palette.muted));
+            ctx.text(fonts, &format!("{v:.0}"), p.0 + 4.0, p.1 + 4.0, 13.0, c(palette.muted));
         }
         v += label_step;
+    }
+}
+
+/// Mark the positive ends even after rotating the guide. Screen edges are
+/// inset so a label stays on the board at fractional display scales.
+fn draw_axis_ends(ctx: &mut Ctx, fonts: &Fonts, g: &crate::app::CoordGuide, w: i32, h: i32) {
+    let palette = ctx.palette;
+    let (ox, oy) = (g.origin_x, g.origin_y);
+    if ox < 0. || oy < 0. || ox >= w as f32 || oy >= h as f32 { return; }
+    let (sin, cos) = g.rotation.sin_cos();
+    let limit = |origin: f32, delta: f32, extent: i32| {
+        if delta > 0.001 { (extent as f32 - 18. - origin) / delta }
+        else if delta < -0.001 { (16. - origin) / delta } else { f32::INFINITY }
+    };
+    for (dx,dy,label) in [(cos,sin,"x"),(sin,-cos,"y")] {
+        let mut len = limit(ox,dx,w).min(limit(oy,dy,h));
+        if g.conic == crate::app::ConicKind::None { len = len.min(20. * crate::conic::size_scale(g.size) * g.scale); }
+        if len < 26. { continue; }
+        let (x,y) = (ox+len*dx, oy+len*dy);
+        ctx.stroke_polyline(&[(x-7.*dx-3.5*dy,y-7.*dy+3.5*dx),(x,y),
+            (x-7.*dx+3.5*dy,y-7.*dy-3.5*dx)],c(palette.text),1.6,false);
+        ctx.text(fonts,label,x-12.*dx+5.*dy,y-12.*dy-5.*dx,12.,c(palette.text));
     }
 }
 
@@ -2196,101 +2031,29 @@ fn draw_selection_outline(app: &App, ctx: &mut Ctx) {
         let dy = (sel.y - sel.origin_y) as f32 / sc;
         let points: Vec<(f32, f32)> = sel.outline.iter()
             .map(|&(x, y)| (x + dx, y + dy)).collect();
-        ctx.stroke_hazard(&points, true);
+        ctx.stroke_selection(&points, true);
     } else if !app.lasso.is_empty() {
-        ctx.stroke_hazard(&app.lasso, app.lasso.len() > 2);
+        ctx.stroke_selection(&app.lasso, app.lasso.len() > 2);
     }
 }
 
-fn draw_coord_handles(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
+fn draw_coord_handles(app: &App, ctx: &mut Ctx) {
     let Some(coord) = app.coord.as_ref() else { return };
     if !coord.editing || app.conic_menu.is_some() { return; }
     let palette = ctx.palette;
     if let Some((hx, hy)) = coord_rotate_handle(app) {
         ctx.stroke_line((coord.origin_x, coord.origin_y), (hx, hy), alpha(palette.accent, 140), 1.5);
-        ctx.fill_circle(hx, hy, 10.0, c(palette.accent));
-        ctx.fill_circle(hx, hy, 6.0, c(palette.paper));
-        ctx.text(fonts, "旋转", hx + 13.0, hy - 10.0, 12.0, c(palette.muted));
+        ctx.fill_circle(hx, hy, 11.5, c(palette.accent));
+        ctx.fill_circle(hx, hy, 9.5, c(palette.paper));
+        icons::draw(ctx,Glyph::Reset,hx-7.5,hy-7.5,15.,c(palette.text),c(palette.accent));
     }
-    ctx.fill_circle(coord.origin_x, coord.origin_y, 8.0, c(palette.accent));
-    ctx.fill_circle(coord.origin_x, coord.origin_y, 3.5, c(palette.paper));
+    let (x,y) = (coord.origin_x,coord.origin_y);
+    ctx.fill_circle(x,y,9.,c(palette.accent));
+    ctx.fill_circle(x,y,7.,c(palette.paper));
+    ctx.stroke_line((x-3.5,y),(x+3.5,y),c(palette.text),1.6);
+    ctx.stroke_line((x,y-3.5),(x,y+3.5),c(palette.text),1.6);
 }
 
-fn draw_slider(ctx: &mut Ctx, r: R, value: f32, accent: Color, track: Color) {
-    let value = value.clamp(0.0, 1.0);
-    ctx.fill_round(R { y: r.y + r.h / 2 - 2, h: 4, ..r }, 2.0, track);
-    let thumb_x = r.x + ((r.w - 16) as f32 * value) as i32;
-    ctx.fill_round(R { x: thumb_x, y: r.y + 1, w: 16, h: r.h - 2 }, 8.0, accent);
-}
-
-fn draw_whiteboard_controls(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
-    let palette = ctx.palette;
-    let bar = whiteboard_bar_rect(app);
-    panel(ctx, bar, 12.0, 1.0);
-    let conic = app.coord.map(|c| c.conic);
-    let labels = ["空坐标系", "椭圆", "双曲线", "抛物线", "选择"];
-    for (i, label) in labels.iter().enumerate() {
-        let r = wb_button_rect(app, i);
-        let selected = match i {
-            0 => conic == Some(crate::app::ConicKind::None),
-            1..=3 => conic == Some(WB_BUTTONS[i].0) || app.conic_menu == Some(WB_BUTTONS[i].0),
-            _ => app.select_mode || app.floating.is_some(),
-        };
-        let fill = if selected { c(palette.accent_light) } else { c(palette.surface) };
-        let border = if selected { c(palette.accent) } else { c(palette.border) };
-        surface(ctx, r, 8.0, fill, border);
-        wb_label(ctx, fonts, r, label, 14.0, c(palette.text));
-    }
-    if let Some(kind) = app.conic_menu {
-        let menu = direction_menu_rect(app, kind);
-        panel(ctx, menu, 12.0, 1.0);
-        for (i, (direction, label)) in kind.directions().iter().enumerate() {
-            let r = direction_option_rect(app, kind, i);
-            let selected = app.coord.is_some_and(|c| c.conic == kind && c.direction == *direction);
-            surface(ctx, r, 7.0,
-                c(if selected { palette.accent_light } else { palette.paper }),
-                c(if selected { palette.accent } else { palette.border }));
-            wb_label(ctx, fonts, r, label, 15.0, c(palette.text));
-        }
-    }
-    if app.floating.is_some() {
-        let bar = selection_bar_rect(app);
-        panel(ctx, bar, 12.0, 1.0);
-        let cancel = selection_cancel_rect(app);
-        surface(ctx, cancel, 7.0, c(palette.surface), c(palette.border));
-        wb_label(ctx, fonts, cancel, "取消", 14.0, c(palette.text));
-        let done = selection_done_rect(app);
-        surface(ctx, done, 7.0, c(palette.accent), c(palette.accent));
-        wb_label(ctx, fonts, done, "完成", 14.0, c(palette.on_accent));
-    }
-    if let Some(coord) = app.coord.filter(|c| c.editing && app.conic_menu.is_none()) {
-        let edit = whiteboard_edit_bar_rect(app);
-        panel(ctx, edit, 12.0, 1.0);
-        let zoom_slot = wb_slider_slot(app, 0);
-        ctx.text(fonts, "缩放", zoom_slot.x as f32, (zoom_slot.y + 18) as f32, 13.0, c(palette.muted));
-        draw_slider(ctx, wb_zoom_slider_rect(app), (coord.scale - 12.0) / 108.0,
-            c(palette.accent), c(palette.border));
-        if coord.conic != crate::app::ConicKind::None {
-            let shape_slot = wb_slider_slot(app, 1);
-            ctx.text(fonts, "形状", shape_slot.x as f32, (shape_slot.y + 18) as f32, 13.0, c(palette.muted));
-            draw_slider(ctx, wb_shape_slider_rect(app), coord.shape,
-                c(palette.accent), c(palette.border));
-        }
-        let size_index = if coord.conic != crate::app::ConicKind::None { 2 } else { 1 };
-        let size_slot = wb_slider_slot(app, size_index);
-        ctx.text(fonts, "大小", size_slot.x as f32, (size_slot.y + 18) as f32, 13.0, c(palette.muted));
-        draw_slider(ctx, wb_size_slider_rect(app), coord.size,
-            c(palette.accent), c(palette.border));
-        let delete = wb_delete_rect(app);
-        surface(ctx, delete, 7.0, c(palette.danger_light), c(palette.danger));
-        wb_label(ctx, fonts, delete, "删除", 14.0, c(palette.danger));
-        let done = wb_done_rect(app);
-        surface(ctx, done, 7.0, c(palette.accent), c(palette.accent));
-        wb_label(ctx, fonts, done, "完成", 14.0, c(palette.on_accent));
-        ctx.text(fonts, "拖动中心移动 · 拖动圆点旋转", (edit.x + 12) as f32,
-            (edit.y - 6) as f32, 12.0, c(palette.muted));
-    }
-}
 
 fn draw_process_block(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
     crate::settings_panel::draw_process(app, fonts, ctx);
@@ -2553,8 +2316,12 @@ mod whiteboard_guide_tests {
         let pm = render_region(&app, &fonts, None, 0, 0, 320, 240).unwrap();
         assert!(pm.data().iter().any(|value| *value != 0));
         assert!(control_rect(&app, Control::Whiteboard(WhiteboardControl::ZoomSlider)).is_some());
-        assert!(control_rect(&app, Control::Whiteboard(WhiteboardControl::SizeSlider)).is_some());
-        assert!(control_rect(&app, Control::Whiteboard(WhiteboardControl::ShapeSlider)).is_some());
+        for (field,slider) in [(crate::conic::Parameter::Size,WhiteboardControl::SizeSlider),
+            (crate::conic::Parameter::Shape,WhiteboardControl::ShapeSlider)] {
+            assert!(control_rect(&app,Control::Whiteboard(WhiteboardControl::ParameterTab(field))).is_some());
+            app.guide_parameter = field;
+            assert!(control_rect(&app,Control::Whiteboard(slider)).is_some());
+        }
         assert!(control_rect(&app, Control::Whiteboard(WhiteboardControl::Done)).is_some());
         assert!(control_rect(&app, Control::Whiteboard(WhiteboardControl::Delete)).is_some());
     }
@@ -2572,8 +2339,9 @@ mod whiteboard_guide_tests {
                 crate::app::ConicKind::Ellipse, crate::app::ConicDirection::Horizontal));
             let bar = whiteboard_edit_bar_rect(&app);
             let rects = [
-                wb_zoom_slider_rect(&app), wb_shape_slider_rect(&app), wb_size_slider_rect(&app),
-                wb_done_rect(&app), wb_delete_rect(&app),
+                wb_slider_rect(&app, crate::conic::Parameter::Zoom), wb_slider_rect(&app, crate::conic::Parameter::Shape),
+                wb_slider_rect(&app, crate::conic::Parameter::Size), wb_action_rect(&app, WhiteboardControl::Done),
+                wb_action_rect(&app, WhiteboardControl::Delete),
             ];
             for r in rects {
                 assert!(r.x >= bar.x && r.x + r.w <= bar.x + bar.w

@@ -2,7 +2,7 @@
 use crate::{app::App, text::Fonts, ui::{self, Ctx, R, SliderId}, ui_theme::c};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Target { Setting(SliderId), Page, Hue, Saturation, Brightness, Hex }
+pub enum Target { Setting(SliderId), Guide(crate::conic::Parameter), Page, Hue, Saturation, Brightness, Hex }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key { Character(char), Backspace, Delete, Left, Right, Home, End, SelectAll, Paste, Enter, Escape }
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -17,6 +17,12 @@ pub fn position(app: &App) -> f32 {
 pub fn spec(app: &App, target: Target) -> Spec {
     use Target::*;
     let (title,min,max,digits,unit,value)=match target {
+        Guide(field) => {
+            let kind = app.coord.map_or(crate::app::ConicKind::None, |g| g.conic);
+            let (title, lo, hi, digits, unit) = field.display(kind);
+            let value = app.coord.map_or(lo, |g| lo + field.fraction(&g) * (hi - lo));
+            (title, lo, hi, digits, unit, value)
+        }
         Setting(SliderId::Alpha)=>("工具栏不透明度",12.0,100.0,0,"%",app.sidebar_alpha as f32/255.0*100.0),
         Setting(SliderId::Scale)=>("工具栏大小",60.0,140.0,0,"%",app.sb_scale as f32*100.0),
         Setting(SliderId::Position)=>("工具栏垂直位置",0.0,100.0,0,"%",position(app)),
@@ -87,6 +93,7 @@ pub fn parse(app:&App)->Result<f32,String> {
 }
 pub fn target_rect(app:&App,target:Target)->Option<R> {
     match target {
+        Target::Guide(field) => ui::whiteboard_value_rect(app,field),
         Target::Setting(id)=>ui::settings_sliders(app).into_iter().find(|s|s.id==id).map(|s|s.badge),
         Target::Page=>Some(ui::page_picker_control_rect(app,ui::PagePickerHit::Input)),
         _=>crate::settings_panel::picker_controls(app).into_iter()

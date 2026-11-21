@@ -119,8 +119,7 @@ fn start_input_group_auth(app: &mut App) {
     app.input_group_state = 3;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WbSlider { Zoom, Size, Shape }
+pub use conic::Parameter as WbSlider;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WbHandle { Move, Rotate }
 
@@ -184,6 +183,8 @@ pub struct Ip {
     // 正在拖动的设置滑条
     pub slider: Option<ui::SliderId>,
     pub wb_slider: Option<WbSlider>,
+    // Keep the original geometry until the initiating pointer is released.
+    wb_before: Option<(i32, u8, app::CoordGuide)>,
     /// Last full redraw caused by a whiteboard slider drag (60 fps cap).
     pub wb_redraw_at: i64,
     pub wb_handle: Option<WbHandle>,
@@ -193,7 +194,8 @@ pub struct Ip {
     /// Displayed selection/floating dirty bounds, for partial redraws.
     pub wb_lasso_rect: Option<R>,
     pub wb_sel_rect: Option<R>,
-    pub wb_sel_drag: Option<(f32, f32)>,
+    // Physical offset from the pointer to the selection's top-left corner.
+    pub wb_sel_drag: Option<(i32, i32)>,
     pub wb_start_angle: f32,
     pub wb_start_rotation: f32,
     pub picker_drag: Option<settings_state::PickerHit>,
@@ -227,6 +229,7 @@ impl Default for Ip {
             touch_over_ui: HashMap::new(),
             slider: None,
             wb_slider: None,
+            wb_before: None,
             wb_redraw_at: 0,
             wb_handle: None,
             wb_last: (0, 0),
@@ -1272,6 +1275,14 @@ pub fn value_input_key(rt:&Rt,app:&mut App,key:value_input::Key)->bool {
             Err(message)=>{if let Some(editor)=app.settings_ui.editor.as_mut(){editor.error=message;}},
             Ok(value)=>{
                 match target {
+                    Target::Guide(field) => {
+                        let before = app.coord;
+                        if let Some(g) = app.coord.as_mut().filter(|g| g.editing) {
+                            let (_, lo, hi, _, _) = field.display(g.conic);
+                            field.set_fraction(g, (value - lo) / (hi - lo));
+                            app.record_coord_change(before);
+                        }
+                    }
                     Target::Setting(id)=>{
                         let raw=match id {ui::SliderId::Alpha=>value/100.0*255.0,ui::SliderId::Scale=>value/100.0,_=>value};
                         apply_slider(app,id,raw);app::save_settings(app);
@@ -1507,69 +1518,60 @@ fn set_sidebar_drag_feedback(rt: &Rt, app: &mut App, feedback: Option<ui::Sideba
     for right in [false, true] { rt.redraw(app, ui::sidebar_rect(app, right)); }
 }
 
-fn apply_wb_zoom(app: &mut App, x: i32) {
-    let scale = ui::coord_zoom_at(app, x);
-    if let Some(coord) = app.coord.as_mut() { coord.scale = scale; }
-}
-
-fn apply_wb_size(app: &mut App, x: i32) {
-    let size = ui::coord_size_at(app, x);
-    if let Some(coord) = app.coord.as_mut() { coord.size = size; }
-}
-
-fn apply_wb_shape(app: &mut App, x: i32) {
-    let shape = ui::coord_shape_at(app, x);
-    if let Some(coord) = app.coord.as_mut() { coord.shape = shape; }
+fn adjust_guide_slider(app: &mut App, field: WbSlider, x: i32) {
+    let fraction = ui::whiteboard_fraction_at(app, field, x);
+    if let Some(g) = app.coord.as_mut() { field.set_fraction(g, fraction); }
 }
 
 fn handle_whiteboard_release(rt: &Rt, app: &mut App, hit: ui::WhiteboardControl) {
+    use app::{ConicDirection, ConicKind};
     use ui::WhiteboardControl as W;
-    if app.floating.is_some() && matches!(hit,
-        W::Empty | W::Ellipse | W::Hyperbola | W::Parabola | W::Direction(_, _)) {
-        crate::selection::commit(app);
+    if matches!(hit, W::Empty | W::Ellipse | W::Hyperbola | W::Parabola | W::Direction(_, _)) {
+        if app.floating.is_some() { selection::commit(app); }
+        app.select_mode = false;
+        app.selection_missed = false;
     }
+    close_all_popups(rt, app);
     match hit {
-        W::Empty => {
-            app.set_coord(crate::app::ConicKind::None, crate::app::ConicDirection::Horizontal);
+        W::Empty => app.set_coord(ConicKind::None, ConicDirection::Horizontal),
+        W::Ellipse | W::Hyperbola | W::Parabola => {
+            let kind = match hit { W::Ellipse => ConicKind::Ellipse, W::Hyperbola => ConicKind::Hyperbola, _ => ConicKind::Parabola };
+            if app.conic_menu == Some(kind) { app.conic_menu = None; }
+            else if let Some(g) = app.coord.filter(|g| g.conic == kind && !g.editing) {
+                app.set_coord(kind, g.direction);
+            } else { app.conic_menu = Some(kind); }
         }
-        W::Ellipse => { app.conic_menu = Some(crate::app::ConicKind::Ellipse); }
-        W::Hyperbola => { app.conic_menu = Some(crate::app::ConicKind::Hyperbola); }
-        W::Parabola => { app.conic_menu = Some(crate::app::ConicKind::Parabola); }
-        W::Direction(kind, direction) => {
-            app.set_coord(kind, direction);
-        }
+        W::Direction(kind, direction) => app.set_coord(kind, direction),
         W::Select => {
-            if app.floating.is_some() { crate::selection::commit(app); }
-            if let Some(coord) = app.coord.as_mut() { coord.editing = false; }
-            app.select_mode = true;
+            let already_selecting = app.select_mode || app.floating.is_some();
+            if app.floating.is_some() { selection::commit(app); }
+            if let Some(g) = app.coord.as_mut() { g.editing = false; }
+            app.select_mode = !already_selecting;
+            app.selection_missed = false;
             app.conic_menu = None;
         }
-        W::Done => {
-            if let Some(coord) = app.coord.as_mut() { coord.editing = false; }
-            app.conic_menu = None;
+        W::ResetView => {
+            let before = app.coord;
+            if let Some(g) = app.coord.as_mut() {
+                g.origin_x = app.screen_w as f32 / 2.;
+                g.origin_y = app.screen_h as f32 / 2.;
+                g.rotation = 0.;
+            }
+            app.record_coord_change(before);
+        }
+        W::Value(field) => { open_value_input(rt,app,value_input::Target::Guide(field)); return; }
+        W::ParameterTab(field) => app.guide_parameter = field,
+        W::Delete | W::Done => {
+            if hit == W::Delete { app.delete_coord(); }
             switch_to_draw(rt, app, 1);
             return;
         }
-        W::Delete => {
-            app.delete_coord();
-            switch_to_draw(rt, app, 1);
-            return;
-        }
-        W::SelDone => {
-            crate::selection::commit(app);
+        W::SelDone | W::SelCancel => {
+            if hit == W::SelDone { selection::commit(app); } else { selection::cancel(app); }
             app.select_mode = false;
-            apply_input_shape(rt, app);
-            rt.redraw_full(app);
-            return;
+            app.selection_missed = false;
         }
-        W::SelCancel => {
-            crate::selection::cancel(app);
-            app.select_mode = false;
-            apply_input_shape(rt, app);
-            rt.redraw_full(app);
-            return;
-        }
-        W::ZoomSlider | W::SizeSlider | W::ShapeSlider => {}
+        W::ZoomSlider | W::SizeSlider | W::ShapeSlider => return,
     }
     apply_input_shape(rt, app);
     rt.redraw_full(app);
@@ -1577,72 +1579,56 @@ fn handle_whiteboard_release(rt: &Rt, app: &mut App, hit: ui::WhiteboardControl)
 
 fn handle_whiteboard_press(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32, button: u8) -> bool {
     use ui::WhiteboardControl as W;
-    if !app.whiteboard || app.page_picker.is_some() { return false; }
-    if ip.wb_slider.is_some() || ip.wb_handle.is_some() || ip.wb_lasso || ip.wb_sel_drag.is_some() {
+    if !app.whiteboard || app.page_picker.is_some() || app.settings_open || app.show_diag
+        || app.settings_ui.modal() || app.show_input_group_prompt || app.confirm_quit || app.process_block_open {
+        return false;
+    }
+    if ip.wb_before.is_some() || ip.wb_lasso || ip.wb_sel_drag.is_some() { return true; }
+    if (app.pen_popup_visible && ui::pen_popup_rect(app).contains(x,y))
+        || (app.eraser_popup_visible && ui::eraser_popup_rect(app).contains(x,y))
+        || [false,true].into_iter().any(|side| ui::sidebar_input_rect(app,side).contains(x,y)) {
+        return false;
+    }
+    if let Some(control) = ui::whiteboard_hit(app,x,y) {
+        let slider = match control {
+            W::ZoomSlider => WbSlider::Zoom, W::ShapeSlider => WbSlider::Shape, W::SizeSlider => WbSlider::Size,
+            _ => return false, // Discrete buttons activate on release inside the same target.
+        };
+        if button == 1 {
+            close_all_popups(rt,app);
+            ip.wb_before = app.coord.map(|g| (app.current_slide, button, g));
+            ip.wb_slider = Some(slider);
+            adjust_guide_slider(app,slider,x);
+            rt.redraw_full(app);
+        }
         return true;
     }
-    if app.floating.is_some() && button == 3 {
-        crate::selection::cancel(app);
+    if ui::whiteboard_panel_contains(app,x,y) { return true; }
+    if app.conic_menu.take().is_some() {
         rt.redraw_full(app);
         return true;
     }
-    if app.select_mode && button == 3 {
-        app.lasso.clear();
-        ip.wb_sel_start = None;
-        app.select_mode = false;
-        let dirty = union_rect(ip.wb_lasso_rect.take(),
-            Some(ui::whiteboard_bar_rect(app)));
-        if let Some(r) = dirty { rt.redraw(app, r); }
+    if button == 3 && (app.select_mode || app.floating.is_some()) {
+        handle_whiteboard_release(rt,app,W::SelCancel);
         return true;
     }
-    if button == 2 && app.coord.as_ref().is_some_and(|c| c.editing) {
-        ip.wb_handle = Some(WbHandle::Move);
-        ip.wb_last = (x, y);
-        return true;
-    }
-    if app.coord.as_ref().is_some_and(|c| c.editing) {
-        match ui::coord_handle_at(app, x, y) {
-            Some(ui::CoordHandle::Origin) => {
-                ip.wb_handle = Some(WbHandle::Move);
-                ip.wb_last = (x, y);
-                return true;
-            }
-            Some(ui::CoordHandle::Rotate) => {
-                if let Some(coord) = app.coord.as_ref() {
-                    ip.wb_start_angle = (y as f32 - coord.origin_y).atan2(x as f32 - coord.origin_x);
-                    ip.wb_start_rotation = coord.rotation;
+    if let Some(g) = app.coord.filter(|g| g.editing) {
+        let handle = match button {
+            1 => ui::coord_handle_at(app,x,y), 2 => Some(ui::CoordHandle::Origin), _ => None,
+        };
+        if let Some(handle) = handle {
+            ip.wb_before = Some((app.current_slide, button, g));
+            ip.wb_last = (x,y);
+            ip.wb_handle = Some(match handle {
+                ui::CoordHandle::Origin => WbHandle::Move,
+                ui::CoordHandle::Rotate => {
+                    ip.wb_start_angle = (y as f32 - g.origin_y).atan2(x as f32 - g.origin_x);
+                    ip.wb_start_rotation = g.rotation;
+                    WbHandle::Rotate
                 }
-                ip.wb_handle = Some(WbHandle::Rotate);
-                ip.wb_last = (x, y);
-                return true;
-            }
-            None => {}
-        }
-        if wb_zoom_slider_hit(app, x, y) {
-            ip.wb_slider = Some(WbSlider::Zoom);
-            apply_wb_zoom(app, x);
-            rt.redraw_full(app);
+            });
             return true;
         }
-        if wb_size_slider_hit(app, x, y) {
-            ip.wb_slider = Some(WbSlider::Size);
-            apply_wb_size(app, x);
-            rt.redraw_full(app);
-            return true;
-        }
-        if wb_shape_slider_hit(app, x, y) {
-            ip.wb_slider = Some(WbSlider::Shape);
-            apply_wb_shape(app, x);
-            rt.redraw_full(app);
-            return true;
-        }
-    }
-    // Bottom bar, direction menu, edit and selection buttons activate on release.
-    if matches!(ui::whiteboard_hit(app, x, y), Some(
-        W::Empty | W::Ellipse | W::Hyperbola | W::Parabola | W::Select
-        | W::Direction(_, _) | W::Done | W::Delete | W::SelDone | W::SelCancel
-    )) {
-        return false;
     }
     if app.select_mode && button == 1 && !ui::whiteboard_ui_contains(app, x, y) {
         let start = (x as f32, y as f32);
@@ -1661,7 +1647,8 @@ fn handle_whiteboard_press(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32, 
         let right = left + sel.pixmap.width() as f32 / sc;
         let bottom = top + sel.pixmap.height() as f32 / sc;
         if (x as f32) >= left && (x as f32) <= right && (y as f32) >= top && (y as f32) <= bottom {
-            ip.wb_sel_drag = Some((x as f32, y as f32));
+            ip.wb_sel_drag = Some(((x as f32 * sc).round() as i32 - sel.x,
+                (y as f32 * sc).round() as i32 - sel.y));
             ip.wb_sel_rect = floating_rect(app);
             return true;
         }
@@ -1669,22 +1656,7 @@ fn handle_whiteboard_press(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32, 
         rt.redraw_full(app);
         return true;
     }
-    if app.conic_menu.is_some() && ui::whiteboard_hit(app, x, y).is_none() {
-        app.conic_menu = None;
-        rt.redraw_full(app);
-        return true;
-    }
     false
-}
-
-fn wb_zoom_slider_hit(app: &App, x: i32, y: i32) -> bool {
-    ui::whiteboard_hit(app, x, y) == Some(ui::WhiteboardControl::ZoomSlider)
-}
-fn wb_size_slider_hit(app: &App, x: i32, y: i32) -> bool {
-    ui::whiteboard_hit(app, x, y) == Some(ui::WhiteboardControl::SizeSlider)
-}
-fn wb_shape_slider_hit(app: &App, x: i32, y: i32) -> bool {
-    ui::whiteboard_hit(app, x, y) == Some(ui::WhiteboardControl::ShapeSlider)
 }
 
 pub fn on_press(
@@ -1701,12 +1673,12 @@ pub fn on_press(
     // The press that started a drag owns it until release. A second button
     // must not replace it with a pending click and consume that release.
     if ip.pending_ui.is_some() || ip.slider.is_some() || ip.dragging || ip.picker_drag.is_some() || ip.panel_scroll.is_some() { return; }
-    if handle_whiteboard_press(rt, app, ip, x, y, button) { return; }
     if button==1 && !app.show_input_group_prompt && app.settings_ui.editor.is_some()
         && !value_input::controls(app).iter().any(|(_,r)|r.contains(x,y)) {
         value_input_key(rt,app,value_input::Key::Enter);
         if app.settings_ui.editor.is_some() || ui::control_at(app,x,y).is_none() {return;}
     }
+    if handle_whiteboard_press(rt, app, ip, x, y, button) { return; }
     if button == 1 && !app.show_input_group_prompt && !app.settings_ui.modal() && !app.confirm_quit {
         if app.process_block_open && settings_panel::process_list_rect(app).contains(x,y) {
             ip.panel_scroll = Some((y, app.process_scroll, false));
@@ -1832,7 +1804,7 @@ fn activate_press(
         return;
     }
     if app.whiteboard {
-        if let Some(hit) = ui::whiteboard_hit(app, x, y) {
+        if let Some(ui::Control::Whiteboard(hit)) = ui::control_at(app, x, y) {
             handle_whiteboard_release(rt, app, hit);
             return;
         }
@@ -2054,13 +2026,15 @@ pub fn handle_btn(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>, k: Btn, right
 }
 
 pub fn on_motion(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
+    if ip.wb_before.is_some_and(|(page, _, _)| !app.whiteboard || page != app.current_slide
+        || !app.coord.is_some_and(|g| g.editing)) {
+        ip.wb_before = None;
+        ip.wb_slider = None;
+        ip.wb_handle = None;
+    }
     if app.whiteboard {
         if let Some(slider) = ip.wb_slider {
-            match slider {
-                WbSlider::Zoom => apply_wb_zoom(app, x),
-                WbSlider::Size => apply_wb_size(app, x),
-                WbSlider::Shape => apply_wb_shape(app, x),
-            }
+            adjust_guide_slider(app, slider, x);
             // Editing still redraws a full frame; cap it to ~50 fps on low-end CPUs.
             let now = now_ms();
             if now - ip.wb_redraw_at >= 20 {
@@ -2104,13 +2078,8 @@ pub fn on_motion(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
             }
             return;
         }
-        if let Some((lx, ly)) = ip.wb_sel_drag {
-            let sc = app.scale.max(0.001) as f32;
-            if let Some(sel) = app.floating.as_mut() {
-                sel.x += ((x as f32 - lx) * sc).round() as i32;
-                sel.y += ((y as f32 - ly) * sc).round() as i32;
-            }
-            ip.wb_sel_drag = Some((x as f32, y as f32));
+        if let Some(offset) = ip.wb_sel_drag {
+            selection::move_to_pointer(app, offset, x, y);
             let new = floating_rect(app);
             let dirty = union_rect(ip.wb_sel_rect, new);
             let now = now_ms();
@@ -2310,6 +2279,7 @@ pub fn on_release(rt: &Rt, app: &mut App, ip: &mut Ip, wps: Option<&WpsBridge>, 
     if ip.picker_drag.take().is_some() { app.press=None; rt.redraw_full(app); return; }
     if ip.panel_scroll.take().is_some_and(|(_,_,moved)|moved) { ip.pending_ui=None; app.press=None; rt.redraw_full(app); return; }
     if app.whiteboard {
+        if (ip.wb_lasso || ip.wb_sel_drag.is_some()) && button != 1 { return; }
         if ip.wb_lasso {
             ip.wb_lasso = false;
             if let Some(start) = ip.wb_sel_start.take() {
@@ -2319,12 +2289,13 @@ pub fn on_release(rt: &Rt, app: &mut App, ip: &mut Ip, wps: Option<&WpsBridge>, 
             let final_rect = lasso_rect(&lasso);
             app.floating = crate::selection::lift(app, &lasso);
             app.lasso.clear();
-            app.select_mode = false;
+            app.select_mode = app.floating.is_none();
+            app.selection_missed = app.select_mode;
             let mut dirty = union_rect(ip.wb_lasso_rect.take(), final_rect);
             dirty = union_rect(dirty, Some(ui::whiteboard_bar_rect(app)));
+            dirty = union_rect(dirty, Some(ui::selection_bar_rect(app)));
             if app.floating.is_some() {
                 dirty = union_rect(dirty, floating_rect(app));
-                dirty = union_rect(dirty, Some(ui::selection_bar_rect(app)));
             }
             apply_input_shape(rt, app);
             match dirty {
@@ -2333,17 +2304,22 @@ pub fn on_release(rt: &Rt, app: &mut App, ip: &mut Ip, wps: Option<&WpsBridge>, 
             }
             return;
         }
-        if ip.wb_slider.take().is_some() || ip.wb_handle.take().is_some() {
+        if let Some((page, owner, before)) = ip.wb_before {
+            if button != owner { return; }
+            if page == app.current_slide && app.coord.is_some_and(|g| g.editing) {
+                // Some touch backends deliver the last position only on release.
+                on_motion(rt, app, ip, x, y);
+                app.record_coord_change(Some(before));
+            }
+            ip.wb_before = None;
+            ip.wb_slider = None;
+            ip.wb_handle = None;
             apply_input_shape(rt, app);
             rt.redraw_full(app);
             return;
         }
-        if let Some((lx, ly)) = ip.wb_sel_drag.take() {
-            let sc = app.scale.max(0.001) as f32;
-            if let Some(sel) = app.floating.as_mut() {
-                sel.x += ((x as f32 - lx) * sc).round() as i32;
-                sel.y += ((y as f32 - ly) * sc).round() as i32;
-            }
+        if let Some(offset) = ip.wb_sel_drag.take() {
+            selection::move_to_pointer(app, offset, x, y);
             let dirty = union_rect(ip.wb_sel_rect.take(), floating_rect(app));
             match dirty {
                 Some(r) => rt.redraw(app, r),
@@ -2414,6 +2390,13 @@ pub fn on_release(rt: &Rt, app: &mut App, ip: &mut Ip, wps: Option<&WpsBridge>, 
 
 /// 触摸事件（X11 与 Wayland 共用）
 pub fn cancel_input(rt: &Rt, app: &mut App, ip: &mut Ip) {
+    if let Some((page, _, before)) = ip.wb_before {
+        if app.whiteboard && page == app.current_slide && app.coord.is_some_and(|g| g.editing) {
+            app.coord = Some(before);
+            app.save_coord_page();
+        }
+    }
+    if ip.wb_lasso { app.lasso.clear(); }
     if let Some(picker) = app.page_picker.as_mut() { picker.cancel_drag(); }
     if app.is_drawing { paint::commit_stroke(app); }
     app.is_drawing = false;
@@ -2467,7 +2450,7 @@ pub fn handle_touch(
             // The whiteboard cursor/edit/select/lasso states need the pointer
             // path; the palm-gesture engine would otherwise draw a stroke.
             let whiteboard_pointer = app.whiteboard && (app.mode == 0 || app.select_mode
-                || app.floating.is_some()
+                || app.floating.is_some() || app.conic_menu.is_some() || app.settings_ui.editor.is_some()
                 || app.coord.as_ref().is_some_and(|coord| coord.editing));
             if over_ui(app, x, y) || whiteboard_pointer || ip.ui_touch.is_some() {
                 ip.touch_over_ui.insert(id, true);

@@ -75,10 +75,9 @@ pub fn clone_pixmap(p: &Pixmap) -> Pixmap {
     n
 }
 
-/// 一次撤回记录：按瓦片保存落笔前像素，只存被笔迹覆盖到的瓦片
-#[derive(Default)]
-pub struct UndoEntry {
-    tiles: HashMap<(i32, i32), Vec<u8>>,
+pub enum UndoEntry {
+    Ink(HashMap<(i32, i32), Vec<u8>>),
+    Guide(Option<CoordGuide>),
 }
 
 // ---------------- 白板坐标系 / 圆锥曲线 ----------------
@@ -180,6 +179,8 @@ pub struct App {
     pub coord_page: i32,
     pub conic_menu: Option<ConicKind>,
     pub select_mode: bool,
+    pub selection_missed: bool,
+    pub guide_parameter: crate::conic::Parameter,
     pub lasso: Vec<(f32, f32)>,
     pub floating: Option<crate::selection::FloatingSelection>,
     pub thumbs: HashMap<(i32, i32), Pixmap>,
@@ -340,6 +341,8 @@ impl App {
             coord_page: 1,
             conic_menu: None,
             select_mode: false,
+            selection_missed: false,
+            guide_parameter: crate::conic::Parameter::Zoom,
             lasso: Vec::new(),
             floating: None,
             thumbs: HashMap::new(),
@@ -586,10 +589,13 @@ impl App {
     }
     /// 开始一次新的撤回记录（落笔前调用）；不立即拷贝像素，避免整屏快照
     pub fn begin_undo(&mut self) {
+        self.push_undo(UndoEntry::Ink(HashMap::new()));
+    }
+    fn push_undo(&mut self, entry: UndoEntry) {
         if self.undo.len() >= MAX_UNDO {
             self.undo.pop_front();
         }
-        self.undo.push_back(UndoEntry::default());
+        self.undo.push_back(entry);
     }
     /// 在绘制前保存 rect 覆盖到、且本条目尚未保存的瓦片。
     /// rect 使用画布物理像素坐标，右、下边界不包含在区域内。
@@ -603,7 +609,7 @@ impl App {
         if x1 <= x0 || y1 <= y0 {
             return;
         }
-        let Some(entry) = self.undo.back_mut() else {
+        let Some(UndoEntry::Ink(tiles)) = self.undo.back_mut() else {
             return;
         };
         let tc0 = x0 / UNDO_TILE;
@@ -613,7 +619,7 @@ impl App {
         let data = self.canvas.data();
         for tr in tr0..=tr1 {
             for tc in tc0..=tc1 {
-                if entry.tiles.contains_key(&(tc, tr)) {
+                if tiles.contains_key(&(tc, tr)) {
                     continue;
                 }
                 let tx = tc * UNDO_TILE;
@@ -625,18 +631,32 @@ impl App {
                     let start = ((ty as usize + row) * cw as usize + tx as usize) * 4;
                     buf.extend_from_slice(&data[start..start + tw * 4]);
                 }
-                entry.tiles.insert((tc, tr), buf);
+                tiles.insert((tc, tr), buf);
             }
         }
     }
     pub fn undo_last(&mut self) {
-        let Some(entry) = self.undo.pop_back() else {
+        if self.floating.is_some() {
+            crate::selection::cancel(self);
+            self.select_mode = false;
             return;
+        }
+        let tiles = match self.undo.pop_back() {
+            Some(UndoEntry::Ink(tiles)) => tiles,
+            Some(UndoEntry::Guide(previous)) => {
+                let editing = self.coord.is_some_and(|c| c.editing);
+                self.coord = previous.map(|mut c| { c.editing = editing; c });
+                if editing && self.coord.is_none() { self.mode = 1; }
+                self.conic_menu = None;
+                self.save_coord_page();
+                return;
+            }
+            None => return,
         };
         let cw = self.canvas.width() as i32;
         let ch = self.canvas.height() as i32;
         let data = self.canvas.data_mut();
-        for (&(tc, tr), buf) in &entry.tiles {
+        for (&(tc, tr), buf) in &tiles {
             let tx = tc * UNDO_TILE;
             let ty = tr * UNDO_TILE;
             let tw = UNDO_TILE.min(cw - tx) as usize;
@@ -829,8 +849,18 @@ impl App {
         }
     }
 
+    /// One gesture is one undo step. Entering or leaving edit mode is not a geometry change.
+    pub fn record_coord_change(&mut self, before: Option<CoordGuide>) {
+        let geometry = |guide: Option<CoordGuide>| guide.map(|mut c| { c.editing = false; c });
+        if geometry(before) != geometry(self.coord) {
+            self.push_undo(UndoEntry::Guide(geometry(before)));
+            self.save_coord_page();
+        }
+    }
+
     /// Create or replace the current page's guide, keeping its transform.
     pub fn set_coord(&mut self, conic: ConicKind, direction: ConicDirection) {
+        let before = self.coord;
         let mut coord = match self.coord {
             Some(mut existing) => {
                 existing.conic = conic;
@@ -842,7 +872,7 @@ impl App {
         coord.editing = true;
         self.coord = Some(coord);
         self.coord_page = self.current_slide;
-        self.coord_pages.insert(self.current_slide, coord);
+        self.record_coord_change(before);
         self.conic_menu = None;
         self.select_mode = false;
         self.lasso.clear();
@@ -850,9 +880,9 @@ impl App {
     }
 
     pub fn delete_coord(&mut self) {
-        self.coord_pages.remove(&self.current_slide);
-        self.coord = None;
+        let before = self.coord.take();
         self.coord_page = self.current_slide;
+        self.record_coord_change(before);
         self.conic_menu = None;
         self.select_mode = false;
         self.lasso.clear();

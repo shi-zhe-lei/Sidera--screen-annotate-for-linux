@@ -1,6 +1,37 @@
 //! Two-dimensional coordinate guide and conic-section math.
 use crate::app::{ConicDirection, ConicKind, CoordGuide};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Parameter { Zoom, Shape, Size }
+
+impl Parameter {
+    pub fn display(self, kind: ConicKind) -> (&'static str, f32, f32, usize, &'static str) {
+        match (self, kind) {
+            (Self::Zoom, _) => ("单位格距", 12.0, 120.0, 0, "px"),
+            (Self::Shape, ConicKind::Ellipse) => ("短轴 / 长轴", 0.30, 1.0, 2, ""),
+            (Self::Shape, ConicKind::Hyperbola) => ("轴比 b/a", 0.25, 1.50, 2, ""),
+            (Self::Shape, _) => ("开口宽度", 0.0, 100.0, 0, "%"),
+            (Self::Size, ConicKind::None) => ("单侧范围", 8.0, 32.0, 1, "格"),
+            (Self::Size, _) => ("图形大小", 40.0, 160.0, 0, "%"),
+        }
+    }
+    pub fn fraction(self, guide: &CoordGuide) -> f32 {
+        match self {
+            Self::Zoom => (guide.scale - 12.0) / 108.0,
+            Self::Shape => guide.shape,
+            Self::Size => guide.size,
+        }.clamp(0.0, 1.0)
+    }
+    pub fn set_fraction(self, guide: &mut CoordGuide, value: f32) {
+        let t = value.clamp(0.0, 1.0);
+        match self {
+            Self::Zoom => guide.scale = 12.0 + 108.0 * t,
+            Self::Shape => guide.shape = t,
+            Self::Size => guide.size = t,
+        }
+    }
+}
+
 pub fn to_screen(coord: &CoordGuide, u: f32, v: f32) -> (f32, f32) {
     let (sin, cos) = coord.rotation.sin_cos();
     let sx = u * cos + v * sin;
@@ -51,6 +82,7 @@ pub fn foci(coord: &CoordGuide) -> Vec<(f32, f32)> {
         ConicKind::Ellipse => {
             let (a, b) = ellipse_axes(coord.shape, coord.size);
             let c = (a * a - b * b).max(0.0).sqrt();
+            if c < f32::EPSILON { return vec![(0.0, 0.0)]; }
             match coord.direction {
                 ConicDirection::Vertical => vec![(0.0, c), (0.0, -c)],
                 _ => vec![(c, 0.0), (-c, 0.0)],
@@ -97,7 +129,12 @@ pub fn branches(coord: &CoordGuide, u0: f32, u1: f32, v0: f32, v1: f32) -> Vec<V
             let (a, b) = hyperbola_axes(coord.shape, coord.size);
             let mut left = Vec::new();
             let mut right = Vec::new();
-            let tmax = 2.2;
+            let (axial, transverse) = if coord.direction == ConicDirection::Vertical {
+                (v0.abs().max(v1.abs()), u0.abs().max(u1.abs()))
+            } else {
+                (u0.abs().max(u1.abs()), v0.abs().max(v1.abs()))
+            };
+            let tmax = ((axial + 1.0) / a).max(1.0).acosh().min(((transverse + 1.0) / b).asinh());
             for i in 0..=N {
                 let t = -tmax + 2.0 * tmax * i as f32 / N as f32;
                 let (x, y) = (a * t.cosh(), b * t.sinh());
@@ -156,6 +193,8 @@ mod tests {
         c.direction = ConicDirection::Vertical;
         let f = foci(&c);
         assert!((f[0].1 - f[1].1).abs() > 0.1);
+        c.shape = 1.0;
+        assert_eq!(foci(&c), vec![(0.0, 0.0)], "a circle has one coincident focus");
         c.conic = ConicKind::Parabola;
         c.direction = ConicDirection::Right;
         assert_eq!(foci(&c).len(), 1);
@@ -190,6 +229,18 @@ mod tests {
             lower |= negative > 0;
         }
         assert!(upper && lower, "vertical hyperbola needs both halves");
+    }
+
+    #[test]
+    fn zoomed_out_hyperbola_reaches_the_visible_edge_in_both_orientations() {
+        for direction in [ConicDirection::Horizontal, ConicDirection::Vertical] {
+            let guide = CoordGuide::new(1280,720,ConicKind::Hyperbola,direction);
+            for branch in branches(&guide,-55.,55.,-45.,45.) {
+                for &(x,y) in [branch.first().unwrap(),branch.last().unwrap()] {
+                    assert!(x.abs() >= 55. || y.abs() >= 45., "branch ends inside the board");
+                }
+            }
+        }
     }
 
     #[test]

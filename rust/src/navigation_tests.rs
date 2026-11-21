@@ -360,9 +360,11 @@ fn coordinate_edit_sliders_and_done_drive_the_guide() {
     on_release(&rt, &mut app, &mut ip, None, origin.0 + 20, origin.1 + 10, 1);
     assert!(app.coord.unwrap().origin_x > 330.0);
     let origin = (app.coord.unwrap().origin_x as i32, app.coord.unwrap().origin_y as i32);
-    on_press(&rt, &mut app, &mut ip, None, origin.0, origin.1 - 76, 1);
-    on_motion(&rt, &mut app, &mut ip, origin.0 + 60, origin.1);
-    on_release(&rt, &mut app, &mut ip, None, origin.0 + 60, origin.1, 1);
+    let (hx,hy) = ui::coord_rotate_handle(&app).unwrap();
+    let destination = (origin.0 - (hy as i32 - origin.1), origin.1 + (hx as i32 - origin.0));
+    on_press(&rt, &mut app, &mut ip, None, hx as i32, hy as i32, 1);
+    on_motion(&rt, &mut app, &mut ip, destination.0, destination.1);
+    on_release(&rt, &mut app, &mut ip, None, destination.0, destination.1, 1);
     assert!((app.coord.unwrap().rotation - std::f32::consts::FRAC_PI_2).abs() < 0.2);
     let done = ui::control_rect(&app, ui::Control::Whiteboard(ui::WhiteboardControl::Done)).unwrap();
     on_press(&rt, &mut app, &mut ip, None, done.x + 5, done.y + 5, 1);
@@ -1340,6 +1342,98 @@ fn whiteboard_sidebar_has_no_collapse_button_and_enters_expanded() {
         .flat_map(|right| ui::sidebar_buttons(&app, right).into_iter().map(|(b, _)| b))
         .collect();
     assert!(buttons.contains(&ui::Btn::Collapse));
+}
+
+fn tap_board(rt: &Rt, app: &mut App, ip: &mut Ip, hit: ui::WhiteboardControl) {
+    let r = ui::control_rect(app, ui::Control::Whiteboard(hit)).expect("visible whiteboard control");
+    let (x,y) = (r.x+r.w/2,r.y+r.h/2);
+    assert_eq!(ui::control_at(app,x,y),Some(ui::Control::Whiteboard(hit)));
+    on_press(rt,app,ip,None,x,y,1);
+    on_release(rt,app,ip,None,x,y,1);
+}
+
+#[test]
+fn compact_geometry_values_validate_and_undo_in_order() {
+    use ui::WhiteboardControl as W;
+    use app::{ConicKind as K, ConicDirection as D};
+    use value_input::Key;
+    let (rt,mut a,_) = fixture(false);
+    a.configure_geometry(320,240,1.25);
+    a.toggle_whiteboard();
+    let mut ip = Ip::default();
+    tap_board(&rt,&mut a,&mut ip,W::Ellipse);
+    tap_board(&rt,&mut a,&mut ip,W::Direction(K::Ellipse,D::Vertical));
+    let initial = a.coord.unwrap();
+    tap_board(&rt,&mut a,&mut ip,W::ParameterTab(WbSlider::Shape));
+    tap_board(&rt,&mut a,&mut ip,W::Value(WbSlider::Shape));
+    value_input_key(&rt,&mut a,Key::Character('9'));
+    value_input_key(&rt,&mut a,Key::Enter);
+    assert!(!a.settings_ui.editor.as_ref().unwrap().error.is_empty());
+    assert_eq!(a.coord.unwrap(),initial);
+    value_input_key(&rt,&mut a,Key::SelectAll);
+    for ch in "0.72".chars() { value_input_key(&rt,&mut a,Key::Character(ch)); }
+    value_input_key(&rt,&mut a,Key::Enter);
+    assert!(a.settings_ui.editor.is_none());
+    let edited = a.coord.unwrap();
+    let (major, minor) = conic::ellipse_axes(edited.shape,edited.size);
+    assert!((minor/major-0.72).abs()<0.001);
+    tap_board(&rt,&mut a,&mut ip,W::Done);
+    tap_board(&rt,&mut a,&mut ip,W::Ellipse);
+    assert!(a.coord.unwrap().editing && a.conic_menu.is_none());
+    tap_board(&rt,&mut a,&mut ip,W::Parabola);
+    tap_board(&rt,&mut a,&mut ip,W::Direction(K::Parabola,D::Left));
+    tap_board(&rt,&mut a,&mut ip,W::Delete);
+    a.undo_last();
+    assert_eq!(a.coord.unwrap().direction,D::Left);
+    a.undo_last();
+    assert_eq!(a.coord.unwrap().shape,edited.shape);
+    assert_eq!(a.coord.unwrap().conic,K::Ellipse);
+    a.undo_last();
+    assert_eq!(a.coord.unwrap().shape,initial.shape);
+    a.undo_last();
+    assert!(a.coord.is_none());
+}
+
+#[test]
+fn empty_selection_retries_and_a_cancelled_touch_menu_leaves_no_ink() {
+    use ui::WhiteboardControl as W;
+    let (rt,mut a,_) = fixture(false);
+    a.configure_geometry(640,360,1.);
+    a.toggle_whiteboard();
+    let mut ip = Ip::default();
+    tap_board(&rt,&mut a,&mut ip,W::Hyperbola);
+    handle_touch(&rt,&mut a,&mut ip,None,3,140,65,TouchKind::Begin,1.);
+    handle_touch(&rt,&mut a,&mut ip,None,3,140,65,TouchKind::End,0.);
+    assert!(a.conic_menu.is_none() && a.coord.is_none() && !a.page_has_ink);
+    tap_board(&rt,&mut a,&mut ip,W::Select);
+    on_press(&rt,&mut a,&mut ip,None,100,80,1);
+    on_release(&rt,&mut a,&mut ip,None,140,110,1);
+    assert!(a.select_mode && a.selection_missed && a.floating.is_none());
+    tap_board(&rt,&mut a,&mut ip,W::SelCancel);
+    assert!(!a.select_mode && !a.page_has_ink);
+}
+
+#[test]
+fn guide_drag_releases_once_and_can_be_recentred_without_changing_scale() {
+    use ui::WhiteboardControl as W;
+    let (rt,mut a,_) = fixture(false);
+    a.configure_geometry(800,600,1.);
+    a.toggle_whiteboard();
+    let mut ip = Ip::default();
+    tap_board(&rt,&mut a,&mut ip,W::Empty);
+    let before = a.coord.unwrap();
+    let (x,y) = (before.origin_x as i32,before.origin_y as i32);
+    on_press(&rt,&mut a,&mut ip,None,x,y,1);
+    on_motion(&rt,&mut a,&mut ip,x+12,y+10);
+    on_release(&rt,&mut a,&mut ip,None,x+12,y+10,3);
+    on_release(&rt,&mut a,&mut ip,None,x+41,y+17,1);
+    assert_eq!(a.coord.unwrap().origin_x,before.origin_x+41.);
+    tap_board(&rt,&mut a,&mut ip,W::ResetView);
+    assert_eq!(a.coord.unwrap(),before);
+    a.undo_last();
+    assert_eq!(a.coord.unwrap().origin_y,before.origin_y+17.);
+    a.undo_last();
+    assert_eq!(a.coord.unwrap(),before);
 }
 
 #[test]
