@@ -990,12 +990,13 @@ fn collapsed_edge_tabs_stay_hidden_until_the_user_expands_them() {
 
 #[cfg(unix)]
 #[test]
-fn x11_settings_default_to_the_sharp_overlay_path() {
-    assert!(!super::use_native_settings(true, false, false));
-    assert!(super::use_native_settings(true, false, true));
-    assert!(!super::use_native_settings(true, true, false));
-    assert!(super::use_native_settings(false, false, false));
-    assert!(!super::use_native_settings(false, true, false));
+fn settings_default_to_the_sharp_overlay_path_on_every_backend() {
+    // 3.0/3.1 的设置面板画在覆盖层上，几何直接落在设备像素；受管窗口会被
+    // KWin/UKUI 按全局缩放位图放大而发虚，所以只在显式要求时才打开。
+    assert!(!super::use_native_settings(false, false));
+    assert!(super::use_native_settings(false, true));
+    assert!(!super::use_native_settings(true, false));
+    assert!(!super::use_native_settings(true, true));
 }
 
 #[test]

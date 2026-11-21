@@ -1172,8 +1172,12 @@ fn handle_process_hit(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
 /// X11 defaults to the 3.1 overlay panel because managed windows are blurred
 /// by UKUI/KWin; Wayland keeps the native window. Explicit env overrides win.
 #[cfg(unix)]
-fn use_native_settings(x11_backend: bool, force_overlay: bool, force_native: bool) -> bool {
-    force_native || (!force_overlay && !x11_backend)
+/// 设置面板默认画在覆盖层上，理由与 3.0/3.1 相同：覆盖层的几何直接落在设备
+/// 像素上，UKUI/KWin/XWayland 都不会再对内容做一次位图缩放。3.2 引入的受管
+/// 窗口会被合成器按全局缩放放大而发虚（KWin 尤其明显），所以改为需要时用
+/// `SIDERA_SETTINGS_NATIVE=1` 显式打开；`SIDERA_SETTINGS_OVERLAY=1` 始终优先。
+fn use_native_settings(force_overlay: bool, force_native: bool) -> bool {
+    force_native && !force_overlay
 }
 
 pub fn open_settings(rt: &Rt, app: &mut App) {
@@ -1203,12 +1207,10 @@ pub fn open_settings(rt: &Rt, app: &mut App) {
     {
         let force_overlay = std::env::var_os("SIDERA_SETTINGS_OVERLAY").is_some();
         let force_native = std::env::var_os("SIDERA_SETTINGS_NATIVE").is_some();
-        // 3.1 drew settings on the override-redirect overlay and was sharp on
-        // UKUI/KWin X11. The managed native window introduced in 3.2 is blurred
-        // by some X11 compositors, so X11 defaults back to the overlay path.
-        // SIDERA_SETTINGS_NATIVE=1 opts back into the native window.
-        let x11_backend = rt.backend.as_any().is::<crate::x11::X11Plat>();
-        let use_native = use_native_settings(x11_backend, force_overlay, force_native);
+        // 3.0/3.1 把设置画在覆盖层上，在 UKUI/KWin 下是清晰的；3.2 的受管
+        // 窗口会被合成器按全局缩放再次放大（Wayland 与 XWayland 都一样）。
+        // 因此所有后端默认回到覆盖层，SIDERA_SETTINGS_NATIVE=1 才用独立窗口。
+        let use_native = use_native_settings(force_overlay, force_native);
         if !use_native || app.launch.active() || app.show_input_group_prompt {
             crate::diag_log::info("设置窗口：使用覆盖层绘制");
         } else {
