@@ -1407,6 +1407,24 @@ fn build_coord_layer(app: &App, fonts: &Fonts, key: CoordLayerKey, coord: crate:
     Some(pm)
 }
 
+/// 区域渲染的设备像素原点与变换。
+///
+/// 三个后端都按 `round(x * scale)` 放置上屏的 pixmap。渲染时必须使用同一个
+/// 设备像素原点，否则内容会带上 0~1 像素的亚像素偏移：局部重绘与整屏重绘
+/// 对不齐，表现为点击按钮时整个界面轻微跳动（125%/150% 缩放下最明显）。
+fn region_origin(app: &App, x: i32, y: i32, x2: i32, y2: i32) -> (Transform, u32, u32) {
+    let sc = app.scale as f32;
+    let px0 = (x as f32 * sc).round();
+    let py0 = (y as f32 * sc).round();
+    let px1 = (x2 as f32 * sc).round();
+    let py1 = (y2 as f32 * sc).round();
+    let pw = (px1 - px0).max(1.0) as u32;
+    let ph = (py1 - py0).max(1.0) as u32;
+    // world(逻辑) -> region(物理)：平移量直接写在设备像素空间，避免
+    // pre_translate 再乘一次缩放带来的浮点误差。
+    (Transform { sx: sc, sy: sc, kx: 0.0, ky: 0.0, tx: -px0, ty: -py0 }, pw, ph)
+}
+
 pub fn render_region(
     app: &App,
     fonts: &Fonts,
@@ -1427,11 +1445,8 @@ pub fn render_region(
         return None;
     }
     let sc = app.scale as f32;
-    let pw = ((rw as f32) * sc).round().max(1.0) as u32;
-    let ph = ((rh as f32) * sc).round().max(1.0) as u32;
+    let (tr, pw, ph) = region_origin(app, x, y, x2, y2);
     let mut pm = Pixmap::new(pw, ph)?;
-    // world(逻辑) -> region(物理)：先平移再缩放
-    let tr = Transform::from_scale(sc, sc).pre_translate(-x as f32, -y as f32);
     if app.settings_ui.window_size().is_some() {
         if app.previewing_sidebars() {
             let mut ctx = Ctx { palette, pm: &mut pm, tr };
@@ -2354,14 +2369,42 @@ mod tests {
                     a.settings_page = page;
                     let r = settings_rect(&a);
                     let pm = render_region(&a, &fonts, None, r.x, r.y, r.w, r.h).unwrap();
-                    assert_eq!(pm.width(), (r.w as f64 * scale).round() as u32);
-                    assert_eq!(pm.height(), (r.h as f64 * scale).round() as u32);
+                    let px0 = (r.x as f64 * scale).round() as u32;
+                    let py0 = (r.y as f64 * scale).round() as u32;
+                    let px1 = ((r.x + r.w) as f64 * scale).round() as u32;
+                    let py1 = ((r.y + r.h) as f64 * scale).round() as u32;
+                    assert_eq!(pm.width(), px1 - px0);
+                    assert_eq!(pm.height(), py1 - py0);
                     let done = settings_controls(&a).into_iter().find(|(h, _)| *h == SetHit::Done).unwrap().1;
-                    assert_eq!(pm.pixel(((done.x - r.x + 6) as f64 * scale) as u32,
-                        ((done.y - r.y + 19) as f64 * scale) as u32).unwrap(),
+                    let center_x = ((done.x as f64 + done.w as f64 / 2.0) * scale).round() as u32 - px0;
+                    let center_y = ((done.y as f64 + done.h as f64 / 2.0) * scale).round() as u32 - py0;
+                    assert_eq!(pm.pixel(center_x, center_y).unwrap(),
                         c(a.theme.palette().accent).to_color_u8().premultiply());
                     assert!(a.canvas.data().iter().all(|&b| b == 0));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn region_repaint_origin_snaps_to_device_pixels() {
+        // 点击控件只重绘一小块区域。三个后端都按 round(x*scale) 放置 pixmap，
+        // 渲染原点若不对齐到同一个设备像素，局部重绘就会带上亚像素偏移，
+        // 表现为界面轻微跳动。
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            let mut a = App::new(Pixmap::new(640, 360).unwrap(), 640, 360);
+            a.set_scale(scale);
+            for (x, y) in [(0, 0), (1, 3), (7, 57), (101, 57), (233, 199)] {
+                let (tr, pw, ph) = region_origin(&a, x, y, x + 120, y + 90);
+                let px0 = (x as f64 * scale).round() as f32;
+                let py0 = (y as f64 * scale).round() as f32;
+                let px1 = ((x + 120) as f64 * scale).round() as f32;
+                let py1 = ((y + 90) as f64 * scale).round() as f32;
+                assert_eq!((tr.sx, tr.sy), (scale as f32, scale as f32));
+                assert_eq!(tr.tx, -px0, "scale={scale} x={x}");
+                assert_eq!(tr.ty, -py0, "scale={scale} y={y}");
+                assert_eq!(pw as f32, px1 - px0, "scale={scale} x={x}");
+                assert_eq!(ph as f32, py1 - py0, "scale={scale} y={y}");
             }
         }
     }
