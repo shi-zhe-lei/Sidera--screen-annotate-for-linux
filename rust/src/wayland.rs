@@ -182,6 +182,30 @@ fn shm_layout(w: i32, h: i32) -> Option<(i32, usize)> {
     Some((stride, len as usize))
 }
 
+/// 把 back 的指定矩形转成 BGRA 写进 shm 池。只碰脏区，避免每帧整屏拷贝。
+fn copy_rect(dst: &mut [u8], src: &[u8], width: i32, height: i32,
+             rect: (i32, i32, i32, i32)) {
+    let (x0, y0, x1, y1) = rect;
+    let x0 = x0.clamp(0, width);
+    let x1 = x1.clamp(x0, width);
+    let y0 = y0.clamp(0, height);
+    let y1 = y1.clamp(y0, height);
+    if x1 <= x0 || y1 <= y0 { return; }
+    let stride = width as usize;
+    let row_bytes = stride.saturating_mul(4);
+    if row_bytes == 0 || src.len() < row_bytes.saturating_mul(height as usize) { return; }
+    for y in y0..y1 {
+        let row = y as usize * stride;
+        let start = (row + x0 as usize) * 4;
+        let end = (row + x1 as usize) * 4;
+        let dst_row = &mut dst[start..end];
+        let src_row = &src[start..end];
+        for (d, s) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
+            d.copy_from_slice(&[s[2], s[1], s[0], s[3]]);
+        }
+    }
+}
+
 fn render_scale(requested: f64, viewport: bool, surface_version: u32) -> f64 {
     let scale = if requested.is_finite() { requested.clamp(1.0, 4.0) } else { 1.0 };
     if viewport {
@@ -196,11 +220,24 @@ fn render_scale(requested: f64, viewport: bool, surface_version: u32) -> f64 {
 struct ShmFrames {
     shm: Shm,
     slots: [Option<ShmFrame>; 2],
+    /// 每个槽"上次写入之后"累积的脏区（物理像素，x0,y0,x1,y1）。
+    /// 空闲槽可能落后好几帧，只补这块就够，不必每帧整屏拷贝。
+    pending: [Option<(i32, i32, i32, i32)>; 2],
 }
 
 impl ShmFrames {
     fn new(shm: &Shm) -> Self {
-        Self { shm: Shm::from(shm.wl_shm().clone()), slots: [None, None] }
+        Self { shm: Shm::from(shm.wl_shm().clone()), slots: [None, None], pending: [None, None] }
+    }
+
+    /// 记录一次上屏更新，两个槽都要补这块。
+    fn mark(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        for slot in self.pending.iter_mut() {
+            *slot = Some(match *slot {
+                None => (x, y, x + w, y + h),
+                Some((a, b, c, d)) => (a.min(x), b.min(y), c.max(x + w), d.max(y + h)),
+            });
+        }
     }
 
     fn release(&mut self, buffer: &wl_buffer::WlBuffer) {
@@ -222,12 +259,15 @@ impl ShmFrames {
             let mut pool = RawPool::new(bytes, &self.shm)?;
             let buffer = pool.create_buffer(0, w, h, stride, wl_shm::Format::Argb8888, (), qh);
             self.slots[idx] = Some(ShmFrame { pool, buffer, dims: (w, h), busy: false });
+            // 新池的内容未知，必须整屏同步一次。
+            self.pending[idx] = Some((0, 0, w, h));
         }
+        // A free slot may be several frames old. Copy only the region that
+        // changed since this slot was last written; the rest still matches.
+        let rect = self.pending[idx].take();
         let frame = self.slots[idx].as_mut().unwrap();
-        // A free slot may be several frames old. Copy the authoritative canvas,
-        // including changes made while both slots were busy.
-        for (dst, src) in frame.pool.mmap().chunks_exact_mut(4).zip(back.data().chunks_exact(4)) {
-            dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
+        if let Some((x0, y0, x1, y1)) = rect {
+            copy_rect(&mut frame.pool.mmap()[..], back.data(), w, h, (x0, y0, x1, y1));
         }
         frame.busy = true;
         Ok(Some(&frame.buffer))
@@ -340,6 +380,7 @@ impl Backend for WlPlat {
             }
         }
         self.union_dirty(x, y, pm.width() as i32, pm.height() as i32);
+        self.frames.borrow_mut().mark(x, y, pm.width() as i32, pm.height() as i32);
     }
     fn flush(&self) {
         let Some((x0, y0, x1, y1)) = self.dirty.get() else {

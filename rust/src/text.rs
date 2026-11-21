@@ -139,17 +139,21 @@ impl Fonts {
             if list.len() >= 8 || covered.iter().all(|found| *found) { break; }
             // Bound malformed/oversized font files without an arbitrary first-40 cutoff.
             if std::fs::metadata(p).map(|m| m.len() > 64 * 1024 * 1024).unwrap_or(true) { continue; }
-            if let Ok(data) = std::fs::read(p) {
-                if let Ok(f) = FontArc::try_from_vec(data) {
-                    let mut useful = list.is_empty();
-                    for (index, ch) in samples.iter().enumerate() {
-                        if !covered[index] && f.glyph_id(*ch).0 != 0 {
-                            covered[index] = true;
-                            useful = true;
-                        }
+            // 字体要活到进程结束，直接泄漏一份只读映射：ab_glyph 需要 'static
+            // 切片，而 mmap 的字体是文件页，内存紧张时内核可以回收；整份读进
+            // Vec 则是永远压不掉的匿名内存。
+            let Ok(file) = std::fs::File::open(p) else { continue };
+            let Ok(mmap) = (unsafe { memmap2::Mmap::map(&file) }) else { continue };
+            let data: &'static [u8] = &*Box::leak(Box::new(mmap));
+            if let Ok(f) = FontArc::try_from_slice(data) {
+                let mut useful = list.is_empty();
+                for (index, ch) in samples.iter().enumerate() {
+                    if !covered[index] && f.glyph_id(*ch).0 != 0 {
+                        covered[index] = true;
+                        useful = true;
                     }
-                    if useful { list.push(f); }
                 }
+                if useful { list.push(f); }
             }
         }
         if list.is_empty() {

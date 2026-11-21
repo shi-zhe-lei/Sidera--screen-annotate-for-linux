@@ -6,7 +6,7 @@
 #
 # 依赖：bwrap + qemu-aarch64-static（已注册 binfmt）
 #       + 仓库根 aarch64-sysroot/（容器内含 gcc-9 + Qt5.12）
-# 产物：annotate_aarch64、sidera_3.2-Electro-stable_arm64.deb
+# 产物：annotate_aarch64、sidera_3.2-Electro-stable~beta1_arm64.deb
 # ============================================================
 set -e
 cd "$(dirname "$0")"

@@ -9,7 +9,7 @@ on:
       release_tag:
         description: Existing release tag
         required: true
-        default: v3.2-Electro-stable
+        default: v3.2-Electro-stable-beta1
         type: string
 
 permissions:
@@ -28,7 +28,7 @@ jobs:
             machine: aarch64
             runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
+    timeout-minutes: 60
     env:
       RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
       DEB_ARCH: ${{ matrix.architecture }}
@@ -37,6 +37,9 @@ jobs:
       RUSTUP_TOOLCHAIN: 1.93.1
       REQUIRE_FULL_TESTS: '1'
       CARGO_TERM_COLOR: never
+      # 产物能装多老的系统由构建环境的 glibc 决定；22.04 会要求 GLIBC_2.35。
+      SIDERA_BUILD_IMAGE: ubuntu:20.04
+      MAX_GLIBC: '2.31'
     steps:
       - name: Checkout build and verification tools
         uses: actions/checkout@v4
@@ -47,10 +50,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v3\.2-Electro(-stable|\.rc(\.[0-9]+)?)$ ]]
+          [[ "$RELEASE_TAG" =~ ^v3\.2-Electro(-stable(-beta[0-9]+)?|\.rc(\.[0-9]+)?)$ ]]
           test "$(uname -m)" = "$EXPECTED_MACHINE"
           test "$(dpkg --print-architecture)" = "$DEB_ARCH"
           version="${RELEASE_TAG#v}"
+          # git 标签不能含 '~'；包版本用 '~' 表示"低于正式版"，
+          # 这样以后发布 3.2-Electro-stable 时会被视为升级而不是降级。
+          version="${version/-beta/~beta}"
           echo "SIDERA_VERSION=${version}" >> "$GITHUB_ENV"
 
       - name: Checkout the exact application tag
@@ -81,10 +87,9 @@ jobs:
           rustup toolchain install "$RUST_VERSION" --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Compile the tagged application natively
+      - name: Check the tagged sources compile
         working-directory: release-source/rust
         run: |
-          cargo build --release --locked
           cargo check --tests --examples --locked
 
       - name: Verify Rust behavior including themes
@@ -101,15 +106,32 @@ jobs:
           python3 release-source/tools/test_rust.py --x11 2>&1 | tee "release-artifacts/X11-TESTS-${DEB_ARCH}.txt"
           python3 release-source/tools/test_rust.py --wayland 2>&1 | tee "release-artifacts/WAYLAND-TESTS-${DEB_ARCH}.txt"
 
-      - name: Package and verify architecture and dependencies
+      - name: Compile and package in an Ubuntu 20.04 container
         shell: bash
         run: |
           set -euo pipefail
           cp rust/build_deb.sh release-source/rust/build_deb.sh
           mkdir -p release-source/tools
           cp tools/deb_dependencies.py release-source/tools/deb_dependencies.py
-          bash release-source/rust/build_deb.sh "$DEB_ARCH"
+          # 容器的 glibc 就是产物的最低运行基线：20.04 = 2.31。
+          # 编译在容器内的独立 target 目录完成，避免复用宿主机构建的旧二进制。
+          docker run --rm -e DEB_ARCH="$DEB_ARCH" -e DEBIAN_FRONTEND=noninteractive \
+            -v "$PWD/release-source:/src" -w /src/rust ubuntu:20.04 bash -lc '
+              set -euo pipefail
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                build-essential pkg-config libwayland-dev libxkbcommon-dev \
+                libx11-dev libxcb1-dev dpkg-dev binutils python3 curl ca-certificates
+              curl --proto "=https" --tlsv1.2 -fsSL https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain 1.93.1
+              . "$HOME/.cargo/env"
+              cargo build --release --locked --target-dir /tmp/build
+              install -Dm755 /tmp/build/release/sidera /src/rust/target/release/sidera
+              cd /src && bash rust/build_deb.sh "$DEB_ARCH"
+            '
+          sudo chown -R "$(id -u):$(id -g)" release-source
           git -C release-source diff --exit-code -- rust/src rust/Cargo.toml rust/Cargo.lock wps-addin compat
+          mkdir -p release-artifacts
           cp "release-source/sidera_${SIDERA_VERSION}_${DEB_ARCH}.deb" release-artifacts/
           dpkg-deb --extract "release-artifacts/sidera_${SIDERA_VERSION}_${DEB_ARCH}.deb" "$PWD/release-unpacked"
           cmp release-source/rust/target/release/sidera "$PWD/release-unpacked/usr/bin/sidera"

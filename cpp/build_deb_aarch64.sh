@@ -1,14 +1,14 @@
 #!/bin/bash
 # arm64 deb 打包脚本
 # 用法: ./build_deb_aarch64.sh
-# 产物: sidera_3.2-Electro-stable_arm64.deb
+# 产物: sidera_3.2-Electro-stable~beta1_arm64.deb
 
 set -e
 cd "$(dirname "$0")"
 
 BINARY="annotate_aarch64"
 PKG_NAME="sidera"
-VERSION="${SIDERA_VERSION:-3.2-Electro-stable}"
+VERSION="${SIDERA_VERSION:-3.2-Electro-stable~beta1}"
 dpkg --validate-version "$VERSION" || exit 1
 [[ "$VERSION" != */* && "$VERSION" != *[[:space:]]* ]] || exit 1
 ARCH="arm64"

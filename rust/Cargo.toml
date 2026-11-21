@@ -1,6 +1,6 @@
 [package]
 name = "sidera"
-version = "3.2.0-Electro-stable"
+version = "3.2.0-Electro-stable-beta1"
 edition = "2021"
 description = "Sidera - screen annotation overlay (Rust, X11, layer-shell and GNOME Wayland)"
 license = "GPL-3.0-only"
@@ -20,6 +20,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 dirs = "5"
 log = "0.4"
 env_logger = "0.11"
+memmap2 = "0.9"
 serde_json = "1"
 sha1 = "0.10"
 url = "2"

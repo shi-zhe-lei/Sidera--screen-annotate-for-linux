@@ -913,6 +913,8 @@ impl App {
         // Each whiteboard session starts fresh.
         self.coord = None;
         self.coord_pages.clear();
+        // 整屏网格缓存只在白板里用；退出后必须放掉，否则一块整屏内存常驻。
+        self.coord_layer.borrow_mut().take();
         self.coord_page = 1;
         self.conic_menu = None;
         self.select_mode = false;

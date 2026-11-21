@@ -9,7 +9,7 @@
 #       若要部署到较老的发行版（如 Ubuntu 20.04），仍请用 rust/build_*.sh 的容器交叉构建。
 
 pkgname=sidera
-pkgver=3.2_electro_stable
+pkgver=3.2_electro_stable_beta1
 pkgrel=1
 pkgdesc="Linux 屏幕批注与教学演示工具（Rust，X11/Wayland，WPS 联动）"
 arch=('x86_64' 'aarch64')

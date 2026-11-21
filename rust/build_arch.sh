@@ -22,7 +22,7 @@ BIN="$(pkg_find_bin)"
 [ -f "$BIN" ] || { echo "错误: 找不到二进制 $BIN，请先 ./build_container.sh $SRC_ARCH"; exit 1; }
 command -v bsdtar >/dev/null || { echo "错误: 缺少 bsdtar"; exit 1; }
 
-VER=3.2_electro_stable
+VER=3.2_electro_stable_beta1
 REL=1
 DIST="$HERE/dist"
 mkdir -p "$DIST"
