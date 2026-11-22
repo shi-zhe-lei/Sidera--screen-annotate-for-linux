@@ -166,6 +166,10 @@ impl Fonts {
         }
         Fonts { list }
     }
+    /// 供共用绘制入口使用的字体句柄。清晰度改造（em 度量 + hinting）尚未并入
+    /// 本分支，这里返回同一份字体，行为与全局一致。
+    pub(crate) fn for_settings(&self) -> Self { self.clone() }
+
     fn pick(&self, ch: char) -> Option<&FontArc> {
         self.list.iter().find(|f| f.glyph_id(ch).0 != 0)
     }
