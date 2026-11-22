@@ -1607,15 +1607,16 @@ fn draw_sidebar_pages(app: &App, fonts: &Fonts, ctx: &mut Ctx, right: bool) {
 }
 
 fn draw_button_label(fonts: &Fonts, ctx: &mut Ctx, r: R, label: &str, ink: Color) {
-    // Fit visible outlines, including overhangs and descenders, inside the padding.
+    // 按“步进宽度”收字：中文字形墨迹比步进窄，用墨迹算字号会让两字标签溢出按钮。
     let Some((left, top, right, bottom)) = fonts.text_bounds(label, 1.0) else { return };
-    let width = (right - left).max(0.01);
+    let width = fonts.text_width(label, 1.0).max(0.01);
+    let ink_width = (right - left).max(0.01);
     let height = (bottom - top).max(0.01);
     let padding = (r.w.min(r.h) as f32 * 0.10).max(2.0);
     let size = (r.w as f32 * 0.49).max(11.0)
         .min((r.w as f32 - 2.0 * padding).max(1.0) / width)
         .min((r.h as f32 - 2.0 * padding).max(1.0) / height);
-    let x = r.x as f32 + (r.w as f32 - width * size) / 2.0 - left * size;
+    let x = r.x as f32 + (r.w as f32 - ink_width * size) / 2.0 - left * size;
     let baseline = r.y as f32 + (r.h as f32 - height * size) / 2.0 - top * size;
     ctx.text(fonts, label, x, baseline, size, ink);
 }
@@ -1648,9 +1649,7 @@ fn draw_btn(app: &App, fonts: &Fonts, ctx: &mut Ctx, k: Btn, r: R) {
     }
     surface(ctx, r, radius, fill, edge);
     match k {
-        Btn::Collapse => {
-            ctx.text_multiline_center(fonts, r, "收起", (btn * 0.49).max(11.0), c(palette.muted));
-        }
+        Btn::Collapse => draw_button_label(fonts, ctx, r, "收起", c(palette.muted)),
         Btn::Cursor | Btn::Pen | Btn::Eraser | Btn::Prev | Btn::Next => {
             let glyph = match k {
                 Btn::Cursor => Glyph::Cursor, Btn::Pen => Glyph::Pen, Btn::Eraser => Glyph::Eraser,
@@ -1675,7 +1674,7 @@ fn draw_btn(app: &App, fonts: &Fonts, ctx: &mut Ctx, k: Btn, r: R) {
         Btn::Clear => draw_button_label(fonts, ctx, r, "清除", c(palette.danger)),
         Btn::Restore => draw_button_label(fonts, ctx, r, "恢复", ink),
         Btn::Screenshot => draw_button_label(fonts, ctx, r, "截图", ink),
-        Btn::Undo => ctx.text_center(fonts, r, "撤回", (btn * 0.49).max(11.0), ink),
+        Btn::Undo => draw_button_label(fonts, ctx, r, "撤回", ink),
         Btn::Whiteboard => {
             if app.whiteboard {
                 let top = R { h: r.h / 2, ..r };

@@ -170,6 +170,16 @@ impl Fonts {
     /// 本分支，这里返回同一份字体，行为与全局一致。
     pub(crate) fn for_settings(&self) -> Self { self.clone() }
 
+    /// 字号按 em 解释。ab_glyph 的 PxScale 是 ascent-to-descent 全高，内置中文面
+    /// 约 1.448 em；直接传 em 数值会让中文小掉约三成（13px 只剩 8.3px 字高），
+    /// 小字号必然发糊。
+    fn em_scale(face: &FontArc, px: f32) -> PxScale {
+        if let Some(em) = face.units_per_em().filter(|em| *em > 0.0) {
+            return PxScale::from(px * (face.height_unscaled() / em));
+        }
+        PxScale::from(px)
+    }
+
     fn pick(&self, ch: char) -> Option<&FontArc> {
         self.list.iter().find(|f| f.glyph_id(ch).0 != 0)
     }
@@ -178,7 +188,7 @@ impl Fonts {
         let mut w = 0.0;
         for ch in s.chars() {
             if let Some(f) = self.pick(ch) {
-                let sf = f.as_scaled(PxScale::from(px));
+                let sf = f.as_scaled(Self::em_scale(f, px));
                 let gid = sf.glyph_id(ch);
                 w += sf.h_advance(gid);
             } else {
@@ -194,7 +204,7 @@ impl Fonts {
         let mut caret = 0.0;
         for ch in s.chars() {
             let Some(font) = self.pick(ch) else { caret += px * 0.5; continue };
-            let scaled = font.as_scaled(PxScale::from(px));
+            let scaled = font.as_scaled(Self::em_scale(font, px));
             let glyph = scaled.glyph_id(ch);
             if let Some(outline) = font.outline(glyph) {
                 let scale = scaled.h_scale_factor();
@@ -258,7 +268,7 @@ impl Fonts {
                 caret += px * 0.5;
                 continue;
             };
-            let sf = f.as_scaled(PxScale::from(px));
+            let sf = f.as_scaled(Self::em_scale(f, px));
             let gid = sf.glyph_id(ch);
             let adv = sf.h_advance(gid);
             // 必须与 ab_glyph 的 h_advance 用同一个缩放因子（px / height_unscaled），
