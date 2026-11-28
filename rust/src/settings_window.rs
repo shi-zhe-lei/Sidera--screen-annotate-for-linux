@@ -166,7 +166,7 @@ impl X11Window {
         x11.conn.change_property8(PropMode::REPLACE, id, AtomEnum::WM_NAME,
             AtomEnum::STRING, b"Sidera Settings")?.check()?;
         x11.conn.change_property8(PropMode::REPLACE, id, net_name, utf8,
-            "Sidera · 偏好设置".as_bytes())?.check()?;
+            "Sidera 设置".as_bytes())?.check()?;
         x11.conn.change_property8(PropMode::REPLACE, id, AtomEnum::WM_CLASS,
             AtomEnum::STRING, b"sidera\0Sidera\0")?.check()?;
         x11.conn.change_property32(PropMode::REPLACE, id, protocols, AtomEnum::ATOM, &[delete])?.check()?;

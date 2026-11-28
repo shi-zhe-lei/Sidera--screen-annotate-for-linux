@@ -2,5 +2,5 @@
 <JsPlugin>
   <ApiVersion>1.0.0</ApiVersion>
   <Name>Sidera 联动</Name>
-  <Description>sidera bridge: report WPS slideshow events and receive NEXT/PREV</Description>
+  <Description>在 WPS 演示中同步页码和翻页。</Description>
 </JsPlugin>

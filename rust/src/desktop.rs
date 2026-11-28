@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Read;
 use crate::instance::Instance as UnixListener;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tiny_skia::Pixmap;
 use crate::{app, App, Backend, Fonts, Ip, Rt, Timers, WpsBridge};
 use crate::gesture::TouchKind;
@@ -34,6 +34,20 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_tab_shares_the_original_deadline_with_other_outputs() {
+        let mut desktop = fixture();
+        let start = Instant::now() - Duration::from_secs(30);
+        let laptop = &mut desktop.outputs.get_mut("laptop").unwrap().app;
+        laptop.sidebar_expand_minutes = 1;
+        laptop.set_sidebar_collapsed_since(Some(start));
+        desktop.synchronize("laptop");
+        let projector = &desktop.outputs["projector"].app;
+        assert_eq!(projector.sidebar_collapsed_since, Some(start));
+        assert_eq!(projector.sidebar_countdown_at(start + Duration::from_secs(30)), Some(128));
+        assert_eq!(projector.sidebar_countdown_at(start + Duration::from_secs(60)), Some(0));
+    }
+
+    #[test]
     fn cursor_and_pages_follow_ink_on_any_output_without_untucking_sidebars() {
         let mut desktop = fixture();
         desktop.toggle();
@@ -44,12 +58,16 @@ mod tests {
         let laptop = desktop.outputs.get_mut("laptop").unwrap();
         crate::go_next(&laptop.rt, &mut laptop.app, None);
         desktop.synchronize("laptop");
+        assert!(desktop.outputs.values().all(|o| o.app.drawing_tools.expanded()));
+        desktop.resolve_drawing_tools_at(Instant::now() + Duration::from_secs(1));
         assert!(desktop.outputs.values().all(|o| o.app.current_slide == 2 && !o.app.drawing_tools.expanded()));
         assert!(!desktop.controls.drawing_tools);
         desktop.motion("projector", 50, 50);
         let laptop = desktop.outputs.get_mut("laptop").unwrap();
         crate::go_prev(&laptop.rt, &mut laptop.app, None);
         desktop.synchronize("laptop");
+        assert!(desktop.outputs.values().all(|o| !o.app.drawing_tools.expanded()));
+        desktop.resolve_drawing_tools_at(Instant::now() + Duration::from_secs(1));
         assert!(desktop.outputs["projector"].app.canvas.pixels().iter().any(|p| p.alpha() != 0));
         assert!(desktop.outputs.values().all(|o| o.app.mode == 0 && o.app.drawing_tools.expanded()));
         assert!(desktop.controls.drawing_tools);
@@ -65,7 +83,30 @@ mod tests {
             else { crate::go_prev(&laptop.rt, &mut laptop.app, None); }
             desktop.synchronize("laptop");
             assert!(desktop.outputs.values().all(|o| o.app.collapsed && !o.app.drawing_tools.expanded()));
-            assert!(desktop.controls.collapsed && !desktop.controls.drawing_tools);
+            assert!(desktop.controls.collapsed_since.is_some() && !desktop.controls.drawing_tools);
+        }
+    }
+
+    #[test]
+    fn a_cleared_output_keeps_its_own_restore_key() {
+        use crate::toolbar::DrawerLayout;
+        let mut desktop = fixture();
+        desktop.toggle();
+        let projector = desktop.outputs.get_mut("projector").unwrap();
+        crate::paint::stroke_tapered(&mut projector.app, (20, 20), (80, 20), 5, 5);
+        crate::clear_drawing(&projector.rt, &mut projector.app);
+        desktop.synchronize("projector");
+        assert_eq!(desktop.outputs["projector"].app.drawing_tools.layout(), DrawerLayout::RestoreOnly);
+        assert_eq!(desktop.outputs["laptop"].app.drawing_tools.layout(), DrawerLayout::Compact);
+        for next in [true, false] {
+            let laptop = desktop.outputs.get_mut("laptop").unwrap();
+            if next { crate::go_next(&laptop.rt, &mut laptop.app, None); }
+            else { crate::go_prev(&laptop.rt, &mut laptop.app, None); }
+            desktop.synchronize("laptop");
+            desktop.resolve_drawing_tools_at(Instant::now() + Duration::from_secs(1));
+            assert_eq!(desktop.outputs["projector"].app.drawing_tools.layout(),
+                if next { DrawerLayout::Compact } else { DrawerLayout::RestoreOnly });
+            assert_eq!(desktop.outputs["laptop"].app.drawing_tools.layout(), DrawerLayout::Compact);
         }
     }
 
@@ -86,6 +127,33 @@ mod tests {
         desktop.outputs.get_mut("laptop").unwrap().app.toggle_whiteboard();
         desktop.synchronize("laptop");
         assert!(desktop.outputs.values().all(|o| o.app.mode == 0 && !o.app.drawing_tools.expanded()));
+    }
+
+    #[test]
+    fn toolbar_display_options_in_appearance_reach_other_outputs() {
+        let mut desktop = fixture();
+        use crate::ui::SetHit::{FadeToolbarDuringShow, ToolbarIconsOnly};
+        for hit in [FadeToolbarDuringShow, ToolbarIconsOnly] {
+            let app = &mut desktop.outputs.get_mut("laptop").unwrap().app;
+            app.configure_geometry(640, 360, 1.0);
+            app.settings_open = true;
+            app.settings_ui.select(crate::settings_state::Tab::General);
+            assert!(!crate::settings_panel::controls(app).iter().any(|(h, _)| *h == hit));
+            app.settings_ui.select(crate::settings_state::Tab::Appearance);
+            let (_, row) = (0..crate::settings_panel::layout(app).pages).find_map(|page| {
+                app.settings_page = page;
+                crate::settings_panel::controls(app).into_iter().find(|(h, _)| *h == hit)
+            }).unwrap();
+            let (x, y) = (row.x + row.w - 32, row.y + row.h / 2);
+            for enabled in [true, false] {
+                desktop.press("laptop", x, y, 1);
+                desktop.release("laptop", x, y, 1);
+                assert!(desktop.outputs.values().all(|o| {
+                    let actual = if hit == ToolbarIconsOnly { o.app.toolbar_icons_only } else { o.app.fade_toolbar_during_show };
+                    actual == enabled
+                }));
+            }
+        }
     }
 
     #[test]
@@ -112,10 +180,11 @@ mod tests {
 
 #[derive(Clone, PartialEq)]
 struct Controls {
-    mode: i32, saved_mode: i32, collapsed: bool, whiteboard: bool, whiteboard_bg: i32,
+    mode: i32, saved_mode: i32, collapsed_since: Option<Instant>, whiteboard: bool, whiteboard_bg: i32,
     drawing_tools: bool, saved_drawing_tools: bool,
     page: i32, color: usize, pen: usize, eraser: usize, wps: bool, wps_test: bool, linked_show: bool,
-    alpha: u8, scale: f64,
+    alpha: u8, scale: f64, fade_toolbar_during_show: bool, toolbar_icons_only: bool,
+    document_scroll_enabled: bool,
     sidebar_expand_minutes: u32,
     recent_colors: Vec<u32>,
     threshold: f64, erase_scale: i32,
@@ -123,11 +192,17 @@ struct Controls {
 }
 impl Controls {
     fn read(app: &App) -> Self {
-        Self { mode: app.mode, saved_mode: app.saved_mode, collapsed: app.collapsed, whiteboard: app.whiteboard,
+        // Guide editing and lasso selection belong to the output that owns them.
+        let local_edit = app.whiteboard && (app.select_mode || app.coord.is_some_and(|c| c.editing));
+        let mode = if local_edit && app.mode == 0 { 1 } else { app.mode };
+        Self { mode, saved_mode: app.saved_mode, collapsed_since: app.sidebar_collapsed_since, whiteboard: app.whiteboard,
             drawing_tools: app.drawing_tools.expanded(), saved_drawing_tools: app.saved_drawing_tools,
             whiteboard_bg: app.whiteboard_bg_index, page: app.current_slide,
             color: app.cur_color, pen: app.cur_pen, eraser: app.cur_eraser,
             wps: app.wps_debug, wps_test: app.wps_test_mode, alpha: app.sidebar_alpha, scale: app.sb_scale,
+            fade_toolbar_during_show: app.fade_toolbar_during_show,
+            toolbar_icons_only: app.toolbar_icons_only,
+            document_scroll_enabled: app.document_scroll_enabled,
             linked_show: app.wps_debug && app.wps_connected && app.wps_real_pos > 0,
             sidebar_expand_minutes: app.sidebar_expand_minutes,
             recent_colors: app.settings_ui.recent.clone(),
@@ -136,9 +211,10 @@ impl Controls {
     }
     fn apply(&self, output: &mut Output) {
         let a = &mut output.app;
-        let mode = if self.whiteboard && self.mode == 0 { 1 } else { self.mode };
+        let mode = self.mode;
+        let collapsed = self.collapsed_since.is_some();
         if a.mode != mode || a.whiteboard != self.whiteboard
-            || a.drawing_tools.expanded() != self.drawing_tools || a.collapsed != self.collapsed {
+            || a.drawing_tools.expanded() != self.drawing_tools || a.collapsed != collapsed {
             crate::cancel_input(&output.rt, a, &mut output.ip);
             crate::close_all_popups(&output.rt, a);
         }
@@ -146,16 +222,26 @@ impl Controls {
         if (self.whiteboard || !self.linked_show) && a.current_slide != self.page {
             a.save_current_page(); a.current_slide = self.page; a.load_page(self.page);
         }
-        a.set_sidebar_collapsed(self.collapsed);
-        a.drawing_tools.set_expanded(self.drawing_tools);
+        if a.drawing_tools.expanded() != self.drawing_tools || a.mode != mode || a.collapsed != collapsed {
+            let layout = crate::toolbar::DrawerLayout::for_page(self.drawing_tools, !collapsed && a.can_restore_cleared());
+            a.drawing_tools.set_layout_at(layout, Instant::now());
+        }
+        a.sidebar_expand_minutes = self.sidebar_expand_minutes;
+        a.set_sidebar_collapsed_since(self.collapsed_since);
         a.saved_drawing_tools = self.saved_drawing_tools;
-        a.mode = mode; a.saved_mode = self.saved_mode;
+        if a.mode != mode { a.set_tool_mode(mode); }
+        a.saved_mode = self.saved_mode;
         a.whiteboard_bg_index = self.whiteboard_bg;
         a.apply_theme(self.theme);
         a.cur_color = self.color; a.cur_pen = self.pen; a.cur_eraser = self.eraser;
         a.wps_debug = self.wps; a.wps_test_mode = self.wps_test;
         a.sidebar_alpha = self.alpha; a.sb_scale = self.scale;
-        a.sidebar_expand_minutes = self.sidebar_expand_minutes;
+        a.toolbar_icons_only = self.toolbar_icons_only;
+        a.document_scroll_enabled = self.document_scroll_enabled;
+        if a.fade_toolbar_during_show != self.fade_toolbar_during_show {
+            a.fade_toolbar_during_show = self.fade_toolbar_during_show;
+            a.presentation_fade.reset();
+        }
         a.settings_ui.recent.clone_from(&self.recent_colors);
         a.large_touch_threshold = self.threshold; a.large_erase_scale10 = self.erase_scale;
         crate::apply_input_shape(&output.rt, a);
@@ -213,6 +299,7 @@ impl Desktop {
         if let Some(mut output) = self.outputs.remove(id) {
             crate::cancel_input(&output.rt, &mut output.app, &mut output.ip);
             output.app.launch.finish();
+            output.app.presentation_fade.reset();
             output.app.settings_open = false;
             output.app.settings_ui.dialog = None;
             output.app.settings_ui.picker = None;
@@ -263,6 +350,11 @@ impl Desktop {
     }
 
     fn resolve_drawing_tools_auto_update(&mut self) {
+        self.resolve_drawing_tools_at(Instant::now());
+    }
+
+    fn resolve_drawing_tools_at(&mut self, now: Instant) {
+        if self.outputs.values().any(|o| o.app.waiting_for_drawer(now)) { return; }
         // Consume every request, then decide after all displays have changed
         // page/mode. Ink on any projector also reopens the shared tool drawer.
         let requested = self.outputs.values_mut().fold(None, |pending, output| {
@@ -321,7 +413,7 @@ impl Desktop {
         if self.controls.whiteboard { return; }
         self.controls.mode = if self.controls.mode == 0 { 1 } else { 0 };
         if self.controls.mode != 0 {
-            self.controls.collapsed = false;
+            self.controls.collapsed_since = None;
             self.controls.drawing_tools = true;
         }
         for output in self.outputs.values_mut() {

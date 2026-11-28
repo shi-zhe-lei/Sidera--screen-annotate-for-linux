@@ -76,7 +76,7 @@ void showEraserPopup() {
   }
   lay->addLayout(sr);
   lay->addSpacing(6);
-  QPushButton* cb = new QPushButton(QString::fromUtf8("清除全部"));
+  QPushButton* cb = new QPushButton(QString::fromUtf8("清空当前页"));
   cb->setFixedHeight(38);
   cb->setStyleSheet("QPushButton{background:#555;font-size:14px;font-weight:bold;border-radius:6px;}QPushButton:hover{background:#666;}");
   QObject::connect(cb, &QPushButton::clicked, [](){ clearCanvas(); });

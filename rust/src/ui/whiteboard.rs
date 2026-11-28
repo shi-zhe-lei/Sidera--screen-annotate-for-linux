@@ -260,6 +260,15 @@ fn symbol(ctx: &mut Ctx, tool: W, dir: Direction, x: f32, y: f32, size: f32, ink
     }
 }
 
+fn choice_face(app: &App, ctx: &mut Ctx, hit: W, r: R, radius: f32, selected: bool) {
+    let p = ctx.palette;
+    let control = Control::Whiteboard(hit);
+    if selected || control.pressed(app) {
+        let fill = if selected { p.accent_light } else { p.paper };
+        button_surface(app, ctx, control, r, radius, c(fill), c(p.accent_line));
+    }
+}
+
 fn draw_tools(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
     let p = ctx.palette;
     let b = whiteboard_bar_rect(app);
@@ -273,7 +282,7 @@ fn draw_tools(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
         let r = wb_button_rect(app,i);
         let kind = kind_of(w);
         let active = if w == W::Select { selecting } else { !selecting && kind == active_kind };
-        if active { surface(ctx, r, 9., c(p.accent_light), c(p.accent_line)); }
+        choice_face(app, ctx, w, r, 9., active);
         let ink = if active { p.accent } else { p.text };
         let direction = app.coord.filter(|g| Some(g.conic) == kind).map_or(Direction::Up, |g| g.direction);
         if r.w >= 80 {
@@ -303,17 +312,22 @@ fn draw_direction(app: &App, fonts: &Fonts, ctx: &mut Ctx, kind: Kind) {
     for (i, &(d,label)) in kind.directions().iter().enumerate() {
         let slot = direction_option_rect(app,kind,i);
         let selected = app.coord.is_some_and(|g| g.conic == kind && g.direction == d);
-        if selected { surface(ctx,slot,7.,c(palette.accent_light),c(palette.accent_line)); }
+        choice_face(app, ctx, W::Direction(kind, d), slot, 7., selected);
         symbol(ctx,tool,d,(slot.x + (slot.w-24)/2) as f32,(slot.y+4) as f32,24.,
             if selected { palette.accent } else { palette.text });
         centered(ctx,fonts,R {y:slot.y+29,h:22,..slot},label,12.,palette.text);
     }
 }
 
-fn action(ctx: &mut Ctx, fonts: &Fonts, r: R, w: W, label: &str) {
+fn action(app: &App, ctx: &mut Ctx, fonts: &Fonts, r: R, w: W, label: &str) {
     let p = ctx.palette;
+    let control = Control::Whiteboard(w);
+    let primary = matches!(w, W::Done | W::SelDone);
+    if primary || control.pressed(app) {
+        button_surface(app, ctx, control, r, 7., c(if primary { p.accent } else { p.paper }), Color::TRANSPARENT);
+    }
     let ink = match w {
-        W::Done | W::SelDone => { ctx.fill_round(r,7.,c(p.accent)); p.on_accent }
+        W::Done | W::SelDone => p.on_accent,
         W::Delete => p.danger,
         _ => p.text,
     };
@@ -345,7 +359,7 @@ fn draw_editor(app: &App, fonts: &Fonts, ctx: &mut Ctx, g: &crate::app::CoordGui
         ctx.text(fonts,&metric,(r.x+22) as f32+fonts.text_width(&name,14.),(r.y+24) as f32,12.,c(p.muted));
     }
     for (w,label) in [(W::ResetView,"归位"),(W::Delete,"移除"),(W::Done,"完成")] {
-        action(ctx,fonts,wb_action_rect(app,w),w,label);
+        action(app,ctx,fonts,wb_action_rect(app,w),w,label);
     }
     let narrow = narrow_editor(app);
     for &field in parameters(app) {
@@ -356,7 +370,10 @@ fn draw_editor(app: &App, fonts: &Fonts, ctx: &mut Ctx, g: &crate::app::CoordGui
                 Parameter::Size => "大小", Parameter::Shape if g.conic == Kind::Parabola => "开口", Parameter::Shape => "轴比",
             };
             let active = field == active_parameter(app);
-            if active { ctx.fill_round(tab, 5., c(p.accent_light)); }
+            let control = Control::Whiteboard(W::ParameterTab(field));
+            if active || control.pressed(app) {
+                button_surface(app, ctx, control, tab, 5., c(if active { p.accent_light } else { p.paper }), Color::TRANSPARENT);
+            }
             centered(ctx,fonts,tab,title,12.,if active {p.text} else {p.muted});
             if !active { continue; }
         }
@@ -368,6 +385,8 @@ fn draw_editor(app: &App, fonts: &Fonts, ctx: &mut Ctx, g: &crate::app::CoordGui
             let px = 12.0 * (label_width / fonts.text_width(title,12.).max(1.)).min(1.);
             ctx.text(fonts,title,(slot.x+3) as f32,(slot.y+16) as f32,px,c(p.text));
         }
+        let control = Control::Whiteboard(W::Value(field));
+        if control.pressed(app) { button_surface(app, ctx, control, value, 5., c(p.paper), Color::TRANSPARENT); }
         value_input::draw_value(app,fonts,ctx,Target::Guide(field),value,12.,"",unit);
         let (start,end,y) = rail(app,field);
         let thumb = start + field.fraction(g)*(end-start);
@@ -377,9 +396,7 @@ fn draw_editor(app: &App, fonts: &Fonts, ctx: &mut Ctx, g: &crate::app::CoordGui
         ctx.fill_circle(thumb,y,3.2,c(p.paper));
     }
     let message = app.settings_ui.editor.as_ref().and_then(|e| value_input::message(app,e.target));
-    let hint = message.as_deref().unwrap_or(if narrow { "点击数值可输入" } else if r.w >= 335 {
-        "拖中心移动 · 拖圆柄旋转 · 点数值输入"
-    } else { "拖中心移动 · 拖圆柄旋转" });
+    let hint = message.as_deref().unwrap_or("拖中心移动，拖圆柄旋转");
     let error = app.settings_ui.editor.as_ref().is_some_and(|e| !e.error.is_empty());
     let hint_height = if narrow {15} else if r.h == 90 {17} else {22};
     centered(ctx,fonts,R { x:r.x+6,y:r.y+r.h-hint_height-2,w:r.w-12,h:hint_height },
@@ -392,11 +409,11 @@ fn draw_selection(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
     card(ctx,r);
     let lifted = app.floating.is_some();
     let first = selection_action(app,W::SelCancel);
-    let message = if lifted { "拖动选中的笔迹" } else if app.selection_missed { "未选中笔迹，请重新框选" } else { "拖出矩形，框选笔迹" };
+    let message = if lifted { "拖动选中的笔迹" } else if app.selection_missed { "未选中笔迹，请重选" } else { "拖动框选笔迹" };
     let text_area = R { x:r.x+9, y:r.y+4, w:if r.h>48 {r.w-18} else {first.x-r.x-15}, h:if r.h>48 {29} else {r.h-8} };
     ctx.text(fonts,message,(text_area.x+4) as f32,(text_area.y+text_area.h/2+5) as f32,13.,c(p.text));
-    action(ctx,fonts,first,W::SelCancel,"取消");
-    if lifted { action(ctx,fonts,selection_action(app,W::SelDone),W::SelDone,"完成"); }
+    action(app,ctx,fonts,first,W::SelCancel,"取消");
+    if lifted { action(app,ctx,fonts,selection_action(app,W::SelDone),W::SelDone,"完成"); }
 }
 
 pub(super) fn draw_whiteboard_controls(app: &App, fonts: &Fonts, ctx: &mut Ctx) {

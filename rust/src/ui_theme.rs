@@ -51,8 +51,7 @@ impl Accent {
                 let mut accent = rgb;
                 // Adapt the displayed accent, never the user's saved source colour.
                 for _ in 0..32 {
-                    let a = luminance(accent); let b = luminance(tint);
-                    if (a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5 { break; }
+                    if contrast(accent, tint) >= 4.5 { break; }
                     accent = mix(accent, if dark { 0xFFFFFF } else { 0 }, 0.12);
                 }
                 (accent, tint, mix(surface, accent, 0.48))
@@ -109,6 +108,10 @@ pub struct Palette {
     pub eraser: u32, pub splash_header: u32,
 }
 
+impl Palette {
+    pub fn control_border(self) -> u32 { mix(self.border, self.text, 0.46) }
+}
+
 pub const LIGHT: Palette = Palette {
     paper: 0xFCFCFD, surface: 0xF1F2F5, border: 0xD5D7DD,
     text: 0x25262B, muted: 0x62646D,
@@ -156,6 +159,11 @@ fn luminance(rgb: u32) -> f32 {
         if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
     };
     0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+}
+
+pub(crate) fn contrast(a: u32, b: u32) -> f32 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
 /// Checkmarks and page labels sit on user-selected colours, not UI surfaces.

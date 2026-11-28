@@ -558,7 +558,7 @@ impl Win32Plat {
             let win_h = frame.bottom - frame.top;
             let x = ((screen_w - win_w) / 2).max(0);
             let y = ((screen_h - win_h) / 2).max(0);
-            let title = wide("Sidera · 偏好设置");
+            let title = wide("Sidera 设置");
             let hwnd = CreateWindowExW(0, class_name.as_ptr(), title.as_ptr(),
                 WS_OVERLAPPEDWINDOW | WS_VISIBLE, x, y, win_w, win_h,
                 null_mut(), null_mut(), hinstance, null());
@@ -808,10 +808,10 @@ impl Win32Plat {
             return;
         }
         let items: [(usize, &str); 5] = [
-            (1, "打开设置"),
-            (2, "切换批注/光标"),
+            (1, "设置"),
+            (2, "切换画笔和光标"),
             (3, "白板"),
-            (4, "显示 Sidera"),
+            (4, "显示工具栏"),
             (5, "退出"),
         ];
         for (id, label) in items {
@@ -1112,7 +1112,43 @@ impl Win32Plat {
     }
 }
 
+struct DocumentWheel { window: HWND, receiver: HWND, remainder: f64 }
+
+impl sidera_core::document_scroll::ScrollTarget for DocumentWheel {
+    fn clear_pending(&mut self) { self.remainder = 0.0; }
+
+    fn scroll_by(&mut self, pixels: f64) -> bool {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IsChild, IsWindow};
+        unsafe {
+            if GetForegroundWindow() != self.window || IsWindow(self.receiver) == 0
+                || (self.receiver != self.window && IsChild(self.window, self.receiver) == 0) { return false; }
+            self.remainder -= pixels * (120.0 / 48.0);
+            let delta = self.remainder.trunc() as i16;
+            if delta == 0 { return true; }
+            self.remainder -= f64::from(delta);
+            let mut rect = std::mem::zeroed();
+            if GetWindowRect(self.receiver, &mut rect) == 0 { return false; }
+            let x = rect.left + (rect.right - rect.left) / 2;
+            let y = rect.top + (rect.bottom - rect.top) / 2;
+            let point = ((y as u16 as u32) << 16) | x as u16 as u32;
+            PostMessageW(self.receiver, WM_MOUSEWHEEL, (delta as u16 as usize) << 16, point as isize) != 0
+        }
+    }
+}
+
 impl Backend for Win32Plat {
+    fn document_scroll_target(&self) -> Option<Box<dyn sidera_core::document_scroll::ScrollTarget>> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetGUIThreadInfo, GUITHREADINFO};
+        unsafe {
+            let window = GetForegroundWindow();
+            if window.is_null() || window == self.visual_hwnd || window == self.input_hwnd { return None; }
+            let mut info: GUITHREADINFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+            let thread = GetWindowThreadProcessId(window, std::ptr::null_mut());
+            let receiver = if GetGUIThreadInfo(thread, &mut info) != 0 && !info.hwndFocus.is_null() { info.hwndFocus } else { window };
+            Some(Box::new(DocumentWheel { window, receiver, remainder: 0.0 }))
+        }
+    }
     fn set_text_input(&self, on: bool) {
         if self.text_input.replace(on) == on { return; }
         unsafe {

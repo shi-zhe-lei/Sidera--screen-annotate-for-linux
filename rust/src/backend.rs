@@ -34,10 +34,19 @@ pub trait Backend: 'static {
     fn present(&self, pm: &Pixmap, x: i32, y: i32);
     /// 设置输入区域；full=true 表示整屏可输入
     fn set_input_region(&self, rects: &[IRect], full: bool);
+    /// GNOME must leave the foreground document focused while these rails are held.
+    fn set_scroll_rails(&self, _rails: Option<[[i32; 4]; 2]>) {}
     /// 临时请求/释放文本键盘焦点（进程屏蔽输入框使用）。
     fn set_text_input(&self, _on: bool) {}
     /// 注入一次按键（翻页/退出）
     fn fake_key(&self, key: Key);
+    /// Capture the foreground document without moving the physical pointer.
+    fn document_scroll_target(&self) -> Option<Box<dyn crate::document_scroll::ScrollTarget>> {
+        #[cfg(unix)]
+        { Some(Box::new(crate::linux_scroll::Document::open())) }
+        #[cfg(not(unix))]
+        { None }
+    }
     /// 用演示软件快捷键从当前页开始放映。false 表示当前后端无法注入。
     fn start_presentation(&self) -> bool { false }
     /// 当前后端能否直接注入按键，而不触发桌面远程控制授权。

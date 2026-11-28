@@ -2,18 +2,32 @@ use super::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-struct TestBackend { keys: Rc<Cell<usize>>, direct_keys: bool, foreground: Option<bool>, input: RefCell<Vec<IRect>> }
+struct TestBackend {
+    keys: Rc<Cell<usize>>,
+    document_pixels: Rc<Cell<f64>>,
+    direct_keys: bool,
+    foreground: Cell<Option<bool>>,
+    fullscreen: Cell<bool>,
+    input: RefCell<Vec<IRect>>,
+}
+struct RecordingScroll(Rc<Cell<f64>>);
+impl document_scroll::ScrollTarget for RecordingScroll {
+    fn scroll_by(&mut self, pixels: f64) -> bool { self.0.set(self.0.get()+pixels); true }
+}
 impl Backend for TestBackend {
     fn as_any(&self) -> &dyn std::any::Any { self }
     fn screen_size(&self) -> (i32, i32) { (100, 100) }
     fn present(&self, _: &Pixmap, _: i32, _: i32) {}
     fn set_input_region(&self, rects: &[IRect], _: bool) { *self.input.borrow_mut() = rects.to_vec(); }
     fn fake_key(&self, _: Key) { self.keys.set(self.keys.get() + 1); }
+    fn document_scroll_target(&self) -> Option<Box<dyn document_scroll::ScrollTarget>> {
+        Some(Box::new(RecordingScroll(self.document_pixels.clone())))
+    }
     fn start_presentation(&self) -> bool { self.keys.set(self.keys.get() + 1); true }
     fn can_inject_keys_without_prompt(&self) -> bool { self.direct_keys }
     fn screenshot(&self) -> Option<(Vec<u8>, u32, u32)> { None }
-    fn is_presentation_fullscreen(&self) -> bool { false }
-    fn presentation_foreground(&self) -> Option<bool> { self.foreground }
+    fn is_presentation_fullscreen(&self) -> bool { self.fullscreen.get() }
+    fn presentation_foreground(&self) -> Option<bool> { self.foreground.get() }
     fn has_compositor(&self) -> bool { true }
 }
 
@@ -24,13 +38,157 @@ pub(crate) fn fixture(direct_keys: bool) -> (Rt, App, Rc<Cell<usize>>) {
 fn fixture_with_foreground(direct_keys: bool, foreground: Option<bool>) -> (Rt, App, Rc<Cell<usize>>) {
     let keys = Rc::new(Cell::new(0));
     let rt = Rt {
-        backend: Box::new(TestBackend { keys: keys.clone(), direct_keys, foreground, input: RefCell::new(Vec::new()) }),
+        backend: Box::new(TestBackend {
+            keys: keys.clone(), document_pixels: Rc::default(), direct_keys, foreground: Cell::new(foreground),
+            fullscreen: Cell::new(false), input: RefCell::new(Vec::new()),
+        }),
         fonts: Fonts::load(), icon: None, icon_big: None,
         batching: Cell::new(true), dirty: RefCell::new(Vec::new()),
     };
     let mut app = App::new(Pixmap::new(100, 100).unwrap(), 100, 100);
     app.wps_test_mode = true;
     (rt, app, keys)
+}
+
+#[test]
+fn document_scroll_uses_the_foreground_document_and_consumes_the_whole_contact() {
+    for right in [false,true] {
+        let (rt,mut app,keys)=fixture(true);
+        let pixels=rt.backend.as_any().downcast_ref::<TestBackend>().unwrap().document_pixels.clone();
+        app.configure_geometry(1280,900,1.25);
+        let mut ip=Ip::default();
+        let now=Instant::now();
+        let old_page=app.current_slide;
+        let arrow=ui::sidebar_buttons(&app,right).into_iter().find(|(b,_)|*b==Btn::Next).unwrap().1;
+        assert_eq!(ui::control_at(&app,arrow.x+arrow.w/2,arrow.y+arrow.h/2),Some(ui::Control::Sidebar(Btn::Next,right)));
+        app.document_scroll_enabled=true;
+        tick_document_scroll(&rt,&mut app,&mut ip,now);
+        tick_document_scroll(&rt,&mut app,&mut ip,now+Duration::from_millis(220));
+        let r=ui::scroll_track_rect(&app,right);
+        let x=r.x+r.w/2;
+        let (centre,_,_)=ui::scroll_thumb_geometry(&app,right);
+        handle_touch(&rt,&mut app,&mut ip,None,7,x,centre,TouchKind::Begin,4.0);
+        let start=Instant::now();
+        tick_document_scroll(&rt,&mut app,&mut ip,start);
+        assert_eq!(pixels.get(),0.0);
+        handle_touch(&rt,&mut app,&mut ip,None,7,x,r.y+r.h,TouchKind::Update,4.0);
+        on_motion(&rt,&mut app,&mut ip,-1,-1);
+        handle_touch(&rt,&mut app,&mut ip,None,8,x,r.y,TouchKind::Begin,4.0);
+        handle_touch(&rt,&mut app,&mut ip,None,8,x,r.y,TouchKind::End,4.0);
+        tick_document_scroll(&rt,&mut app,&mut ip,start+Duration::from_millis(20));
+        let down=pixels.get();
+        assert!(down>20.0 && down<=28.1);
+        handle_touch(&rt,&mut app,&mut ip,None,7,x,r.y,TouchKind::Update,4.0);
+        tick_document_scroll(&rt,&mut app,&mut ip,start+Duration::from_millis(40));
+        assert!(pixels.get().abs()<0.1);
+        handle_touch(&rt,&mut app,&mut ip,None,7,x,centre,TouchKind::End,4.0);
+        let stopped=pixels.get();
+        tick_document_scroll(&rt,&mut app,&mut ip,start+Duration::from_secs(1));
+        assert_eq!(pixels.get(),stopped);
+        assert_eq!(app.scroll_rail.thumb,0.0);
+        assert_eq!(app.current_slide,old_page);
+        assert!(app.page_picker.is_none() && !app.is_drawing && keys.get()==0);
+    }
+}
+
+#[test]
+fn document_scroll_morphs_for_ppt_and_whiteboard_and_never_converts_a_held_drag_to_a_click() {
+    let (rt,mut app,keys)=fixture(true);
+    app.configure_geometry(1280,900,1.0);
+    let mut ip=Ip::default();
+    let start=Instant::now();
+    app.document_scroll_enabled=true;
+    tick_document_scroll(&rt,&mut app,&mut ip,start);
+    tick_document_scroll(&rt,&mut app,&mut ip,start+Duration::from_millis(200));
+    let r=ui::scroll_track_rect(&app,false);
+    let x=r.x+r.w/2;
+    on_press(&rt,&mut app,&mut ip,None,x,r.y+r.h-3,1);
+    app.wps_connected=true;
+    app.scroll_rail.ppt_foreground=true; // Linked before the first page report.
+    assert!(!app.wants_scroll_rail());
+    tick_document_scroll(&rt,&mut app,&mut ip,start+Duration::from_millis(210));
+    assert!(ip.document_drag.is_none());
+    app.wps_page_index=3;app.wps_page_total=15;
+    tick_document_scroll(&rt,&mut app,&mut ip,start+Duration::from_millis(285));
+    assert!(app.scroll_rail.mix>0.0 && app.scroll_rail.mix<1.0);
+    let partial=app.scroll_rail.mix;
+    app.scroll_rail.ppt_foreground=false; // WPS is still running behind a document.
+    assert!(app.wants_scroll_rail()); // Writer can take focus before PPT clears its cached page count.
+    tick_document_scroll(&rt,&mut app,&mut ip,start+Duration::from_millis(285));
+    assert_eq!(partial,app.scroll_rail.mix);
+    tick_document_scroll(&rt,&mut app,&mut ip,start+Duration::from_millis(500));
+    assert_eq!(app.scroll_rail.mix,1.0);
+    on_release(&rt,&mut app,&mut ip,None,x,r.y+r.h-3,1);
+    assert_eq!(keys.get(),0);
+    let focus = &rt.backend.as_any().downcast_ref::<TestBackend>().unwrap().foreground;
+    focus.set(Some(true));
+    on_press(&rt,&mut app,&mut ip,None,x,r.y+3,1);
+    assert!(ip.document_drag.is_none());
+    on_release(&rt,&mut app,&mut ip,None,x,r.y+3,1);
+    focus.set(Some(false));
+    on_press(&rt,&mut app,&mut ip,None,x,r.y+3,1);
+    app.toggle_whiteboard();
+    let page=app.current_slide;
+    tick_document_scroll(&rt,&mut app,&mut ip,start+Duration::from_millis(510));
+    tick_document_scroll(&rt,&mut app,&mut ip,start+Duration::from_millis(720));
+    app.drawing_tools.advance_at(start+Duration::from_millis(720));
+    assert_eq!(app.scroll_rail.mix,0.0);
+    let badge=ui::sidebar_page_rect(&app,false);
+    on_release(&rt,&mut app,&mut ip,None,badge.x+badge.w/2,badge.y+badge.h/2,1);
+    assert!(app.page_picker.is_none() && app.current_slide==page);
+    assert_eq!(ui::control_at(&app,badge.x+badge.w/2,badge.y+badge.h/2),Some(ui::Control::PageCount(false)));
+    app.toggle_whiteboard();
+    assert!(app.wants_scroll_rail());
+}
+
+#[test]
+fn document_scroll_rate_is_linear_stops_at_centre_and_ignores_sleep_backlog() {
+    let now=Instant::now();
+    let mut drag=document_scroll::Drag::new(100,100,43.0,0.0,20,now);
+    assert_eq!(drag.position(102),0.0);
+    assert_eq!(drag.position(123),0.5);
+    assert_eq!(drag.position(77),-0.5);
+    assert_eq!(drag.position(1000),1.0);
+    assert_eq!(drag.distance(0.5,now+Duration::from_millis(20)),14.0);
+    assert!(drag.distance(1.0,now+Duration::from_secs(6))<=56.0);
+}
+
+#[test]
+fn document_scroll_settings_entry_is_reachable_in_short_and_narrow_windows() {
+    for (w,h) in [(320,240),(680,400),(1280,900)] {
+        let (rt,mut app,_)=fixture(false);
+        app.configure_geometry(w,h,1.0);
+        app.settings_open=true;
+        let tab=SetHit::Tab(settings_state::Tab::Experimental);
+        let nav=ui::settings_controls(&app);
+        for (key,r) in nav.iter().filter(|(k,_)| matches!(k,SetHit::Tab(_))) {
+            let cancel=nav.iter().find(|(k,_)|*k==SetHit::Quit).unwrap().1;
+            assert!(!cancel.contains(r.x+2,r.y+r.h-2));
+            assert_eq!(ui::control_at(&app,r.x+r.w/2,r.y+r.h/2),Some(ui::Control::Setting(*key)));
+        }
+        handle_settings_hit(&rt,&mut app,tab);
+        let (_,r)=ui::settings_controls(&app).into_iter().find(|(k,_)|*k==SetHit::DocumentScroll).unwrap();
+        let (x,y)=(r.x+r.w-20,r.y+r.h/2);
+        let mut ip=Ip::default();
+        on_press(&rt,&mut app,&mut ip,None,x,y,1);
+        on_release(&rt,&mut app,&mut ip,None,x,y,1);
+        assert!(app.document_scroll_enabled);
+        #[cfg(unix)]
+        {
+            // Model a completed read of the desktop setting without enabling
+            // accessibility on the machine running this test.
+            app.settings_ui.scroll_access = Default::default();
+            app.settings_ui.scroll_access.enabled = Some(false);
+            let layout = settings_panel::layout(&app);
+            app.settings_page = 1 / layout.rows;
+            let (_, r) = ui::settings_controls(&app).into_iter()
+                .find(|(key, _)| *key == SetHit::EnableScrollAccess).unwrap();
+            assert_eq!(ui::control_at(&app, r.x+r.w-42, r.y+r.h/2),
+                Some(ui::Control::Setting(SetHit::EnableScrollAccess)));
+            app.settings_ui.scroll_access.enabled = Some(true);
+            assert!(!ui::settings_controls(&app).iter().any(|(key, _)| *key == SetHit::EnableScrollAccess));
+        }
+    }
 }
 
 #[test]
@@ -220,10 +378,66 @@ fn whiteboard_pages_remain_local() {
 }
 
 #[test]
+fn presentation_end_releases_pen_and_eraser_for_the_editor() {
+    for mode in [1, 2] {
+        let (rt, mut app, keys) = fixture_with_foreground(true, Some(false));
+        app.configure_geometry(800, 600, 1.0);
+        app.wps_real_pos = 4;
+        app.current_slide = 4;
+        switch_to_draw(&rt, &mut app, mode);
+        app.pen_popup_visible = mode == 1;
+        app.eraser_popup_visible = mode == 2;
+        app.is_drawing = true;
+
+        let update = WpsUpdate { connected: true, events: vec![WpsEvent::SlideshowEnd] };
+        tick_shared(&rt, &mut app, &mut Ip::default(), None, &update, &mut Timers::new(), false);
+
+        assert_eq!(app.mode, 0);
+        assert!(!app.is_drawing && !app.pen_popup_visible && !app.eraser_popup_visible);
+        assert!(!point_input_ok(&app, 400, 300));
+        let backend = rt.backend.as_any().downcast_ref::<TestBackend>().unwrap();
+        let input = backend.input.borrow();
+        assert!(!input.is_empty() && input.iter().all(|r| r.x + r.w <= 400 || r.x > 400));
+        assert_eq!((app.wps_real_pos, app.current_slide), (-1, 1));
+        assert_eq!(keys.get(), 0, "WPS has already handled the physical Escape");
+    }
+}
+
+#[test]
+fn presentation_fullscreen_fallback_requires_an_unlinked_show_and_wps_focus() {
+    for (connected, started_in_wps, returned_to_wps, expected_mode) in [
+        (false, true, true, 0),  // WPS returned from its show to the editor.
+        (false, true, false, 2), // Alt+Tab away from the show.
+        (false, false, true, 2), // Switch from an unrelated fullscreen app to WPS.
+        (true, true, true, 2),   // The linked show has not sent its end event.
+    ] {
+        let (rt, mut app, keys) = fixture_with_foreground(true, Some(started_in_wps));
+        let backend = rt.backend.as_any().downcast_ref::<TestBackend>().unwrap();
+        let update = WpsUpdate { connected, events: Vec::new() };
+        let mut timers = Timers::new();
+        let mut ip = Ip::default();
+        switch_to_draw(&rt, &mut app, 2);
+        backend.fullscreen.set(true);
+        tick_shared(&rt, &mut app, &mut ip, None, &update, &mut timers, false);
+        assert_eq!(app.mode, 2);
+
+        backend.fullscreen.set(false);
+        backend.foreground.set(Some(returned_to_wps));
+        timers.last_foreground = Instant::now(); // The cached focus still belongs to the old window.
+        timers.last_wps -= Duration::from_secs(1);
+        tick_shared(&rt, &mut app, &mut ip, None, &update, &mut timers, false);
+        assert_eq!(app.mode, expected_mode);
+        assert_eq!(keys.get(), 0);
+    }
+}
+
+#[test]
 fn presentation_lifecycle_does_not_erase_visible_whiteboard() {
     for (event, overlay_page) in [(WpsEvent::SlideshowBegin(4), 4), (WpsEvent::SlideshowEnd, 1)] {
         let (rt, mut app, keys) = fixture(false);
+        let ended = matches!(event, WpsEvent::SlideshowEnd);
         app.current_slide = 7;
+        switch_to_draw(&rt, &mut app, 2);
         paint::stroke_tapered(&mut app, (20, 20), (80, 20), 6, 6);
         app.toggle_whiteboard();
         paint::stroke_tapered(&mut app, (20, 40), (80, 40), 6, 6);
@@ -235,11 +449,13 @@ fn presentation_lifecycle_does_not_erase_visible_whiteboard() {
         let update = WpsUpdate { connected: false, events: vec![event] };
         tick_shared(&rt, &mut app, &mut ip, None, &update, &mut timers, false);
         assert!(app.whiteboard);
+        assert_eq!(app.mode, 1);
         assert_eq!(app.current_slide, 2);
         assert_eq!(app.canvas.data(), second.as_slice());
         // A manual mode switch now clears the whiteboard but keeps the overlay.
         app.toggle_whiteboard();
         assert_eq!(app.current_slide, overlay_page);
+        assert_eq!(app.mode, if ended { 0 } else { 2 });
         assert!(!app.page_has_ink);
         app.toggle_whiteboard();
         assert!(app.whiteboard);
@@ -293,6 +509,7 @@ fn linked_failure_does_not_double_advance_through_keyboard_fallback() {
 #[test]
 fn presentation_button_tracks_ready_showing_and_disconnected_states() {
     let (rt, mut app, keys) = fixture(true);
+    app.configure_geometry(1280, 720, 1.0);
     let bridge = WpsBridge::from_listener(std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap());
     {
         let mut s = bridge.shared.lock().unwrap();
@@ -332,6 +549,141 @@ fn ui_fixture() -> (Rt, App, Ip) {
     app.configure_geometry(1280, 900, 1.0);
     app.mode = 0; app.collapsed = false;
     (rt, app, Ip::default())
+}
+
+#[test]
+fn toolbar_fade_only_runs_during_a_foreground_presentation() {
+    let (rt, mut app, _) = fixture_with_foreground(true, Some(true));
+    let backend = rt.backend.as_any().downcast_ref::<TestBackend>().unwrap();
+    let bridge = WpsBridge::from_listener(std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap());
+    app.fade_toolbar_during_show = true;
+    for (connected, slide, fullscreen, focus, should_fade) in [
+        (true, 2, false, Some(true), true),
+        (true, 2, false, None, true), // Native Wayland can rely on the add-in.
+        (true, 2, true, Some(false), false),
+        (true, -1, true, Some(true), false), // An editor with a connected add-in.
+        (false, -1, true, Some(true), true),
+        (false, -1, true, Some(false), false),
+        (false, -1, false, Some(true), false),
+    ] {
+        backend.fullscreen.set(fullscreen);
+        backend.foreground.set(focus);
+        {
+            let mut state = bridge.shared.lock().unwrap();
+            state.connected = connected;
+            state.real_pos = slide;
+            state.last_seen = now_ms();
+        }
+        app.presentation_fade.reset();
+        app.presentation_fade.advance_at(true, Instant::now() - Duration::from_secs(7));
+        let update = WpsUpdate { connected, events: vec![] };
+        tick_shared(&rt, &mut app, &mut Ip::default(), Some(&bridge), &update, &mut Timers::new(), false);
+        assert_eq!(app.presentation_fade.opacity() < 1.0, should_fade, "connected={connected} slide={slide} focus={focus:?}");
+    }
+
+    // Switching directly to another deck emits Begin without an intervening idle tick.
+    let mut timers = Timers::new();
+    let mut ip = Ip::default();
+    {
+        let mut state = bridge.shared.lock().unwrap();
+        state.connected = true;
+        state.real_pos = 3;
+        state.last_seen = now_ms();
+    }
+    app.presentation_fade.advance_at(true, Instant::now() - Duration::from_secs(7));
+    let mut update = WpsUpdate { connected: true, events: vec![WpsEvent::RealPos(3)] };
+    tick_shared(&rt, &mut app, &mut ip, Some(&bridge), &update, &mut timers, false);
+    assert_eq!(app.presentation_fade.opacity(), 0.2, "a page change alone does not wake the rails");
+    update.events = vec![WpsEvent::SlideshowBegin(3)];
+    tick_shared(&rt, &mut app, &mut ip, Some(&bridge), &update, &mut timers, false);
+    assert_eq!(app.presentation_fade.opacity(), 1.0, "a new show gets the full grace period");
+}
+
+#[test]
+fn toolbar_fade_keeps_touch_targets_and_executes_the_first_tap() {
+    for (right, touch) in [(false, true), (true, false)] {
+        let (rt, mut app, mut ip) = ui_fixture();
+        app.fade_toolbar_during_show = true;
+        let now = Instant::now();
+        tick_toolbar_fade(&rt, &mut app, &ip, true, now - Duration::from_secs(7));
+        tick_toolbar_fade(&rt, &mut app, &ip, true, now);
+        assert_eq!(app.presentation_fade.opacity(), 0.2);
+        on_motion(&rt, &mut app, &mut ip, 650, 450);
+        on_press(&rt, &mut app, &mut ip, None, 650, 450, 1);
+        on_release(&rt, &mut app, &mut ip, None, 650, 450, 1);
+        assert_eq!(app.presentation_fade.opacity(), 0.2, "touching the slide should not wake the rails");
+        let control = ui::Control::Sidebar(Btn::Pen, right);
+        let r = ui::control_rect(&app, control).unwrap();
+        let (x, y) = (r.x + r.w / 2, r.y + r.h / 2);
+        assert_eq!(ui::control_at(&app, x, y), Some(control));
+        if touch { handle_touch(&rt, &mut app, &mut ip, None, 1, x, y, TouchKind::Begin, 1.0); }
+        else { on_press(&rt, &mut app, &mut ip, None, x, y, 1); }
+        assert_eq!(app.presentation_fade.opacity(), 1.0);
+        tick_toolbar_fade(&rt, &mut app, &ip, true, now + Duration::from_secs(30));
+        tick_toolbar_fade(&rt, &mut app, &ip, true, now + Duration::from_secs(40));
+        assert_eq!(app.presentation_fade.opacity(), 1.0, "a stationary press still owns the tool");
+        assert_eq!(app.mode, 0);
+        if touch { handle_touch(&rt, &mut app, &mut ip, None, 1, x, y, TouchKind::End, 0.0); }
+        else { on_release(&rt, &mut app, &mut ip, None, x, y, 1); }
+        assert_eq!(app.mode, 1);
+        assert!(!app.pen_popup_visible);
+    }
+}
+
+#[test]
+fn toolbar_fade_composites_both_rails_over_the_ink_at_fractional_scale() {
+    let (rt, mut app, ip) = ui_fixture();
+    app.configure_geometry(820, 720, 1.25);
+    app.fade_toolbar_during_show = true;
+    let render = |app: &App, r: R| ui::render_region(app, &rt.fonts, None, r.x, r.y, r.w, r.h).unwrap();
+    let rails = [false, true].map(|right| ui::sidebar_rect(&app, right).with_paint_margin());
+    let normal = rails.map(|r| render(&app, r));
+    let now = Instant::now();
+    tick_toolbar_fade(&rt, &mut app, &ip, true, now - Duration::from_secs(7));
+    tick_toolbar_fade(&rt, &mut app, &ip, true, now);
+    let faded = rails.map(|r| render(&app, r));
+    for (before, after) in normal.iter().zip(&faded) {
+        assert!(before.pixels().iter().any(|p| p.alpha() == 255));
+        assert!(before.pixels().iter().zip(after.pixels()).all(|(a,b)| {
+            let expected = (f32::from(a.alpha()) * 0.2).round() as u8;
+            b.alpha().abs_diff(expected) <= 1
+        }));
+    }
+    // An opaque handwritten stroke beneath the toolbar must keep its own opacity.
+    let red = tiny_skia::Color::from_rgba8(210, 30, 35, 255);
+    app.canvas.fill(red);
+    let under_ink = render(&app, rails[0]);
+    let index = faded[0].pixels().iter().position(|p| p.alpha() == 51).unwrap();
+    let toolbar = faded[0].pixels()[index];
+    let pixel = under_ink.pixels()[index];
+    assert_eq!(pixel.alpha(), 255);
+    assert!(pixel.red().abs_diff(toolbar.red() + 168) <= 1);
+    let center = render(&app, R {x:400, y:340, w:12, h:12});
+    assert!(center.pixels().iter().all(|p| *p == red.to_color_u8().premultiply()));
+    rt.dirty.borrow_mut().clear();
+    tick_toolbar_fade(&rt, &mut app, &ip, true, now + Duration::from_secs(60));
+    assert!(rt.dirty.borrow().is_empty());
+}
+
+#[test]
+fn toolbar_fade_leaves_popups_and_the_whiteboard_fully_visible() {
+    let (rt, mut app, mut ip) = ui_fixture();
+    app.fade_toolbar_during_show = true;
+    let before = Instant::now() - Duration::from_secs(10);
+    let now = Instant::now();
+    for state in ["pen", "eraser", "pages", "drag", "appearance", "board"] {
+        app.pen_popup_visible = state == "pen";
+        app.eraser_popup_visible = state == "eraser";
+        app.page_picker = (state == "pages").then(|| page_picker::PagePicker::new(2, 9, page_picker::Source::Wps(1)));
+        ip.dragging = state == "drag";
+        app.settings_open = state == "appearance";
+        app.settings_ui.tab = settings_state::Tab::Appearance;
+        app.whiteboard = state == "board";
+        app.presentation_fade.advance_at(true, before);
+        tick_toolbar_fade(&rt, &mut app, &ip, true, now);
+        tick_toolbar_fade(&rt, &mut app, &ip, true, now + Duration::from_secs(30));
+        assert_eq!(app.presentation_fade.opacity(), 1.0, "{state}");
+    }
 }
 
 #[test]
@@ -501,9 +853,12 @@ fn floating_selection_commits_when_tools_change_or_the_page_is_cleared() {
     assert!(app.floating.is_none());
     assert_eq!(app.canvas.data()[ink + 3], 255, "the lifted ink must be committed");
     app.floating = crate::selection::lift(&mut app, &lasso);
-    assert!(app.floating.is_some());
-    app.clear_current_strokes();
+    app.floating.as_mut().unwrap().y += 20;
+    clear_drawing(&rt, &mut app);
     assert!(app.floating.is_none());
+    handle_btn(&rt, &mut app, None, Btn::Restore, false);
+    assert_eq!(app.canvas.data()[ink + 3], 0);
+    assert_eq!(app.canvas.data()[ink + 20 * 640 * 4 + 3], 255, "restore the ink at its moved position");
 }
 
 #[test]
@@ -586,6 +941,126 @@ fn page_wheel_previews_without_changing_whiteboard_and_commits_once() {
     }
 }
 
+fn rendered_page_preview(rt: &Rt, app: &App) -> Pixmap {
+    let r = ui::page_picker_thumb_rect(app);
+    ui::render_region(app, &rt.fonts, None, r.x, r.y, r.w, r.h).unwrap()
+}
+
+#[test]
+fn page_wheel_shows_live_saved_and_empty_board_pages_without_navigating() {
+    use tiny_skia::Color;
+    let (rt, mut app, _) = ui_fixture();
+    app.configure_geometry(960, 540, 1.25);
+    app.toggle_whiteboard();
+    let red = Color::from_rgba8(210, 40, 35, 255);
+    let blue = Color::from_rgba8(30, 80, 210, 255);
+    app.canvas.fill(red);
+    app.page_has_ink = true;
+    go_next(&rt, &mut app, None);
+    app.canvas.fill(blue);
+    app.page_has_ink = true;
+    // WPS page numbers may coincide with local ones.
+    let mut slide = Pixmap::new(16, 9).unwrap();
+    slide.fill(red);
+    app.thumbs.insert((0, 3), slide);
+    open_page_picker(&rt, &mut app, true);
+    app.open_anim = 0;
+    let center = |app: &App| {
+        let pm = rendered_page_preview(&rt, app);
+        pm.pixel(pm.width() / 2, pm.height() / 2).unwrap()
+    };
+    assert_eq!(center(&app), blue.to_color_u8().premultiply());
+    open_value_input(&rt, &mut app, value_input::Target::Page);
+    value_input_key(&rt, &mut app, value_input::Key::Character('1'));
+    value_input_key(&rt, &mut app, value_input::Key::Enter);
+    assert_eq!(center(&app), red.to_color_u8().premultiply());
+    app.page_picker.as_mut().unwrap().set_selected(3);
+    for background in [0, 1] {
+        app.whiteboard_bg_index = background;
+        assert_eq!(center(&app), app.whiteboard_bg_color().to_color_u8().premultiply());
+    }
+    assert_eq!(app.current_slide, 2);
+    assert!(!app.whiteboard_cache.contains_key(&2));
+    assert!(app.thumb_waiting.is_none() && app.thumb_target.is_none());
+    close_all_popups(&rt, &mut app);
+    assert_eq!(app.canvas.pixel(0, 0).unwrap(), blue.to_color_u8().premultiply());
+
+    // Clearing and restoring live ink must also refresh an already-open preview.
+    open_page_picker(&rt, &mut app, false);
+    app.open_anim = 0;
+    assert_eq!(center(&app), blue.to_color_u8().premultiply());
+    app.remember_before_clear();
+    app.clear_current_strokes();
+    assert_eq!(center(&app), app.whiteboard_bg_color().to_color_u8().premultiply());
+    assert!(app.restore_cleared());
+    assert_eq!(center(&app), blue.to_color_u8().premultiply());
+}
+
+#[test]
+fn page_wheel_composes_guides_and_floating_ink_in_page_coordinates() {
+    let (rt, mut app, _) = ui_fixture();
+    app.configure_geometry(640, 360, 1.5);
+    app.toggle_whiteboard();
+    app.whiteboard_bg_index = 1;
+    let mut guide = app::CoordGuide::new(640, 360, app::ConicKind::Ellipse, app::ConicDirection::Horizontal);
+    guide.editing = false;
+    guide.rotation = 0.4;
+    app.coord = Some(guide);
+    open_page_picker(&rt, &mut app, false);
+    app.open_anim = 0;
+    let live_guide = rendered_page_preview(&rt, &app);
+    close_all_popups(&rt, &mut app);
+    go_next(&rt, &mut app, None);
+    assert!(!app.whiteboard_cache.contains_key(&1), "a guide-only page has no ink snapshot");
+
+    let red = tiny_skia::Color::from_rgba8(220, 20, 30, 255);
+    crate::paint::pen_segment(&mut app.canvas, red, (120, 180), (150, 180), 24,
+        tiny_skia::Transform::from_scale(1.5, 1.5));
+    app.page_has_ink = true;
+    app.floating = crate::selection::lift(&mut app, &[(80., 140.), (190., 140.), (190., 220.), (80., 220.)]);
+    assert!(app.floating.is_some());
+    crate::selection::move_to_pointer(&mut app, (0, 0), 400, 140);
+    let lifted_canvas = app.canvas.data().to_vec();
+    open_page_picker(&rt, &mut app, false);
+    app.open_anim = 0;
+    let live = rendered_page_preview(&rt, &app);
+    let reds: Vec<_> = live.pixels().iter().enumerate()
+        .filter(|(_, p)| p.red() > 180 && p.green() < 60 && p.blue() < 60)
+        .map(|(i, _)| i % live.width() as usize).collect();
+    assert!(!reds.is_empty() && reds.iter().all(|&x| x > live.width() as usize / 2));
+    app.page_picker.as_mut().unwrap().set_selected(1);
+    let saved_guide = rendered_page_preview(&rt, &app);
+    assert!(saved_guide.data() == live_guide.data());
+    app.page_picker.as_mut().unwrap().set_selected(3);
+    let blank = rendered_page_preview(&rt, &app);
+    assert!(saved_guide.pixels().iter().zip(blank.pixels()).filter(|(a, b)| a != b).count() > 100);
+    close_all_popups(&rt, &mut app);
+    assert_eq!(app.current_slide, 2);
+    assert!(app.floating.is_some() && app.canvas.data() == lifted_canvas);
+}
+
+#[test]
+fn page_wheel_fits_whiteboard_preview_and_touch_buttons_on_short_outputs() {
+    let (rt, mut app, _) = ui_fixture();
+    app.toggle_whiteboard();
+    for (w, h) in [(640, 320), (720, 480), (480, 780)] {
+        app.configure_geometry(w, h, 1.0);
+        for right in [false, true] {
+            open_page_picker(&rt, &mut app, right);
+            let panel = ui::page_picker_rect(&app);
+            let thumb = ui::page_picker_thumb_rect(&app);
+            let wheel = ui::page_picker_control_rect(&app, ui::PagePickerHit::Wheel);
+            assert!(panel.x >= 0 && panel.y >= 0 && panel.x + panel.w <= w && panel.y + panel.h <= h);
+            assert!(thumb.h >= 44 && thumb.x + thumb.w <= wheel.x && wheel.h >= 88);
+            for hit in [ui::PagePickerHit::Cancel, ui::PagePickerHit::Jump] {
+                let button = ui::page_picker_control_rect(&app, hit);
+                assert!(wheel.y + wheel.h <= button.y && button.y + button.h <= panel.y + panel.h);
+                assert_eq!(ui::page_picker_hit(&app, button.x + button.w / 2, button.y + button.h / 2), Some(hit));
+            }
+        }
+    }
+}
+
 #[test]
 fn page_wheel_owns_touch_until_release_and_cancels_cleanly() {
     let (rt, mut app, mut ip) = ui_fixture();
@@ -606,6 +1081,39 @@ fn page_wheel_owns_touch_until_release_and_cancels_cleanly() {
     cancel_input(&rt, &mut app, &mut ip);
     close_all_popups(&rt, &mut app);
     assert!(!over_ui(&app, x, y));
+}
+
+#[test]
+fn page_wheel_keeps_editor_jumps_without_rendering_or_requesting_thumbnails() {
+    let (rt, mut app, mut ip) = ui_fixture();
+    rt.begin_batch();
+    let bridge = WpsBridge::from_listener(std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap());
+    {
+        let mut s = bridge.shared.lock().unwrap();
+        s.connected = true; s.last_seen = now_ms(); s.page_index = 3; s.page_total = 20;
+        s.can_jump = true; s.deck_epoch = 10;
+    }
+    let update = WpsUpdate { connected: true, events: vec![] };
+    let mut timers = Timers::new();
+    let mut tick = |a: &mut App| tick_shared(&rt, a, &mut ip, Some(&bridge), &update, &mut timers, false);
+    tick(&mut app);
+    open_page_picker(&rt, &mut app, false);
+    let edit = ui::page_picker_rect(&app);
+    assert_eq!(ui::page_picker_thumb_rect(&app).h, 0);
+    assert!(ui::page_picker_control_rect(&app, ui::PagePickerHit::Wheel).h >= 88);
+    bridge.shared.lock().unwrap().real_pos = 3;
+    tick(&mut app);
+    assert!(ui::page_picker_thumb_rect(&app).h > 0 && ui::page_picker_rect(&app).w > edit.w);
+    bridge.shared.lock().unwrap().real_pos = -1;
+    app.thumb_target = None;
+    tick(&mut app);
+    assert_eq!(ui::page_picker_rect(&app), edit);
+    assert!(app.thumb_target.is_none() && app.thumb_waiting.is_none());
+    app.page_picker.as_mut().unwrap().set_selected(8);
+    commit_page_picker(&rt, &mut app, Some(&bridge));
+    let state = bridge.shared.lock().unwrap();
+    assert_eq!(state.queue.len(), 1);
+    assert_eq!(state.queue[0].1, "GOTO 8 10");
 }
 
 #[test]
@@ -634,19 +1142,340 @@ fn button_center(app: &App, btn: Btn) -> (i32, i32) {
 }
 
 #[test]
+fn tool_track_previews_on_drag_and_commits_only_when_the_owner_releases() {
+    for right in [false, true] {
+        for board in [false, true] {
+            for touch in [false, true] {
+                let (rt, mut app, mut ip) = ui_fixture();
+                app.sb_y = 60;
+                if board { app.toggle_whiteboard(); switch_to_cursor(&rt, &mut app); }
+                app.drawing_tools.set_expanded(true);
+                app.drawing_tools.settle();
+                app.tool_selector.advance_at(Instant::now() + Duration::from_secs(1));
+                let center = |button| {
+                    let r = ui::control_rect(&app, ui::Control::Sidebar(button, right)).unwrap();
+                    (r.x + r.w / 2, r.y + r.h / 2)
+                };
+                let (x, cursor) = center(Btn::Cursor);
+                let (_, pen) = center(Btn::Pen);
+                let (_, eraser) = center(Btn::Eraser);
+                let event = |app: &mut App, ip: &mut Ip, y, kind| {
+                    if touch { handle_touch(&rt, app, ip, None, 4, x, y, kind, 0.0); }
+                    else { match kind {
+                        TouchKind::Begin => on_press(&rt, app, ip, None, x, y, 1),
+                        TouchKind::Update => on_motion(&rt, app, ip, x, y),
+                        TouchKind::End => on_release(&rt, app, ip, None, x, y, 1),
+                    }}
+                };
+                event(&mut app, &mut ip, cursor, TouchKind::Begin);
+                rt.dirty.borrow_mut().clear();
+                event(&mut app, &mut ip, (pen + eraser) / 2, TouchKind::Update);
+                assert_eq!(app.mode, 0);
+                assert!((app.tool_selector.position(app.mode) - 1.5).abs() < 0.03);
+                for side in [false, true] {
+                    assert!(rt.dirty.borrow().contains(&ui::tool_track_rect(&app, side).with_paint_margin()));
+                }
+                if touch {
+                    for kind in [TouchKind::Begin, TouchKind::End] {
+                        handle_touch(&rt, &mut app, &mut ip, None, 9, x, pen, kind, 0.0);
+                    }
+                    assert_eq!(app.mode, 0);
+                }
+                event(&mut app, &mut ip, eraser, TouchKind::End);
+                assert_eq!(app.mode, 2);
+                assert!(!app.eraser_popup_visible && !app.is_drawing && !app.page_has_ink);
+                // The auxiliary drawer can still be opening. The fixed segments stay live.
+                event(&mut app, &mut ip, eraser, TouchKind::Begin);
+                event(&mut app, &mut ip, eraser, TouchKind::End);
+                assert!(app.eraser_popup_visible && app.popup_on_right == right);
+                event(&mut app, &mut ip, eraser, TouchKind::Begin);
+                event(&mut app, &mut ip, pen, TouchKind::End);
+                assert_eq!(app.mode, 1, "a coalesced release can select the next segment");
+                assert!(!app.eraser_popup_visible && !app.pen_popup_visible);
+                event(&mut app, &mut ip, pen, TouchKind::Begin);
+                event(&mut app, &mut ip, eraser, TouchKind::Update);
+                event(&mut app, &mut ip, pen, TouchKind::End);
+                assert_eq!(app.mode, 1);
+                assert!(!app.pen_popup_visible, "dragging back does not count as tapping the pen again");
+            }
+        }
+    }
+}
+
+#[test]
+fn leaving_the_track_or_ending_the_slideshow_discards_a_pending_mode_change() {
+    let (rt, mut app, mut ip) = ui_fixture();
+    app.sb_y = 60;
+    app.drawing_tools.set_expanded(true);
+    app.drawing_tools.settle();
+    let (x, pen) = button_center(&app, Btn::Pen);
+    let (_, eraser) = button_center(&app, Btn::Eraser);
+    let (_, next) = button_center(&app, Btn::Next);
+    for (release_x, release_y) in [(x, next), (app.screen_w / 2, eraser), (app.screen_w - x, eraser)] {
+        on_press(&rt, &mut app, &mut ip, None, x, pen, 1);
+        on_motion(&rt, &mut app, &mut ip, x, eraser);
+        on_release(&rt, &mut app, &mut ip, None, release_x, release_y, 1);
+        assert_eq!((app.mode, app.current_slide), (0, 1));
+        assert_eq!(app.tool_selector.position(app.mode), 0.0);
+        assert!(!app.page_has_ink && !app.is_drawing);
+    }
+    for mode in [0, 1] {
+        app.set_tool_mode(mode);
+        on_press(&rt, &mut app, &mut ip, None, x, pen, 1);
+        on_motion(&rt, &mut app, &mut ip, x, eraser);
+        finish_presentation(&rt, &mut app);
+        on_release(&rt, &mut app, &mut ip, None, x, eraser, 1);
+        assert_eq!(app.mode, 0);
+        assert!(!app.eraser_popup_visible);
+    }
+}
+
+#[test]
+fn each_sidebar_key_keeps_a_distinct_48_by_48_touch_target() {
+    let (_, mut app, _) = ui_fixture();
+    app.wps_connected = true;
+    app.wps_page_index = 6;
+    app.wps_page_total = 24;
+    app.wps_can_jump = true;
+    app.wps_deck_epoch = 1;
+    app.sb_y = 60;
+    for scale in [0.6, 1.0, 1.4] {
+        app.sb_scale = scale;
+        for open in [false, true] {
+            app.drawing_tools.set_expanded(open);
+            app.drawing_tools.settle();
+            for right in [false, true] {
+                let keys = ui::sidebar_buttons(&app, right).into_iter()
+                    .map(|(button, r)| (ui::Control::Sidebar(button, right), r))
+                    .chain([(ui::Control::PageCount(right), ui::sidebar_page_rect(&app, right))]);
+                for (key, r) in keys {
+                    let (cx, cy) = (r.x + r.w / 2, r.y + r.h / 2);
+                    for x in [cx - 24, cx + 23] {
+                        for y in [cy - 24, cy + 23] {
+                            assert_eq!(ui::control_at(&app, x, y), Some(key), "{key:?} at scale {scale}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for p in [ui_theme::LIGHT, ui_theme::DARK] {
+        for face in [p.paper, p.surface] {
+            assert!(ui_theme::contrast(p.control_border(), face) >= 3.0);
+        }
+    }
+}
+
+#[test]
+fn a_short_touchscreen_can_scroll_to_the_last_action_without_triggering_clear() {
+    let (rt, mut app, mut ip) = ui_fixture();
+    app.configure_geometry(640, 360, 1.0);
+    app.sb_y = 77;
+    app.drawing_tools.set_expanded(true);
+    app.drawing_tools.settle();
+    paint::stroke_tapered(&mut app, (300, 80), (360, 100), 5, 5);
+    let ink = app.canvas.data().to_vec();
+    let (x, clear_y) = button_center(&app, Btn::Clear);
+    handle_touch(&rt, &mut app, &mut ip, None, 3, x, clear_y, TouchKind::Begin, 0.0);
+    handle_touch(&rt, &mut app, &mut ip, None, 3, x, 20, TouchKind::End, 0.0);
+    assert!(ip.pending_ui.is_none() && !ip.dragging);
+    assert_eq!(app.canvas.data(), ink);
+    assert!(ui::sidebar_rect(&app, false).y < 0);
+    on_scroll(&rt, &mut app, &ip, x, 100, 10.0);
+    let rail = ui::sidebar_rect(&app, false);
+    assert_eq!(rail.y + rail.h, app.screen_h);
+    for right in [false, true] {
+        let photo = ui::Control::Sidebar(Btn::Screenshot, right);
+        let key = ui::control_rect(&app, photo).unwrap();
+        assert_eq!(ui::control_at(&app, key.x + key.w / 2, key.y + key.h / 2), Some(photo));
+    }
+    assert_eq!(app.sb_y, 77, "scrolling does not change the normal docking position");
+}
+
+#[test]
+fn pen_palette_uses_the_same_cells_for_paint_feedback_and_picking_on_either_edge() {
+    let (_, mut app, _) = ui_fixture();
+    app.pen_popup_visible = true;
+    for (w, h, display_scale, rail_scale) in [(1280, 720, 1.0, 1.0), (800, 600, 1.25, 0.6),
+        (640, 360, 1.5, 1.4), (320, 200, 2.0, 1.0)] {
+        app.configure_geometry(w, h, display_scale);
+        app.sb_scale = rail_scale;
+        for right in [false, true] {
+            app.popup_on_right = right;
+            for anchor in [0, h] {
+                app.sb_y = anchor;
+                let panel = ui::pen_popup_rect(&app);
+                assert!(panel.x >= 0 && panel.x + panel.w <= w && panel.y >= 0 && panel.y + panel.h <= h);
+                let controls = (0..app::COLORS.len()).map(PopupHit::Color)
+                    .chain((0..app::PEN_SIZES.len()).map(PopupHit::PenSize));
+                for hit in controls {
+                    let key = ui::Control::Popup(hit);
+                    let cell = ui::control_rect(&app, key).unwrap();
+                    for x in [cell.x, cell.x + cell.w - 1] {
+                        for y in [cell.y, cell.y + cell.h - 1] {
+                            assert!(panel.contains(x, y));
+                            assert_eq!(ui::control_at(&app, x, y), Some(key));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn eraser_palette_touch_selects_each_width_and_clears_only_on_release() {
+    for side in [false, true] {
+        let (rt, mut app, mut ip) = ui_fixture();
+        rt.begin_batch();
+        app.mode = 2;
+        app.eraser_popup_visible = true;
+        app.popup_on_right = side;
+        for i in 0..app::ERASER_SIZES.len() {
+            let hit = ui::Control::Popup(PopupHit::EraserSize(i));
+            let r = ui::control_rect(&app, hit).unwrap();
+            assert!(r.w >= 48 && r.h >= 48);
+            let (x, y) = (r.x + 1, r.y + r.h - 1);
+            assert_eq!(ui::control_at(&app, x, y), Some(hit));
+            handle_touch(&rt, &mut app, &mut ip, None, 1, x, y, TouchKind::Begin, 0.0);
+            handle_touch(&rt, &mut app, &mut ip, None, 1, x, y, TouchKind::End, 0.0);
+            assert_eq!(app.eraser_width(), app::ERASER_SIZES[i]);
+            assert!(app.eraser_popup_visible);
+            assert!(rt.dirty.borrow().iter().all(|r| r.w < app.screen_w));
+        }
+        app.canvas.pixels_mut()[0] = tiny_skia::ColorU8::from_rgba(0, 0, 0, 255).premultiply();
+        app.page_has_ink = true;
+        let r = ui::control_rect(&app, ui::Control::Popup(PopupHit::ClearAll)).unwrap();
+        let (x, y) = (r.x + r.w / 2, r.y + r.h / 2);
+        handle_touch(&rt, &mut app, &mut ip, None, 1, x, y, TouchKind::Begin, 0.0);
+        assert!(app.page_has_ink);
+        handle_touch(&rt, &mut app, &mut ip, None, 1, x, y, TouchKind::End, 0.0);
+        assert!(app.can_restore_cleared() && !app.eraser_popup_visible);
+    }
+}
+
+#[test]
+fn rapid_pen_retap_opens_the_palette_during_drawer_expansion() {
+    for right in [false, true] {
+        for touch in [false, true] {
+            for (at_bottom, leave, drift) in [(false, false, 0), (false, false, 7), (false, true, 0), (true, false, 0)] {
+                let (rt, mut app, mut ip) = ui_fixture();
+                if at_bottom { app.sb_y = app.screen_h - app.sb_height(); }
+                let pen = ui::control_rect(&app, ui::Control::Sidebar(Btn::Pen, right)).unwrap();
+                let (x, y) = (pen.x + pen.w / 2, pen.y + pen.h / 2);
+                let event = |app: &mut App, ip: &mut Ip, kind, (x, y)| {
+                    if touch { handle_touch(&rt, app, ip, None, 1, x, y, kind, 0.0); }
+                    else { match kind {
+                        TouchKind::Begin => on_press(&rt, app, ip, None, x, y, 1),
+                        TouchKind::End => on_release(&rt, app, ip, None, x, y, 1),
+                        TouchKind::Update => on_motion(&rt, app, ip, x, y),
+                    }}
+                };
+                event(&mut app, &mut ip, TouchKind::Begin, (x, y));
+                event(&mut app, &mut ip, TouchKind::End, (x, y));
+                assert_eq!(app.mode, 1);
+                assert!(app.drawing_tools.animating() && !app.pen_popup_visible);
+                app.drawing_tools.advance_at(Instant::now() + Duration::from_millis(80));
+                event(&mut app, &mut ip, TouchKind::Begin, (x, y));
+                if leave { on_motion(&rt, &mut app, &mut ip, -1, -1); }
+                event(&mut app, &mut ip, TouchKind::Update, (x, y + drift));
+                event(&mut app, &mut ip, TouchKind::End, (x, y + drift));
+                assert!(app.pen_popup_visible && app.popup_on_right == right,
+                    "right={right} touch={touch} at_bottom={at_bottom} leave={leave} drift={drift} mode={}", app.mode);
+                let hit = ui::Control::Popup(PopupHit::Color(9));
+                let cell = ui::control_rect(&app, hit).unwrap();
+                let swatch = (cell.x + cell.w / 2, cell.y + cell.h / 2);
+                event(&mut app, &mut ip, TouchKind::Begin, swatch);
+                app.drawing_tools.settle();
+                assert_eq!(ui::control_rect(&app, hit), Some(cell));
+                event(&mut app, &mut ip, TouchKind::End, swatch);
+                assert_eq!(app.cur_color, 9);
+                assert!(app.pen_popup_visible && !app.is_drawing && !app.page_has_ink);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_presenter_can_pick_a_black_fine_pen_from_the_gutters_then_return_to_cursor() {
+    for right in [false, true] {
+        for touch in [false, true] {
+            let (rt, mut app, mut ip) = ui_fixture();
+            rt.begin_batch();
+            app.cur_pen = app::PEN_SIZES.len() - 1;
+            let tap = |app: &mut App, ip: &mut Ip, x, y| {
+                if touch {
+                    handle_touch(&rt, app, ip, None, 1, x, y, TouchKind::Begin, 0.0);
+                    handle_touch(&rt, app, ip, None, 1, x, y, TouchKind::End, 0.0);
+                } else {
+                    on_press(&rt, app, ip, None, x, y, 1);
+                    on_release(&rt, app, ip, None, x, y, 1);
+                }
+            };
+            let pen = ui::control_rect(&app, ui::Control::Sidebar(Btn::Pen, right)).unwrap();
+            let (x, y) = (pen.x - 2, pen.y + pen.h / 2);
+            tap(&mut app, &mut ip, x, y);
+            assert_eq!(app.mode, 1);
+            app.drawing_tools.settle();
+            tap(&mut app, &mut ip, x, y);
+            assert!(app.pen_popup_visible && app.popup_on_right == right);
+            for hit in [PopupHit::Color(9), PopupHit::PenSize(0)] {
+                let cell = ui::control_rect(&app, ui::Control::Popup(hit)).unwrap();
+                rt.dirty.borrow_mut().clear();
+                tap(&mut app, &mut ip, cell.x + 1, cell.y + 1);
+                assert!(rt.dirty.borrow().iter().all(|r| r.w < app.screen_w));
+                if matches!(hit, PopupHit::Color(_)) {
+                    for side in [false, true] {
+                        let tip = ui::control_rect(&app, ui::Control::Sidebar(Btn::Pen, side)).unwrap();
+                        assert!(rt.dirty.borrow().contains(&tip.with_paint_margin()));
+                    }
+                }
+            }
+            assert_eq!(app.pen_width(), 2);
+            assert_eq!(app::COLORS[app.cur_color], (0, 0, 0));
+            assert!(app.pen_popup_visible && !app.page_has_ink);
+            let ended = WpsUpdate { connected: true, events: vec![WpsEvent::SlideshowEnd] };
+            tick_shared(&rt, &mut app, &mut ip, None, &ended, &mut Timers::new(), false);
+            assert_eq!(app.mode, 0);
+            assert!(!app.pen_popup_visible);
+        }
+    }
+}
+
+#[test]
+fn a_delayed_palette_frame_reaches_full_opacity_and_releases_the_animation_timer() {
+    let (rt, mut app, mut ip) = ui_fixture();
+    rt.begin_batch();
+    app.mode = 1;
+    app.pen_popup_visible = true;
+    app.open_anim = now_ms() - ui::POPUP_FADE_MS - 1000;
+    let panel = ui::pen_popup_rect(&app).with_paint_margin();
+    let update = WpsUpdate { connected: false, events: vec![] };
+    let mut timers = Timers::new();
+    tick_shared(&rt, &mut app, &mut ip, None, &update, &mut timers, false);
+    assert_eq!(app.open_anim, 0);
+    assert!(rt.dirty.borrow().contains(&panel));
+    rt.dirty.borrow_mut().clear();
+    tick_shared(&rt, &mut app, &mut ip, None, &update, &mut timers, false);
+    assert!(!rt.dirty.borrow().contains(&panel));
+}
+
+#[test]
 fn both_clear_controls_keep_restore_reachable_and_whiteboard_ready() {
     for whiteboard in [false, true] {
         for popup_clear in [false, true] {
             let (rt, mut app, mut ip) = ui_fixture();
             assert!(!app.drawing_tools.expanded());
-            assert!(ui::sidebar_buttons(&app, false).iter().any(|(b, _)| *b == Btn::Pen));
-            assert!(!ui::sidebar_buttons(&app, false).iter().any(|(b, _)| *b == Btn::Clear));
+            let shown = |app: &App, b| ui::control_rect(app, ui::Control::Sidebar(b, false)).is_some();
+            assert!([Btn::Cursor, Btn::Pen].iter().all(|&b| shown(&app, b)));
+            assert!([Btn::Eraser, Btn::Clear, Btn::Undo, Btn::Restore].iter().all(|&b| !shown(&app, b)));
             if whiteboard { handle_btn(&rt, &mut app, None, Btn::Whiteboard, false); }
             else { handle_btn(&rt, &mut app, None, Btn::Pen, false); }
             assert_eq!(app.mode, 1);
             assert!(app.drawing_tools.expanded());
             assert!(!app.pen_popup_visible, "first pen selection must not also open its settings");
             app.drawing_tools.settle();
+            assert!([Btn::Eraser, Btn::Clear, Btn::Undo].iter().all(|&b| shown(&app, b)));
             paint::stroke_tapered(&mut app, (640, 200), (710, 200), 6, 6);
             app.save_current_page();
             if popup_clear {
@@ -659,17 +1488,20 @@ fn both_clear_controls_keep_restore_reachable_and_whiteboard_ready() {
             assert!(!app.page_has_ink && !app.is_drawing);
             assert!(app.can_restore_cleared(), "clearing must leave one restore snapshot");
             resolve_drawing_tools_auto_update(&rt, &mut app);
-            assert!(app.drawing_tools.expanded(), "restore must stay reachable after clearing");
+            assert_eq!(app.drawing_tools.expanded(), whiteboard);
             assert!(!app.pen_popup_visible && !app.eraser_popup_visible);
             assert_eq!(app.whiteboard, whiteboard);
             assert_eq!(app.mode, if whiteboard { 1 } else { 0 });
             app.drawing_tools.settle();
-            assert!(ui::sidebar_buttons(&app, false).iter().any(|(b, _)| *b == Btn::Eraser),
-                "the clear restore action lives beside eraser/undo");
-            assert!(ui::sidebar_buttons(&app, false).iter().any(|(b, _)| *b == Btn::Next));
+            assert!(shown(&app, Btn::Restore) && shown(&app, Btn::Next));
+            assert_eq!(shown(&app, Btn::Eraser), whiteboard);
+            assert_eq!(shown(&app, Btn::Undo), whiteboard);
             app.load_page(app.current_slide);
             assert!(!app.page_has_ink, "cleared content must not return from its cache");
             if whiteboard {
+                switch_to_cursor(&rt, &mut app);
+                assert!(shown(&app, Btn::Restore) && !shown(&app, Btn::Eraser) && !shown(&app, Btn::Undo));
+                switch_to_draw(&rt, &mut app, 1);
                 go_next(&rt, &mut app, None);
                 resolve_drawing_tools_auto_update(&rt, &mut app);
                 assert!(app.drawing_tools.expanded(), "blank whiteboard pages remain ready to write");
@@ -763,9 +1595,11 @@ fn paging_checks_destination_ink_and_preserves_active_drawing_modes() {
             go_next(&rt, &mut app, None);
             resolve_drawing_tools_auto_update(&rt, &mut app);
             assert_eq!(app.current_slide, 2);
+            assert!(app.drawing_tools.expanded(), "leave the navigation keys in place during the dwell");
+            resolve_drawing_tools_at(&rt, &mut app, Instant::now() + Duration::from_secs(1));
             assert_eq!(app.drawing_tools.expanded(), mode != 0 || target_ink);
             go_prev(&rt, &mut app, None);
-            resolve_drawing_tools_auto_update(&rt, &mut app);
+            resolve_drawing_tools_at(&rt, &mut app, Instant::now() + Duration::from_secs(1));
             assert!(app.canvas.pixels().iter().any(|p| p.alpha() != 0));
             assert!(app.drawing_tools.expanded(), "returning to ink reopens the drawing tools");
             assert_eq!(app.mode, mode, "restoring tools must not change the selected mode");
@@ -790,6 +1624,8 @@ fn folded_cursor_tools_follow_actual_ink_without_untucking_the_sidebar() {
             assert!(!app.drawing_tools.expanded());
             go_next(&rt, &mut app, None);
             resolve_drawing_tools_auto_update(&rt, &mut app);
+            assert!(!app.drawing_tools.expanded());
+            resolve_drawing_tools_at(&rt, &mut app, Instant::now() + Duration::from_secs(1));
             assert_eq!(app.current_slide, 2);
             assert_eq!(app.mode, 0);
             assert_eq!(app.collapsed, tucked);
@@ -799,6 +1635,89 @@ fn folded_cursor_tools_follow_actual_ink_without_untucking_the_sidebar() {
             resolve_drawing_tools_auto_update(&rt, &mut app);
             assert_eq!(app.drawing_tools.expanded(), content == "ink" && !tucked);
         }
+    }
+}
+
+#[test]
+fn rapid_cursor_paging_keeps_the_key_under_the_finger_and_ignores_skipped_ink() {
+    for right in [false, true] {
+        let (rt, mut app, _) = fixture(true);
+        app.configure_geometry(1280, 900, 1.0);
+        let mut ip = Ip::default();
+        app.sb_y = 0;
+        rt.begin_batch();
+        paint::stroke_tapered(&mut app, (100, 100), (130, 100), 5, 5);
+        app.slide_cache.insert(2, app.canvas.clone());
+        app.clear_canvas();
+        let next = ui::Control::Sidebar(Btn::Next, right);
+        let key = ui::control_rect(&app, next).unwrap();
+        let (x, y) = (key.x + key.w / 2, key.y + key.h / 2);
+        let touch = |app: &mut App, ip: &mut Ip, kind| handle_touch(&rt, app, ip, None, 1, x, y, kind, 0.0);
+        touch(&mut app, &mut ip, TouchKind::Begin);
+        touch(&mut app, &mut ip, TouchKind::End);
+        assert_eq!(app.current_slide, 2);
+        assert!(app.page_has_ink);
+        touch(&mut app, &mut ip, TouchKind::Begin);
+        resolve_drawing_tools_at(&rt, &mut app, Instant::now() + Duration::from_secs(2));
+        assert!(!app.drawing_tools.expanded());
+        assert_eq!(ui::control_rect(&app, next), Some(key));
+        touch(&mut app, &mut ip, TouchKind::End);
+        assert_eq!(app.current_slide, 3);
+        resolve_drawing_tools_at(&rt, &mut app, Instant::now() + Duration::from_secs(2));
+        assert!(!app.drawing_tools.expanded());
+        go_prev(&rt, &mut app, None);
+        handle_btn(&rt, &mut app, None, Btn::Pen, right);
+        assert_eq!(app.mode, 1);
+        assert!(app.drawing_tools.expanded(), "selecting the pen bypasses page dwell");
+    }
+}
+
+#[test]
+fn undoing_the_last_mark_in_cursor_mode_waits_before_folding() {
+    let (rt, mut app, _) = fixture(true);
+    switch_to_draw(&rt, &mut app, 1);
+    app.begin_undo();
+    paint::stroke_tapered(&mut app, (20, 20), (80, 20), 6, 6);
+    switch_to_cursor(&rt, &mut app);
+    resolve_drawing_tools_auto_update(&rt, &mut app);
+    handle_btn(&rt, &mut app, None, Btn::Undo, false);
+    resolve_drawing_tools_auto_update(&rt, &mut app);
+    assert!(app.drawing_tools.expanded());
+    resolve_drawing_tools_at(&rt, &mut app, Instant::now() + Duration::from_secs(1));
+    assert!(!app.drawing_tools.expanded() && !app.page_has_ink && !app.can_restore_cleared());
+}
+
+#[test]
+fn compact_restore_belongs_to_the_cleared_page_and_works_from_either_rail() {
+    for right in [false, true] {
+        let (rt, mut app, _) = fixture(true);
+        app.configure_geometry(1280, 900, 1.0);
+        let mut ip = Ip::default();
+        rt.begin_batch();
+        switch_to_draw(&rt, &mut app, 1);
+        paint::stroke_tapered(&mut app, (100, 100), (130, 100), 5, 5);
+        let ink = app.canvas.clone();
+        clear_drawing(&rt, &mut app);
+        let recover = ui::Control::Sidebar(Btn::Restore, right);
+        assert!(ui::control_rect(&app, recover).is_some());
+        go_next(&rt, &mut app, None);
+        assert!(!ui::control_enabled(&app, recover) && ui::control_rect(&app, recover).is_none());
+        resolve_drawing_tools_at(&rt, &mut app, Instant::now() + Duration::from_secs(1));
+        app.drawing_tools.settle();
+        go_prev(&rt, &mut app, None);
+        resolve_drawing_tools_at(&rt, &mut app, Instant::now() + Duration::from_secs(1));
+        app.drawing_tools.settle();
+        let key = ui::control_rect(&app, recover).unwrap();
+        let pen = ui::control_rect(&app, ui::Control::Sidebar(Btn::Pen, right)).unwrap();
+        assert_eq!(key.y, pen.y + pen.h + 6);
+        assert!(ui::control_rect(&app, ui::Control::Sidebar(Btn::Eraser, right)).is_none());
+        let (x, y) = (key.x + key.w / 2, key.y + key.h / 2);
+        assert_eq!(ui::control_at(&app, x, y), Some(recover));
+        on_press(&rt, &mut app, &mut ip, None, x, y, 1);
+        on_release(&rt, &mut app, &mut ip, None, x, y, 1);
+        assert_eq!(app.canvas.data(), ink.data());
+        assert_eq!(app.mode, 0);
+        assert!(app.drawing_tools.expanded() && !app.can_restore_cleared());
     }
 }
 
@@ -834,6 +1753,8 @@ fn wps_waits_for_real_page_before_collapsing_and_whiteboard_restores_tools() {
     tick_shared(&rt, &mut app, &mut ip, Some(&bridge), &next_page, &mut timers, false);
     resolve_drawing_tools_auto_update(&rt, &mut app);
     assert_eq!(app.current_slide, 2);
+    assert!(app.drawing_tools.expanded());
+    resolve_drawing_tools_at(&rt, &mut app, Instant::now() + Duration::from_secs(1));
     assert!(!app.drawing_tools.expanded());
     app.toggle_whiteboard();
     assert!(app.drawing_tools.expanded());
@@ -846,7 +1767,7 @@ fn wps_waits_for_real_page_before_collapsing_and_whiteboard_restores_tools() {
     assert!(!app.drawing_tools.expanded(), "queued navigation must wait for restored page content");
     bridge.shared.lock().unwrap().real_pos = 1;
     tick_shared(&rt, &mut app, &mut ip, Some(&bridge), &same_page, &mut timers, false);
-    resolve_drawing_tools_auto_update(&rt, &mut app);
+    resolve_drawing_tools_at(&rt, &mut app, Instant::now() + Duration::from_secs(1));
     assert_eq!(app.current_slide, 1);
     assert!(app.canvas.pixels().iter().any(|p| p.alpha() != 0));
     assert!(app.drawing_tools.expanded());
@@ -1194,6 +2115,48 @@ fn cancelling_a_drag_clears_feedback_and_hover_does_not_restore_it() {
 }
 
 #[test]
+fn collapsed_tab_repaints_just_the_two_faces_until_auto_expand() {
+    let (rt, mut app, _) = ui_fixture();
+    app.set_sidebar_collapsed(true);
+    app.sidebar_anim_start = None;
+    let start = app.sidebar_collapsed_since.unwrap();
+    let half = start + Duration::from_secs(60);
+    rt.begin_batch();
+    tick_sidebar_countdown(&rt, &mut app, half);
+    assert_eq!(app.sidebar_countdown, 128);
+    assert_eq!(rt.dirty.borrow().as_slice(), &[false, true].map(|right| ui::sidebar_tab_face(&app, right).with_paint_margin()));
+    rt.begin_batch();
+    tick_sidebar_countdown(&rt, &mut app, half + Duration::from_millis(1));
+    assert!(rt.dirty.borrow().is_empty());
+    tick_sidebar_countdown(&rt, &mut app, start + Duration::from_secs(120));
+    assert!(!app.collapsed && app.sidebar_countdown == 0);
+}
+
+#[test]
+fn slim_collapsed_tab_keeps_its_edge_touch_target() {
+    for right in [false, true] {
+        let (rt, mut app, mut ip) = ui_fixture();
+        for scale in [0.6, 1.0, 1.4] {
+            app.sb_scale = scale;
+            app.set_sidebar_collapsed(true);
+            app.sidebar_anim_start = None;
+            let hit = ui::sidebar_rect(&app, right);
+            let face = ui::sidebar_tab_face(&app, right);
+            assert!(hit.w >= 48 && face.h > 2 * face.w);
+            assert!(face.x > hit.x && face.x + face.w < hit.x + hit.w);
+            let x = if right { hit.x + 1 } else { hit.x + hit.w - 2 };
+            let y = hit.y + hit.h / 2;
+            assert!(!face.contains(x, y));
+            assert_eq!(ui::control_at(&app, x, y), Some(ui::Control::Sidebar(Btn::Collapse, right)));
+            for kind in [TouchKind::Begin, TouchKind::End] {
+                handle_touch(&rt, &mut app, &mut ip, None, 1, x, y, kind, 1.0);
+            }
+            assert!(!app.collapsed);
+        }
+    }
+}
+
+#[test]
 fn drag_reverses_immediately_at_an_edge_and_uses_the_release_position() {
     for collapsed in [false, true] {
         let (rt, mut app, mut ip) = ui_fixture();
@@ -1308,8 +2271,11 @@ fn outside_click_dismisses_cursor_popups() {
     app.pen_popup_visible = true;
     apply_input_shape(&rt, &app);
     assert!(dismiss_capture(&app));
-    on_press(&rt, &mut app, &mut ip, None, 320, 300, 1);
-    on_release(&rt, &mut app, &mut ip, None, 320, 300, 1);
+    let panel = ui::pen_popup_rect(&app);
+    let (x, y) = (panel.x + panel.w + 8, panel.y + panel.h / 2);
+    assert!(!over_ui(&app, x, y));
+    on_press(&rt, &mut app, &mut ip, None, x, y, 1);
+    on_release(&rt, &mut app, &mut ip, None, x, y, 1);
     assert!(!app.pen_popup_visible);
     assert!(!app.is_drawing && !app.page_has_ink);
     assert!(!dismiss_capture(&app));

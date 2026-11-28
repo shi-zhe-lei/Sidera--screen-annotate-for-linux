@@ -204,7 +204,7 @@ public:
     lay->addWidget(clearB);
 
     // 撤回键：橙色文字“撤回”
-    QPushButton* undoB = new QPushButton(QString::fromUtf8("撤回"));
+    QPushButton* undoB = new QPushButton(QString::fromUtf8("撤销"));
     undoB->setFixedSize(sbBtn(), sbBtn());
     undoB->setStyleSheet(QString("QPushButton{background:transparent;color:#ff9a3c;border:2px solid rgba(255,154,60,0.7);border-radius:%1px;font-weight:bold;font-size:%2px;}"
                          "QPushButton:hover{background:rgba(255,154,60,0.18);}").arg(int(sbBtn()*0.35)).arg(sbBtn()*16/38));
@@ -387,7 +387,7 @@ protected:
         p.setFont(mf);
         p.setPen(QColor("#0ABAB5"));
         p.drawText(rect(), Qt::AlignHCenter | Qt::AlignVCenter,
-                   QString::fromUtf8("已达到白板页数上限"));
+                   QString::fromUtf8("已翻回第 1 页"));
       }
     }
     p.end();

@@ -143,7 +143,8 @@ fn main() {
         let now = Instant::now();
         a.launch = launch::Launch::begin("GNOME 原生 Wayland · 1280 × 900".into(), true, true, now);
         a.launch.report_link(launch::LinkState::Waiting, now);
-        add("startup", "启动准备", splash_paint::draw(&fonts, intro_icon.as_ref(), &a.launch, 560, 448, palette), 516, 48);
+        a.launch.advance_at(now + Duration::from_millis(810));
+        add("startup", "启动", splash_paint::draw(&fonts, intro_icon.as_ref(), &a.launch, launch::CARD_WIDTH as u32, launch::CARD_HEIGHT as u32, palette), 516, 48);
 
         let mut a = fresh(preference);
         a.pen_popup_visible = true;

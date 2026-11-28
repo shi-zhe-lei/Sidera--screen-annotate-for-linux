@@ -107,6 +107,13 @@ void wpsLoadSettings() {
   f.close();
 }
 
+static void finishSlideshow() {
+  clearAllPages();
+  g.wpsRealPos = -1;
+  if (g.whiteboard) g.cursorAfterWhiteboard = true;
+  else if (g.currentMode != 0) switchToCursorMode();
+}
+
 // Shared bridge owns registration, HTTP bounds, command lifetime and heartbeat.
 static void startWpsApiServer() {
   if (g.wpsBridge) return;
@@ -117,7 +124,7 @@ static void startWpsApiServer() {
     if (g.whiteboard) g.savedSlide = page;
     else { g.currentSlide = page; loadPage(page); }
   };
-  bridge->onSlideshowEnd = []() { clearAllPages(); g.wpsRealPos = -1; };
+  bridge->onSlideshowEnd = finishSlideshow;
   bridge->onRealPos = [](int page) {
     if (g.whiteboard) { g.savedSlide = page; g.wpsRealPos = page; return; }
     if (page == g.currentSlide && page == g.wpsRealPos) return;
@@ -299,18 +306,10 @@ void checkWpsState() {
 
   if (needClose) XCloseDisplay(dpy);
 
-  if (was != g.wpsFullscreen) {
-    if (g.whiteboard || g.wpsDebug) {
-      // The linked bridge owns Begin/End. Fullscreen scans must not clear twice.
-    } else if (g.wpsFullscreen) {
-      // 进入全屏放映：清空所有笔迹
-      qDebug() << "[INFO] 进入全屏放映，清空笔迹";
-      clearAllPages();
-    } else {
-      // 退出全屏放映：清空所有笔迹
-      qDebug() << "[INFO] 退出全屏放映，清空笔迹";
-      clearAllPages();
-    }
+  if (was && !g.wpsFullscreen && !g.wpsConnected) {
+    finishSlideshow();
+  } else if (!was && g.wpsFullscreen && !g.whiteboard && !g.wpsDebug) {
+    clearAllPages();
   }
 
   // 翻页按钮始终显示

@@ -1,94 +1,98 @@
-// Sidera - 启动闪屏
+// Sidera - 启动页
 // Copyright (C) 2026 Carl_Jin   GNU GPL v3
 #include "app.h"
 
-// ============================================================
-// 启动闪屏：屏幕中央小窗、青→粉渐变、底部进度条、右下角 byline
-// ============================================================
-class SplashWindow : public QWidget {
-public:
-  explicit SplashWindow() {
-    setWindowFlags(Qt::Window | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
-    setAttribute(Qt::WA_TranslucentBackground);
-    setFixedSize(460, 210);
-    bar = new QProgressBar(this);
-    bar->setRange(0, 100);
-    bar->setValue(0);
-    bar->setFixedHeight(10);
-    bar->setTextVisible(false);
-    bar->setStyleSheet(
-      "QProgressBar{background:rgba(255,255,255,45);border:none;border-radius:5px;}"
-      "QProgressBar::chunk{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,"
-      "stop:0 #00e5ff,stop:1 #ff80ab);border-radius:5px;}");
-  }
-  void setProgress(int v) { bar->setValue(v); }
-
-protected:
-  void paintEvent(QPaintEvent*) override {
-    QPainter p(this);
-    p.setRenderHint(QPainter::Antialiasing, true);
-    QRectF r = rect().adjusted(1.5, 1.5, -1.5, -1.5);
-    QLinearGradient g(r.topLeft(), r.bottomRight());
-    g.setColorAt(0.0, QColor(0, 200, 255, 245));    // cyan
-    g.setColorAt(1.0, QColor(255, 120, 180, 245));  // pink
-    p.setBrush(g);
-    p.setPen(QPen(QColor(255, 255, 255, 70), 1.5));
-    p.drawRoundedRect(r, 20, 20);
-
-    // 图标（顶部居中）
-    static const QPixmap ico = sideraIconPixmap(84);
-    if (!ico.isNull()) {
-      int ix = (width() - ico.width()) / 2;
-      p.drawPixmap(ix, 22, ico);
-    }
-
-    // 名字
-    QFont nf = p.font();
-    nf.setPointSize(38);
-    nf.setBold(true);
-    p.setFont(nf);
-    p.setPen(Qt::white);
-    p.drawText(QRect(0, 108, width(), 54),
-               Qt::AlignCenter, QStringLiteral("Sidera"));
-
-    // 右下角 byline
-    QFont bf = p.font();
-    bf.setPointSize(10);
-    bf.setBold(false);
-    p.setFont(bf);
-    p.setPen(QColor(255, 255, 255, 210));
-    p.drawText(QRect(0, int(height() * 0.74), width() - 22, 24),
-               Qt::AlignRight | Qt::AlignVCenter,
-               QStringLiteral("developed by jinyicheng"));
-    p.end();
-  }
-
-  void resizeEvent(QResizeEvent*) override {
-    if (bar) bar->setGeometry(24, height() - 30, width() - 48, 10);
-  }
-
-private:
-  QProgressBar* bar = nullptr;
-};
-
-// 阻塞显示 2 秒启动闪屏（进度条 0→100），随后主程序继续初始化
-void showSplashFor(QApplication& app) {
-  SplashWindow splash;
-  QRect scr = QGuiApplication::primaryScreen()->geometry();
-  splash.move(scr.center() - splash.rect().center());
-  splash.show();
-  splash.setProgress(0);
-  QElapsedTimer t;
-  t.start();
-  const int dur = 2000;
-  while (t.elapsed() < dur) {
-    int p = qMin(100, int(t.elapsed() * 100 / dur));
-    splash.setProgress(p);
-    app.processEvents();
-    QThread::msleep(16);
-  }
-  splash.setProgress(100);
-  app.processEvents();
-  splash.close();
+namespace {
+constexpr int cardWidth = 560;
+constexpr int cardHeight = 332;
+constexpr qint64 localReportMs = 720;
+constexpr qint64 linkReportMs = 210;
 }
 
+StartupSplash::StartupSplash()
+    : artwork(QStringLiteral(":/sidera/startup-ink.png")), mark(sideraIconPixmap(48)) {
+  setWindowFlags(Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint | Qt::WindowDoesNotAcceptFocus);
+  setAttribute(Qt::WA_TranslucentBackground);
+  setAttribute(Qt::WA_ShowWithoutActivating);
+  setAttribute(Qt::WA_DeleteOnClose);
+  QScreen* screen = QGuiApplication::primaryScreen();
+  const QRect available = screen->availableGeometry();
+  QSize size(cardWidth, cardHeight);
+  const QSize room(qMax(1, available.width() - 24), qMax(1, available.height() - 24));
+  size.scale(size.boundedTo(room), Qt::KeepAspectRatio);
+  setFixedSize(size);
+  move(available.center() - rect().center());
+  const QSize physical = screen->size() * screen->devicePixelRatio();
+  displayLine = QStringLiteral("已连接桌面 · X11 · %1 × %2").arg(physical.width()).arg(physical.height());
+
+  elapsed.start();
+  auto* frames = new QTimer(this);
+  connect(frames, &QTimer::timeout, this, [this]() {
+    const qint64 now = elapsed.elapsed();
+    if (readyAt >= 0) {
+      const qint64 fade = now - qMax<qint64>(1100, readyAt + 250);
+      if (fade >= 200) { close(); return; }
+      if (fade > 0) { setWindowOpacity(1.0 - fade / 200.0); return; }
+    }
+    update(0, 240 * height() / cardHeight, width(), 50 * height() / cardHeight + 2);
+  });
+  frames->start(16);
+}
+
+void StartupSplash::reportReady() {
+  if (readyAt < 0) readyAt = elapsed.elapsed();
+}
+
+void StartupSplash::paintEvent(QPaintEvent*) {
+  QPainter painter(this);
+  painter.setRenderHints(QPainter::Antialiasing | QPainter::SmoothPixmapTransform);
+  painter.scale(width() / qreal(cardWidth), height() / qreal(cardHeight));
+  const bool dark = palette().window().color().lightness() < 128;
+  const QColor paper(dark ? "#202126" : "#fcfcfd"), ink(dark ? "#f2f2f5" : "#25262b");
+  const QColor muted(dark ? "#bfc1ca" : "#62646d");
+  painter.setPen(Qt::NoPen);
+  painter.setBrush(paper);
+  painter.drawRoundedRect(QRectF(0, 212, cardWidth, cardHeight - 212), 12, 12);
+  painter.drawPixmap(QRectF(0, 0, cardWidth, 224), artwork, QRectF(artwork.rect()));
+
+  const qint64 now = elapsed.elapsed();
+  qreal progress = .74 * qBound(0.0, now / qreal(localReportMs), 1.0);
+  if (readyAt >= 0) {
+    progress += .26 * qBound(0.0, (now - qMax(readyAt, localReportMs)) / qreal(linkReportMs), 1.0);
+  }
+  const QRectF track(30, 246, 500, 4);
+  painter.setBrush(QColor(dark ? "#4a4d58" : "#d5d7dd"));
+  painter.drawRoundedRect(track, 2, 2);
+  if (progress > 0) {
+    const qreal fill = track.width() * progress;
+    const qreal radius = qMin<qreal>(2.0, fill / 2);
+    painter.setBrush(QColor(dark ? "#8cd6b5" : "#216f62"));
+    painter.drawRoundedRect(QRectF(track.x(), track.y(), fill, track.height()), radius, radius);
+  }
+
+  QString status = displayLine;
+  if (progress >= .74) {
+    if (readyAt < 0) status = QStringLiteral("正在连接 WPS 演示");
+    else if (!g.wpsDebug) status = QStringLiteral("工具栏已就绪");
+    else if (!g.wpsBridge) status = QStringLiteral("WPS 联动暂不可用，可继续批注");
+    else if (g.wpsConnected) status = QStringLiteral("已连接 WPS 演示");
+    else status = QStringLiteral("工具栏已就绪，等待 WPS 演示");
+  } else if (progress >= .32) {
+    if (readyAt < 0) status = QStringLiteral("正在准备批注工具");
+    else status = g.hotkeyOk ? QStringLiteral("批注工具已就绪 · Ctrl+Shift+D")
+                            : QStringLiteral("批注工具已就绪，全局快捷键不可用");
+  }
+  QFont font = painter.font();
+  font.setPixelSize(15);
+  painter.setFont(font);
+  painter.setPen(ink);
+  painter.drawText(QPointF(30, 277), status);
+
+  if (!mark.isNull()) painter.drawPixmap(QRectF(30, 298, 20, 20), mark, QRectF(mark.rect()));
+  font.setPixelSize(11);
+  painter.setFont(font);
+  painter.setPen(muted);
+  painter.drawText(QPointF(mark.isNull() ? 30 : 58, 313), QStringLiteral("项目作者 Carl_Jin"));
+  const QString credits = QStringLiteral("定制开发 Gary_6Stones · 教程与反馈 ofkuyu");
+  painter.drawText(QPointF(530 - painter.fontMetrics().horizontalAdvance(credits), 313), credits);
+}

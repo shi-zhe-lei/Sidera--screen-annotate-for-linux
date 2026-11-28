@@ -12,8 +12,8 @@ use tiny_skia::{Color, Pixmap};
 pub const VERSION: &str = "3.2-Electro-stable";
 // 侧边栏基准尺寸（与 C++ 版对齐：56/34/24/19；可在设置里用「侧边栏大小」缩放）
 pub const SB_BASE_W: f64 = 56.0;
-pub const SB_BASE_BTN: f64 = 34.0;
-pub const SB_BASE_ICON: f64 = 24.0;
+pub const SB_BASE_BTN: f64 = 44.0;
+pub const SB_BASE_ICON: f64 = 30.0;
 pub const SB_BASE_DOT: f64 = 19.0;
 pub const DEFAULT_SB_SCALE: f64 = 1.0;
 pub const DEFAULT_SIDEBAR_ALPHA: u8 = 80;
@@ -196,11 +196,14 @@ pub struct App {
     /// Seewo Whiteboard 5 is visible: collapse the toolbar and refuse to open it.
     pub avoid_active: bool,
     pub drawing_tools: crate::toolbar::DrawingTools,
+    pub tool_selector: crate::toolbar::ToolSelector,
     pub sidebar_drag: Option<crate::ui::SidebarDragFeedback>,
     pub sb_y: i32,
+    sidebar_scroll: i32,
     pub sidebar_anim_start: Option<std::time::Instant>,
     pub sidebar_anim_from: f32,
     pub sidebar_collapsed_since: Option<std::time::Instant>,
+    pub(crate) sidebar_countdown: u8,
 
     // 颜色/粗细
     pub cur_color: usize,
@@ -216,6 +219,12 @@ pub struct App {
     // 侧边栏外观
     pub sb_scale: f64,
     pub sidebar_alpha: u8,
+    pub fade_toolbar_during_show: bool,
+    pub toolbar_icons_only: bool,
+    pub document_scroll_enabled: bool,
+    pub(crate) scroll_rail: crate::document_scroll::Rail,
+    pub(crate) screenshot_feedback: crate::toolbar::ScreenshotFeedback,
+    pub(crate) presentation_fade: crate::toolbar::PresentationFade,
     pub theme: crate::ui_theme::Theme,
 
     // 平台
@@ -354,12 +363,15 @@ impl App {
             collapsed: false,
             avoid_active: false,
             drawing_tools: crate::toolbar::DrawingTools::default(),
+            tool_selector: crate::toolbar::ToolSelector::default(),
             sidebar_drag: None,
             saved_drawing_tools: false,
             sb_y: (((screen_h - sb_height_of(DEFAULT_SB_SCALE)) as f32) * DEFAULT_SIDEBAR_POSITION / 100.0).round() as i32,
+            sidebar_scroll: 0,
             sidebar_anim_start: None,
             sidebar_anim_from: 0.0,
             sidebar_collapsed_since: None,
+            sidebar_countdown: 0,
             cur_color: 0,
             cur_pen: DEFAULT_PEN_INDEX,
             cur_eraser: DEFAULT_ERASER_INDEX,
@@ -369,6 +381,12 @@ impl App {
             last_pen_w: 0,
             sb_scale: DEFAULT_SB_SCALE,
             sidebar_alpha: DEFAULT_SIDEBAR_ALPHA,
+            fade_toolbar_during_show: false,
+            toolbar_icons_only: false,
+            document_scroll_enabled: false,
+            scroll_rail: Default::default(),
+            screenshot_feedback: Default::default(),
+            presentation_fade: Default::default(),
             theme: crate::ui_theme::Theme::default(),
             hotkey_ok: false,
             wps_fullscreen: false,
@@ -389,7 +407,7 @@ impl App {
             presentation_transition: crate::toolbar::PresentationTransition::default(),
             touch_frame_contacts: 0,
             slide_cache: PageCache::default(),
-            whiteboard_cache: PageCache::default(),
+            whiteboard_cache: PageCache::with_previews(),
             current_slide: 1,
             saved_slide: 1,
             whiteboard_slide: 1,
@@ -439,13 +457,13 @@ impl App {
 
     // ---- 侧边栏尺寸 ----
     pub fn sb_width(&self) -> i32 {
-        (SB_BASE_W * self.sb_scale) as i32
+        ((SB_BASE_W * self.sb_scale) as i32).max(56)
     }
     pub fn sb_btn(&self) -> i32 {
-        (SB_BASE_BTN * self.sb_scale) as i32
+        sidebar_button_size(self.sb_scale)
     }
     pub fn sb_icon(&self) -> i32 {
-        (SB_BASE_ICON * self.sb_scale) as i32
+        ((SB_BASE_ICON * self.sb_scale).round() as i32).max(24)
     }
     pub fn sb_dot(&self) -> i32 {
         (SB_BASE_DOT * self.sb_scale) as i32
@@ -458,10 +476,28 @@ impl App {
     /// Keep the visible toolbar on screen without losing its preferred anchor.
     /// Height changes (tools, page count, scale) share these bounds with dragging.
     pub fn sidebar_y(&self, height: i32) -> i32 {
-        self.sb_y.clamp(0, (self.screen_h - height).max(0))
+        let space = self.screen_h - height;
+        if space < 0 { -self.sidebar_scroll.clamp(0, -space) } else { self.sb_y.clamp(0, space) }
+    }
+    /// Scroll an oversized rail without losing the teacher's normal docking position.
+    pub fn move_sidebar_to(&mut self, y: i32, height: i32) -> i32 {
+        let space = self.screen_h - height;
+        if space < 0 {
+            self.sidebar_scroll = -y.clamp(space, 0);
+        } else {
+            self.sb_y = y.clamp(0, space);
+            self.sidebar_scroll = 0;
+        }
+        self.sidebar_y(height)
     }
     pub fn previewing_sidebars(&self) -> bool {
         self.settings_open && self.settings_ui.tab == crate::settings_state::Tab::Appearance
+    }
+    pub(crate) fn toolbar_can_fade(&self) -> bool {
+        self.fade_toolbar_during_show && !self.whiteboard && !self.launch.active() && !self.avoid_active
+            && !self.settings_open && !self.process_block_open && !self.confirm_quit
+            && !self.show_diag && !self.show_input_group_prompt && !self.pen_popup_visible
+            && !self.eraser_popup_visible && self.page_picker.is_none()
     }
     pub fn sidebar_position_height(&self) -> i32 {
         if self.collapsed && !self.previewing_sidebars() {
@@ -475,7 +511,14 @@ impl App {
             && (self.wps_page_index > 0 || self.wps_page_total > 0))
     }
     pub fn sidebar_page_space(&self) -> i32 {
-        if self.sidebar_page_visible() { self.sb_page_h() + 6 } else { 0 }
+        if self.sidebar_page_visible() || self.document_scroll_enabled { self.sb_page_h() + 6 } else { 0 }
+    }
+    pub(crate) fn wants_scroll_rail(&self) -> bool {
+        self.document_scroll_enabled && !self.whiteboard
+            && !(self.wps_debug && self.wps_connected && self.scroll_rail.ppt_foreground)
+    }
+    pub(crate) fn page_preview_enabled(&self) -> bool {
+        self.whiteboard || self.presentation_action == crate::ui::PresentationAction::End
     }
     pub fn page_picker_context(&self) -> Option<(i32, i32, crate::page_picker::Source)> {
         if self.whiteboard {
@@ -486,19 +529,37 @@ impl App {
         } else { None }
     }
     pub fn drawing_tools_height(&self) -> i32 {
-        (self.drawing_tools_full_height() as f32 * self.drawing_tools.fraction()).round() as i32
+        2 * self.eraser_row_height() + self.clear_row_height()
+    }
+    pub(crate) fn eraser_row_height(&self) -> i32 {
+        ((self.sb_btn() + 6) as f32 * self.drawing_tools.fraction()).round() as i32
+    }
+    pub(crate) fn clear_row_height(&self) -> i32 {
+        ((self.sb_btn() + 6) as f32 * self.drawing_tools.action_fraction()).round() as i32
     }
     pub fn drawing_tools_full_height(&self) -> i32 {
         3 * (self.sb_btn() + 6)
+    }
+    /// How far the rail still has to rise to fit its open drawer on screen.
+    pub(crate) fn opening_sidebar_shift(&self) -> i32 {
+        if !self.drawing_tools.expanded() { return 0; }
+        let height = self.sb_height();
+        self.sidebar_y(height + self.drawing_tools_full_height() - self.drawing_tools_height())
+            - self.sidebar_y(height)
+    }
+    pub fn set_tool_mode(&mut self, mode: i32) {
+        self.tool_selector.select(self.mode, mode);
+        self.mode = mode;
+        if mode != 0 { self.drawing_tools.set_expanded(true); }
     }
     pub fn sb_page_h(&self) -> i32 {
         page_counter_height(self.sb_scale)
     }
     pub fn collapsed_h(&self) -> i32 {
-        (64.0 * self.sb_scale).round().clamp(56.0, 72.0) as i32
+        (84.0 * self.sb_scale).round().clamp(72.0, 100.0) as i32
     }
     pub fn collapsed_w(&self) -> i32 {
-        (24.0 * self.sb_scale).round().clamp(24.0, 30.0) as i32
+        (48.0 * self.sb_scale).round().clamp(48.0, 54.0) as i32
     }
     pub fn sidebar_retract(&self) -> f32 {
         let target = if self.collapsed { 1.0 } else { 0.0 };
@@ -508,17 +569,35 @@ impl App {
         self.sidebar_anim_from + (target - self.sidebar_anim_from) * eased
     }
     pub fn set_sidebar_collapsed(&mut self, collapsed: bool) {
-        if self.collapsed == collapsed { return; }
-        self.sidebar_anim_from = self.sidebar_retract();
-        self.sidebar_anim_start = Some(std::time::Instant::now());
-        self.collapsed = collapsed;
-        self.sidebar_collapsed_since = collapsed.then(std::time::Instant::now);
+        if self.collapsed != collapsed {
+            self.set_sidebar_collapsed_since(collapsed.then(std::time::Instant::now));
+        }
     }
 
-    /// 手动收起后按用户设定展开；旧配置保持原来的两分钟。
+    pub(crate) fn set_sidebar_collapsed_since(&mut self, start: Option<std::time::Instant>) {
+        let collapsed = start.is_some();
+        let now = std::time::Instant::now();
+        if self.collapsed != collapsed {
+            self.tool_selector.cancel_press();
+            self.sidebar_scroll = 0;
+            self.sidebar_anim_from = self.sidebar_retract();
+            self.sidebar_anim_start = Some(now);
+            self.collapsed = collapsed;
+        }
+        self.sidebar_collapsed_since = start;
+        if let Some(remaining) = self.sidebar_countdown_at(now) { self.sidebar_countdown = remaining; }
+    }
+
+    /// One sample drives both the rim and auto-expand. Zero means the deadline has passed.
+    pub(crate) fn sidebar_countdown_at(&self, now: std::time::Instant) -> Option<u8> {
+        let start = self.sidebar_collapsed_since?;
+        let total = std::time::Duration::from_secs(u64::from(self.sidebar_expand_minutes.clamp(1, 20)) * 60);
+        let left = total.saturating_sub(now.saturating_duration_since(start));
+        Some((left.as_nanos() * u128::from(u8::MAX)).div_ceil(total.as_nanos()) as u8)
+    }
+
     pub fn sidebar_expand_due(&self) -> bool {
-        self.collapsed && self.sidebar_collapsed_since.is_some_and(
-            |start| start.elapsed() >= std::time::Duration::from_secs(u64::from(self.sidebar_expand_minutes.clamp(1, 20)) * 60))
+        self.sidebar_countdown_at(std::time::Instant::now()) == Some(0)
     }
     pub fn finish_sidebar_animation(&mut self) -> bool {
         if self.sidebar_anim_start.is_some_and(|start| start.elapsed().as_millis() >= 180) {
@@ -580,11 +659,16 @@ impl App {
     }
 
     // ---- 撤回 ----
+    pub(crate) fn invalidate_board_preview(&mut self) {
+        if let Some(picker) = &mut self.page_picker { picker.live_ink.take(); }
+    }
     pub fn clear_undo(&mut self) {
+        self.invalidate_board_preview();
         self.undo.clear();
     }
     /// Drop the most recent undo entry (used when a selection is cancelled).
     pub fn discard_last_undo(&mut self) {
+        self.invalidate_board_preview();
         self.undo.pop_back();
     }
     /// 开始一次新的撤回记录（落笔前调用）；不立即拷贝像素，避免整屏快照
@@ -600,6 +684,7 @@ impl App {
     /// 在绘制前保存 rect 覆盖到、且本条目尚未保存的瓦片。
     /// rect 使用画布物理像素坐标，右、下边界不包含在区域内。
     pub fn save_undo_rect(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
+        self.invalidate_board_preview();
         let cw = self.canvas.width() as i32;
         let ch = self.canvas.height() as i32;
         let x0 = x0.clamp(0, cw);
@@ -636,6 +721,7 @@ impl App {
         }
     }
     pub fn undo_last(&mut self) {
+        self.invalidate_board_preview();
         if self.floating.is_some() {
             crate::selection::cancel(self);
             self.select_mode = false;
@@ -646,7 +732,7 @@ impl App {
             Some(UndoEntry::Guide(previous)) => {
                 let editing = self.coord.is_some_and(|c| c.editing);
                 self.coord = previous.map(|mut c| { c.editing = editing; c });
-                if editing && self.coord.is_none() { self.mode = 1; }
+                if editing && self.coord.is_none() { self.set_tool_mode(1); }
                 self.conic_menu = None;
                 self.save_coord_page();
                 return;
@@ -667,6 +753,11 @@ impl App {
                 data[dst..dst + tw * 4].copy_from_slice(&buf[src..src + tw * 4]);
             }
         }
+        // Undoing the first stroke after a clear may uncover the saved page.
+        if self.clear_history.available(self.current_slide, self.whiteboard) {
+            self.page_has_ink = self.canvas.pixels().iter().any(|pixel| pixel.alpha() != 0);
+        }
+        self.follow_page_after_dwell();
     }
 
     // ---- 手势复位 ----
@@ -683,22 +774,29 @@ impl App {
 
     // ---- 画布 ----
     pub fn request_drawing_tools_collapse(&mut self) {
-        if !self.whiteboard && self.mode == 0 {
+        if self.mode == 0 {
             self.drawing_tools.request_auto_collapse();
         }
     }
 
-    /// Actual page content for an automatic drawer update; None preserves a
-    /// manual sidebar tuck, active drawing, or the whiteboard's own tool state.
+    pub(crate) fn waiting_for_drawer(&self, now: std::time::Instant) -> bool {
+        let in_use = self.sidebar_drag.is_some() || self.page_picker.is_some()
+            || self.press.is_some_and(|p| p.until.is_none() && matches!(p.control,
+                crate::ui::Control::Sidebar(..) | crate::ui::Control::PageCount(_)));
+        self.drawing_tools.waiting_for_page(now, in_use)
+    }
+
+    fn follow_page_after_dwell(&mut self) {
+        if self.mode == 0 && !self.collapsed {
+            self.drawing_tools.page_changed_at(std::time::Instant::now());
+        }
+    }
+
+    /// Check canvas alpha only after a requested update, never on idle frames.
     pub fn drawing_tools_auto_state(&mut self) -> Option<bool> {
-        if self.whiteboard || self.collapsed || self.mode != 0
-            || self.is_drawing || !self.stroke_pts.is_empty() {
+        if self.collapsed || self.mode != 0 || self.is_drawing || !self.stroke_pts.is_empty() {
             return None;
         }
-        // A cleared page keeps the drawer open so its restore action stays reachable.
-        if self.can_restore_cleared() { return Some(true); }
-        // Erasing/undo can leave the conservative ink flag set. Inspect actual
-        // alpha only at a requested transition, never on idle animation frames.
         self.page_has_ink = self.canvas.pixels().iter().any(|pixel| pixel.alpha() != 0);
         Some(self.page_has_ink)
     }
@@ -712,11 +810,14 @@ impl App {
     }
 
     pub fn can_restore_cleared(&self) -> bool {
-        !self.page_has_ink && self.clear_history.available(self.current_slide, self.whiteboard)
+        !self.page_has_ink && self.stroke_pts.is_empty() && self.floating.is_none()
+            && self.clear_history.available(self.current_slide, self.whiteboard)
     }
 
     /// 用户点“清除”前调用；空白页不记录，避免恢复出一张空快照。
     pub fn remember_before_clear(&mut self) {
+        crate::paint::commit_stroke(self);
+        if self.floating.is_some() { crate::selection::commit(self); }
         if !self.canvas.pixels().iter().any(|pixel| pixel.alpha() != 0) {
             return;
         }
@@ -725,7 +826,7 @@ impl App {
     }
 
     pub fn restore_cleared(&mut self) -> bool {
-        if self.page_has_ink {
+        if !self.can_restore_cleared() {
             return false;
         }
         let Some(snapshot) = self.clear_history.take(self.current_slide, self.whiteboard) else {
@@ -759,6 +860,7 @@ impl App {
             return;
         }
         let resized = self.screen_w != w || self.screen_h != h;
+        self.tool_selector.cancel_press();
         self.drawing_tools.settle();
         self.scale = scale;
         self.screen_w = w;
@@ -816,7 +918,7 @@ impl App {
                 coord
             });
             self.coord_page = page;
-            if was_editing { self.mode = 1; }
+            if was_editing { self.set_tool_mode(1); }
             self.conic_menu = None;
             self.select_mode = false;
             self.lasso.clear();
@@ -836,7 +938,7 @@ impl App {
             self.page_has_ink = false;
         }
         self.clear_undo();
-        if !self.whiteboard { self.drawing_tools.request_page_update(); }
+        self.follow_page_after_dwell();
     }
 
     /// Store the active guide into the current whiteboard page.
@@ -876,7 +978,7 @@ impl App {
         self.conic_menu = None;
         self.select_mode = false;
         self.lasso.clear();
-        self.mode = 0;
+        self.set_tool_mode(0);
     }
 
     pub fn delete_coord(&mut self) {
@@ -898,7 +1000,7 @@ impl App {
         self.current_slide = 1;
         self.is_drawing = false;
         self.clear_canvas();
-        self.request_drawing_tools_collapse();
+        if self.mode == 0 && !self.collapsed { self.drawing_tools.request_page_update(); }
     }
 
     pub fn clear_current_strokes(&mut self) {
@@ -925,8 +1027,7 @@ impl App {
             self.saved_mode = self.mode;
             self.saved_drawing_tools = self.drawing_tools.expanded();
             self.whiteboard = true;
-            self.mode = 1;
-            self.drawing_tools.set_expanded(true);
+            self.set_tool_mode(1);
             self.current_slide = self.whiteboard_slide;
             // Whiteboard has no collapse button; make sure it is visible.
             self.set_sidebar_collapsed(false);
@@ -936,7 +1037,7 @@ impl App {
             self.clear_history.clear_whiteboard();
             self.whiteboard_slide = 1;
             self.whiteboard = false;
-            self.mode = self.saved_mode;
+            self.set_tool_mode(self.saved_mode);
             self.drawing_tools.set_expanded(self.saved_drawing_tools);
             self.current_slide = self.saved_slide;
         }
@@ -956,20 +1057,28 @@ impl App {
         self.thumb_target_at = 0;
         self.wb_limit_msg_until = 0;
         self.load_page(self.current_slide);
+        if !self.whiteboard && self.mode == 0 && !self.collapsed {
+            self.drawing_tools.request_page_update();
+        }
     }
 }
 
+fn sidebar_button_size(scale: f64) -> i32 {
+    // Two additional logical pixels on either side of the face belong to its target.
+    (SB_BASE_BTN * scale).round().max(44.0) as i32
+}
+
 pub fn sb_height_of(scale: f64) -> i32 {
-    let btn = (SB_BASE_BTN * scale) as i32;
+    let btn = sidebar_button_size(scale);
     22 + 11 * btn + 60 + page_counter_height(scale) + 6
 }
 
 fn sb_compact_height_of(scale: f64) -> i32 {
-    sb_height_of(scale) - 3 * ((SB_BASE_BTN * scale) as i32 + 6)
+    sb_height_of(scale) - 3 * (sidebar_button_size(scale) + 6)
 }
 
 fn page_counter_height(scale: f64) -> i32 {
-    (28.0 * scale).round().clamp(24.0, 36.0) as i32
+    sidebar_button_size(scale)
 }
 
 // ---------------- 配置持久化（遵循 XDG，兼容原配置） ----------------
@@ -1082,6 +1191,9 @@ fn parse_settings(app: &mut App, content: &str) {
                     app.sidebar_alpha = n.clamp(30, 255) as u8;
                 }
             }
+            "fadeToolbarDuringShow" => app.fade_toolbar_during_show = v == "1",
+            "toolbarIconsOnly" => app.toolbar_icons_only = v == "1",
+            "documentScroll" => app.document_scroll_enabled = v == "1",
             "whiteboardDots" | "whiteboardDotSize" => {}
             "processBlock" => app.process_block_enabled = v == "1",
             // Pen choices last only for this session; ignore values saved by older versions.
@@ -1125,13 +1237,16 @@ pub fn save_settings(app: &App) {
 
 fn serialize_settings(app: &App) -> String {
     format!(
-        "configVersion=3\nwpsDebug={}\nwpsTestMode={}\nstartupDelay={}\nsidebarExpandMinutes={}\nsbScale={:.2}\nsidebarAlpha={}\nprocessBlock={}\neraserSize={}\nlargeTouchThreshold={}\nlargeEraseScale10={}\ntheme={}\nthemeAccent={}\n",
+        "configVersion=3\nwpsDebug={}\nwpsTestMode={}\nstartupDelay={}\nsidebarExpandMinutes={}\nsbScale={:.2}\nsidebarAlpha={}\nfadeToolbarDuringShow={}\ntoolbarIconsOnly={}\ndocumentScroll={}\nprocessBlock={}\neraserSize={}\nlargeTouchThreshold={}\nlargeEraseScale10={}\ntheme={}\nthemeAccent={}\n",
         1,
         1,
         app.startup_delay,
         app.sidebar_expand_minutes.clamp(1,20),
         app.sb_scale,
         app.sidebar_alpha,
+        u8::from(app.fade_toolbar_during_show),
+        u8::from(app.toolbar_icons_only),
+        u8::from(app.document_scroll_enabled),
         if app.process_block_enabled { 1 } else { 0 },
         app.cur_eraser,
         app.large_touch_threshold as i32,
@@ -1367,6 +1482,20 @@ mod clear_restore_tests {
     }
 
     #[test]
+    fn undoing_new_ink_reenables_restore_without_overwriting_another_page() {
+        let mut app = App::new(Pixmap::new(100, 80).unwrap(), 100, 80);
+        draw(&mut app, 20);
+        let original = app.canvas.data().to_vec();
+        app.remember_before_clear();
+        app.clear_current_strokes();
+        draw(&mut app, 50);
+        assert!(!app.can_restore_cleared());
+        app.undo_last();
+        assert!(app.can_restore_cleared() && app.restore_cleared());
+        assert_eq!(app.canvas.data(), original.as_slice());
+    }
+
+    #[test]
     fn clearing_an_empty_page_keeps_the_previous_snapshot() {
         let mut app = App::new(Pixmap::new(100, 80).unwrap(), 100, 80);
         draw(&mut app, 30);
@@ -1417,12 +1546,23 @@ mod sidebar_idle_tests {
     fn collapsed_sidebar_becomes_due_after_two_minutes_and_resets_on_expand() {
         let mut app = App::new(Pixmap::new(100, 100).unwrap(), 100, 100);
         app.set_sidebar_collapsed(true);
+        let start = app.sidebar_collapsed_since.unwrap();
+        assert_eq!(app.sidebar_countdown_at(start), Some(255));
+        assert_eq!(app.sidebar_countdown_at(start + Duration::from_secs(60)), Some(128));
         assert!(!app.sidebar_expand_due());
+        for minutes in [1, 2, 20] {
+            app.sidebar_expand_minutes = minutes;
+            let deadline = start + Duration::from_secs(60 * u64::from(minutes));
+            assert_eq!(app.sidebar_countdown_at(deadline - Duration::from_nanos(1)), Some(1));
+            assert_eq!(app.sidebar_countdown_at(deadline), Some(0));
+        }
+        app.sidebar_expand_minutes = 2;
         app.sidebar_collapsed_since = Some(Instant::now() - Duration::from_secs(120));
         assert!(app.sidebar_expand_due());
         app.set_sidebar_collapsed(false);
         assert!(!app.sidebar_expand_due());
         assert!(app.sidebar_collapsed_since.is_none());
+        assert_eq!(app.sidebar_countdown_at(start), None);
     }
 }
 
@@ -1487,6 +1627,27 @@ mod theme_tests {
                     assert_eq!(loaded.whiteboard_bg_index, background);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn toolbar_display_options_are_opt_in_and_round_trip_with_legacy_appearance_settings() {
+        let mut app = App::new(Pixmap::new(10, 10).unwrap(), 10, 10);
+        parse_settings(&mut app, "sidebarAlpha=123\nthemeAccent=#12AB34\n");
+        assert!(!app.fade_toolbar_during_show);
+        assert!(!app.toolbar_icons_only);
+        assert!(!app.document_scroll_enabled);
+        for enabled in [true, false] {
+            app.fade_toolbar_during_show = enabled;
+            app.toolbar_icons_only = !enabled;
+            app.document_scroll_enabled = enabled;
+            let mut loaded = App::new(Pixmap::new(10, 10).unwrap(), 10, 10);
+            parse_settings(&mut loaded, &serialize_settings(&app));
+            assert_eq!(loaded.fade_toolbar_during_show, enabled);
+            assert_eq!(loaded.toolbar_icons_only, !enabled);
+            assert_eq!(loaded.document_scroll_enabled, enabled);
+            assert_eq!(loaded.sidebar_alpha, 123);
+            assert_eq!(loaded.theme.accent, app.theme.accent);
         }
     }
 
@@ -1561,7 +1722,8 @@ mod theme_tests {
         app.save_current_page();
         let ink = app.canvas.data().to_vec();
         let light_board = app.whiteboard_bg_color();
-        app.launch.card.get_mut().replace(Pixmap::new(8, 8).unwrap());
+        let card = crate::splash_paint::Card::new(&crate::text::Fonts { list: vec![] }, None, 8, 8, app.palette());
+        app.launch.card.get_mut().replace(card);
         assert!(app.apply_theme(Theme { preference: Preference::Dark, system_dark: false, ..Default::default() }));
         assert!(app.launch.card.borrow().is_none());
         assert_eq!(app.whiteboard_bg_color(), light_board);

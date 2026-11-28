@@ -33,7 +33,7 @@ pub fn allow_x11_fallback() -> bool {
 pub fn validate_x11_server(is_xwayland: bool, release: u32, vendor: &[u8]) -> Result<(), String> {
     const FIXED_VENDOR: &[u8] = b"The X.Org Foundation (Sidera damage-report fix)";
     if is_xwayland && release == 12_401_010 && vendor != FIXED_VENDOR {
-        return Err("检测到 Xwayland 24.1.10：此版本存在映射透明窗口时导致桌面退出的已知错误。请更新到包含 damage_report 修复的版本（上游 24.1.11 或更高），或使用已验证的本地修复包。Sidera 已在创建窗口前停止。".into());
+        return Err("Xwayland 24.1.10 显示透明窗口时可能导致桌面退出。请升级到 24.1.11 或更高版本，或安装 Sidera 的 damage_report 修复包。".into());
     }
     Ok(())
 }
@@ -84,7 +84,7 @@ pub fn report_error(error: &dyn std::fmt::Display) {
     // 可选桌面通知；缺少 notify-send 或通知服务不会遮蔽原始错误。
     if std::env::var("SIDERA_NO_STARTUP_NOTIFICATION").as_deref() != Ok("1") {
         if let Ok(mut child) = std::process::Command::new("notify-send")
-            .args(["--app-name=Sidera", "--urgency=critical", "--", "Sidera 无法启动", &message])
+            .args(["--app-name=Sidera", "--urgency=critical", "--", "Sidera 无法启动", &error.to_string()])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

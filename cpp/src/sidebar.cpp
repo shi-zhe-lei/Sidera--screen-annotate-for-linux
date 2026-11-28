@@ -83,6 +83,10 @@ void toggleWhiteboard() {
     // 退出白板：两套缓存独立保留，恢复普通/放映页。
     g.whiteboardSlide = g.currentSlide;
     g.whiteboard = false;
+    if (g.cursorAfterWhiteboard) {
+      g.cursorAfterWhiteboard = false;
+      if (g.currentMode != 0) switchToCursorMode();
+    }
     g.currentSlide = g.savedSlide;
     if (g.canvas) g.canvas->fill(Qt::transparent);
     loadPage(g.currentSlide);          // 从 slideCache 恢复
@@ -106,7 +110,7 @@ void toggleWhiteboard() {
 static int collapsedH() { return sbBtn() * 3 + 12; }   // 竖胶囊高度（容纳 5 个竖排字）
 
 void updateCollapseButtons() {
-  QString t = g.collapsed ? QString::fromUtf8("展\n开\n侧\n边\n栏") : QString::fromUtf8("收缩");
+  QString t = g.collapsed ? QString::fromUtf8("展\n开") : QString::fromUtf8("收起");
   if (g.collapseBtnL) g.collapseBtnL->setText(t);
   if (g.collapseBtnR) g.collapseBtnR->setText(t);
 }

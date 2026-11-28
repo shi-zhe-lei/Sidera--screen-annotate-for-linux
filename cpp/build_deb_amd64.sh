@@ -54,12 +54,8 @@ Architecture: ${ARCH}
 Maintainer: User <user@localhost>
 Depends: ${DEPENDS}
 Recommends: fonts-noto-cjk
-Description: Sidera 软件
- 全屏透明画布批注工具，支持画笔/橡皮擦与白板，触控屏友好。
- 启动后显示左右两个胶囊形侧边栏，侧边栏 ⛶ 按钮可退出全屏。
- 附带 WPS 演示联动加载项：设置里开启“WPS接口调试”后，
- 批注缓存随真实换页驱动（页内动画不动批注）。
- 安装后执行一次 sidera-wps-addin-install 注册加载项。
+Description: Sidera 屏幕批注与白板
+ 支持触屏书写和擦除，可与 WPS 演示同步页码。
 EOF
 
 # ---------- desktop 入口文件 ----------
@@ -69,7 +65,7 @@ cat > "${PKG_DIR}/usr/share/applications/sidera.desktop" << EOF
 [Desktop Entry]
 Type=Application
 Name=Sidera
-Comment=Sidera软件
+Comment=屏幕批注与白板
 Exec=sidera
 Icon=${ICON_PATH}
 Categories=Graphics;Utility;

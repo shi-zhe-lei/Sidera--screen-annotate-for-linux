@@ -117,7 +117,7 @@ impl WaylandWindow {
         let viewport = globals.bind::<WpViewporter, _, _>(&queue, 1..=1, ()).ok()
             .map(|viewporter| viewporter.get_viewport(&surface, &queue, ()));
         let window = shell.create_window(surface, WindowDecorations::ClientOnly, &queue);
-        window.set_title("Sidera · 偏好设置");
+        window.set_title("Sidera 设置");
         window.set_app_id("sidera");
         window.set_min_size(Some((MIN_WIDTH, MIN_HEIGHT)));
         window.commit();
@@ -212,7 +212,7 @@ impl WaylandWindow {
         let title = (TITLE as f64 * render_scale).round() as i32;
         frame.draw_pixmap(border, title, body.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
         let mut ctx = Ctx { palette, pm: frame, tr: Transform::from_scale(render_scale as f32, render_scale as f32) };
-        ctx.text(&rt.fonts, "Sidera · 偏好设置", 16.0, 25.0, 14.0, c(palette.text));
+        ctx.text(&rt.fonts, "Sidera 设置", 16.0, 25.0, 14.0, c(palette.text));
         let close = close_rect(width);
         ctx.fill_round(close, 5.0, alpha(palette.border, 100));
         let x = (close.x + close.w / 2) as f32;

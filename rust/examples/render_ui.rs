@@ -123,16 +123,18 @@ fn main() {
     }
     let icon = icon(44);
     let intro_icon = self::icon(84);
-    let mut startup_states = Pixmap::new(1200, 1060).unwrap();
+    let mut startup_states = Pixmap::new(1200, 800).unwrap();
     startup_states.fill(c(0xE8EDE6));
-    for (index, state) in [launch::LinkState::Preparing, launch::LinkState::Waiting,
-        launch::LinkState::Connected, launch::LinkState::Unavailable].into_iter().enumerate() {
+    for (index, (caption, ms, state)) in [("显示环境", 180, launch::LinkState::Preparing),
+        ("批注工具", 510, launch::LinkState::Preparing), ("WPS 未打开", 810, launch::LinkState::Waiting),
+        ("WPS 已连接", 950, launch::LinkState::Connected)].into_iter().enumerate() {
         let start = std::time::Instant::now();
         let mut intro = launch::Launch::begin("GNOME 原生 Wayland · 1280 × 900".into(), true, true, start);
         intro.report_link(state, start);
-        let card = splash_paint::draw(&fonts, intro_icon.as_ref(), &intro, 560, 448, ui_theme::LIGHT);
-        let (x, y) = (20.0 + (index % 2) as f32 * 600.0, 48.0 + (index / 2) as f32 * 518.0);
-        label(&mut startup_states, &fonts, state.label(), x + 6.0, y - 16.0, 20.0);
+        intro.advance_at(start + std::time::Duration::from_millis(ms));
+        let card = splash_paint::draw(&fonts, intro_icon.as_ref(), &intro, launch::CARD_WIDTH as u32, launch::CARD_HEIGHT as u32, ui_theme::LIGHT);
+        let (x, y) = (20.0 + (index % 2) as f32 * 600.0, 48.0 + (index / 2) as f32 * 396.0);
+        label(&mut startup_states, &fonts, caption, x + 6.0, y - 16.0, 20.0);
         paste(&mut startup_states, &card, x, y, 1.0);
         if state == launch::LinkState::Waiting { card.save_png(out.join("classroom-startup.png")).unwrap(); }
     }
@@ -193,9 +195,13 @@ fn main() {
             a.drawing_tools.set_expanded_at(true, start);
             a.drawing_tools.advance_at(start + std::time::Duration::from_millis(if column == 1 { 55 } else { 220 }));
         }
-        if column == 4 {
-            a.toggle_whiteboard();
+        if column >= 3 {
+            if column == 4 { a.toggle_whiteboard(); }
+            paint::stroke_tapered(&mut a, (100, 100), (130, 100), 5, 5);
+            a.remember_before_clear();
             a.clear_current_strokes();
+            let layout = toolbar::DrawerLayout::for_page(a.whiteboard, a.can_restore_cleared());
+            a.drawing_tools.set_layout_at(layout, start);
             a.drawing_tools.settle();
         }
         let x = 26.0 + column as f32 * 194.0;
@@ -359,7 +365,9 @@ fn main() {
     let start = std::time::Instant::now();
     let mut intro = launch::Launch::begin("GNOME 原生 Wayland · 1280 × 900".into(), true, true, start);
     intro.report_link(launch::LinkState::Waiting, start);
-    paste(&mut board, &splash_paint::draw(&fonts, large_icon.as_ref(), &intro, 560, 448, ui_theme::LIGHT), 990.0, 882.0, 0.46);
+    intro.advance_at(start + std::time::Duration::from_millis(810));
+    paste(&mut board, &splash_paint::draw(&fonts, large_icon.as_ref(), &intro, launch::CARD_WIDTH as u32,
+        launch::CARD_HEIGHT as u32, ui_theme::LIGHT), 990.0, 882.0, 0.46);
     board.save_png(out.join("classroom-overview.png")).unwrap();
 
     for dark in [false, true] {
@@ -370,7 +378,7 @@ fn main() {
         pm.save_png(out.join(if dark { "classroom-dark-background.png" } else { "classroom-light-background.png" })).unwrap();
     }
     let mut a = fresh(); a.show_diag = true;
-    let mut tucked = fresh(); tucked.mode = 0; tucked.collapsed = true;
+    let mut tucked = fresh(); tucked.mode = 0; tucked.set_sidebar_collapsed(true); tucked.sidebar_anim_start = None;
     let mut collapsed_scene = scene(&fonts, false);
     paste(&mut collapsed_scene, &ui::render_region(&tucked, &fonts, None, 0, 0, 1280, 900).unwrap(), 0.0, 0.0, 1.0);
     collapsed_scene.save_png(out.join("classroom-collapsed.png")).unwrap();

@@ -22,20 +22,26 @@ fn has_sidebar(app:&App)->bool {
 }
 pub fn content_rect(app:&App)->R {
     let p=rect(app);let wide=has_sidebar(app);
-    let left=if wide {192}else{16};let top=if wide {94}else{90};
+    let left=if wide {192}else{16};let top=if wide {76}else{90};
     R {x:p.x+left,y:p.y+top,w:p.w-left-20,h:(p.h-top-64).max(40)}
 }
 pub fn tab_rect(app:&App,index:usize)->R {
     let p=rect(app);
-    if has_sidebar(app) {R {x:p.x+16,y:p.y+94+index as i32*46,w:136,h:38}}
-    else {let w=(p.w-32)/4;R {x:p.x+16+index as i32*w,y:p.y+48,w:w-2,h:38}}
+    if has_sidebar(app) {
+        let step=((p.h-96-10-94-38)/(Tab::ALL.len() as i32-1)).min(46);
+        R {x:p.x+16,y:p.y+94+index as i32*step,w:136,h:38}
+    }
+    else {let w=(p.w-32)/Tab::ALL.len() as i32;R {x:p.x+16+index as i32*w,y:p.y+48,w:w-2,h:38}}
 }
 fn quit_rect(app:&App)->R {
     let p=rect(app);
     if has_sidebar(app) {R {x:p.x+16,y:p.y+p.h-96,w:136,h:44}}
     else {R {x:p.x+p.w-136,y:p.y+8,w:120,h:36}}
 }
-fn count(tab:Tab)->usize {match tab {Tab::Appearance=>5,Tab::General=>6,Tab::Addins=>3,Tab::About=>5}}
+fn count(app:&App)->usize {match app.settings_ui.tab {
+    Tab::Appearance=>7,Tab::General=>6,Tab::Addins=>3,Tab::About=>5,
+    Tab::Experimental=>1+usize::from(cfg!(unix) && app.document_scroll_enabled),
+}}
 fn addins_notice_rect(app:&App)->Option<R> {
     if app.settings_ui.tab!=Tab::Addins {return None;}
     let body=content_rect(app);
@@ -53,7 +59,7 @@ pub fn layout(app:&App)->ui::SettingsLayout {
     let body=rows_rect(app);let stride=if body.w<460 {
         if app.settings_ui.tab==Tab::About {78}else{64}
     }else{54};
-    let rows=(body.h/stride).max(1) as usize;let pages=count(app.settings_ui.tab).div_ceil(rows);
+    let rows=(body.h/stride).max(1) as usize;let pages=count(app).div_ceil(rows);
     ui::SettingsLayout {rows,pages,page:app.settings_page.min(pages-1),stride:stride.min(body.h)}
 }
 fn row(app:&App,index:usize)->Option<R> {
@@ -78,6 +84,16 @@ pub fn controls(app:&App)->Vec<(SetHit,R)> {
                 }
             }
             if let Some(r)=row(app,1){out.push((SetHit::ThemeAccent,r));}
+            if let Some(r)=row(app,5){out.push((SetHit::FadeToolbarDuringShow,r));}
+            if let Some(r)=row(app,6){out.push((SetHit::ToolbarIconsOnly,r));}
+        }
+        Tab::Experimental=>{
+            if let Some(r)=row(app,0){out.push((SetHit::DocumentScroll,r));}
+            #[cfg(unix)]
+            if app.document_scroll_enabled && app.settings_ui.scroll_access.enabled!=Some(true)
+                && !app.settings_ui.scroll_access.busy() {
+                if let Some(r)=row(app,1){out.push((SetHit::EnableScrollAccess,r));}
+            }
         }
         Tab::General=>for (hit,i) in [(SetHit::Autostart,0),(SetHit::ProcessBlock,5)] {if let Some(r)=row(app,i){out.push((hit,r));}},
         Tab::Addins=>for (hit,i) in [(SetHit::WpsRegister,1),(SetHit::WpsRemove,2)] {if let Some(r)=row(app,i){out.push((hit,r));}},
@@ -100,17 +116,18 @@ pub fn controls(app:&App)->Vec<(SetHit,R)> {
 }
 pub fn sliders(app:&App)->Vec<SliderDef> {
     let values=match app.settings_ui.tab {
-        Tab::Appearance=>vec![(SliderId::Alpha,2,30.0,255.0,app.sidebar_alpha as f32,1.0,"工具栏不透明度",false),
-            (SliderId::Scale,3,0.6,1.4,app.sb_scale as f32,0.01,"工具栏大小",true),
-            (SliderId::Position,4,0.0,100.0,value_input::position(app),1.0,"工具栏垂直位置",false)],
-        Tab::General=>vec![(SliderId::StartupDelay,1,5.0,20.0,app.startup_delay as f32,1.0,"自动启动延迟",false),
-            (SliderId::AutoExpand,2,1.0,20.0,app.sidebar_expand_minutes as f32,1.0,"自动展开时间",false),
-            (SliderId::Threshold,3,20.0,260.0,app.large_touch_threshold as f32,10.0,"大触点阈值",false),
-            (SliderId::EraseScale,4,0.8,2.5,app.large_erase_scale10 as f32/10.0,0.1,"大触点橡皮倍率",true)],
+        Tab::Appearance=>vec![(SliderId::Alpha,2,30.0,255.0,app.sidebar_alpha as f32,1.0,false),
+            (SliderId::Scale,3,0.6,1.4,app.sb_scale as f32,0.01,true),
+            (SliderId::Position,4,0.0,100.0,value_input::position(app),1.0,false)],
+        Tab::General=>vec![(SliderId::StartupDelay,1,5.0,20.0,app.startup_delay as f32,1.0,false),
+            (SliderId::AutoExpand,2,1.0,20.0,app.sidebar_expand_minutes as f32,1.0,false),
+            (SliderId::Threshold,3,20.0,260.0,app.large_touch_threshold as f32,10.0,false),
+            (SliderId::EraseScale,4,0.8,2.5,app.large_erase_scale10 as f32/10.0,0.1,true)],
         _=>Vec::new(),
     };
-    values.into_iter().filter_map(|(id,index,min,max,value,step,label,signed)| {
+    values.into_iter().filter_map(|(id,index,min,max,value,step,signed)| {
         let r=row(app,index)?;let compact=r.w<460;let y=r.y+if compact {(r.h-44).max(0)}else{(r.h-44)/2};
+        let label=value_input::spec(app,Target::Setting(id)).title;
         let reset=R {x:r.x+r.w-40,y,w:32,h:44};
         let badge=R {x:reset.x-74,y,w:66,h:44};
         let start=if compact {r.x+14}else{r.x+r.w-282};
@@ -153,7 +170,7 @@ fn wps_exit_notice(ctx:&mut Ctx,fonts:&Fonts,r:R) {
     let title=R {x:r.x+44,y:r.y+top,w:r.w-58,h:22};
     text(ctx,fonts,"操作前请退出 WPS",title,16.0,p.text);
     if !compact {
-        let lines=wrapped(fonts,"请先保存课件并完全退出 WPS；修改完成后重新打开。",13.0,title.w);
+        let lines=wrapped(fonts,"先保存课件，改完再打开 WPS。",13.0,title.w);
         for (i,line) in lines.iter().take(((r.h-40)/16).max(0) as usize).enumerate() {
             text(ctx,fonts,line,R {y:r.y+34+i as i32*16,h:16,..title},13.0,p.text);
         }
@@ -208,11 +225,8 @@ fn draw_content(app:&App,fonts:&Fonts,ctx:&mut Ctx,icon:Option<&Pixmap>) {
         ctx.fill_round(R {x:p.x+1,y:p.y+1,w:166,h:p.h-2},13.0,c(theme::mix(palette.paper,palette.surface,0.65)));
         ctx.stroke_line(((p.x+168) as f32,(p.y+18) as f32),((p.x+168) as f32,(p.y+p.h-18) as f32),alpha(palette.border,150),1.0);
         draw_icon(ctx,icon,p.x+20,p.y+24,28.0);
-        text(ctx,fonts,"Sidera",R {x:p.x+58,y:p.y+21,w:94,h:24},17.0,palette.text);
-        text(ctx,fonts,"偏好设置",R {x:p.x+58,y:p.y+45,w:94,h:18},11.0,palette.muted);
-        text(ctx,fonts,crate::app::VERSION,R {x:p.x+20,y:p.y+p.h-40,w:132,h:20},10.0,palette.muted);
+        text(ctx,fonts,"Sidera 设置",R {x:p.x+58,y:p.y+24,w:102,h:28},17.0,palette.text);
         text(ctx,fonts,app.settings_ui.tab.label(),R {x:body.x,y:p.y+25,w:body.w,h:30},26.0,palette.text);
-        text(ctx,fonts,app.settings_ui.tab.subtitle(),R {x:body.x,y:p.y+58,w:body.w,h:20},14.0,palette.muted);
     } else {text(ctx,fonts,"设置",R {x:p.x+18,y:p.y+10,w:p.w-174,h:28},22.0,palette.text);}
     let a=tab_rect(app,0);let b=tab_rect(app,1);let pos=app.settings_ui.nav_position();
     let active=R {x:a.x+((b.x-a.x) as f32*pos).round() as i32,y:a.y+((b.y-a.y) as f32*pos).round() as i32,..a};
@@ -220,12 +234,15 @@ fn draw_content(app:&App,fonts:&Fonts,ctx:&mut Ctx,icon:Option<&Pixmap>) {
     for tab in Tab::ALL {
         let r=tab_rect(app,tab.index());
         if wide {
-            let glyph=match tab {Tab::Appearance=>Glyph::Pen,Tab::General=>Glyph::Settings,Tab::Addins=>Glyph::Document,Tab::About=>Glyph::Info};
+            let glyph=match tab {Tab::Appearance=>Glyph::Pen,Tab::General=>Glyph::Settings,Tab::Addins=>Glyph::Document,Tab::Experimental=>Glyph::Flask,Tab::About=>Glyph::Info};
             icons::draw(ctx,glyph,(r.x+12) as f32,(r.y+11) as f32,16.0,c(palette.muted),c(palette.muted));
             text(ctx,fonts,tab.label(),R {x:r.x+40,w:r.w-48,..r},15.0,palette.text);
-        } else {ctx.text_center(fonts,r,tab.label(),14.0,c(palette.text));}
+        } else {
+            let label=if tab==Tab::Experimental && r.w<78 {"实验"} else {tab.label()};
+            ctx.text_center(fonts,r,label,14.0,c(palette.text));
+        }
     }
-    let visible=(count(app.settings_ui.tab)-l.page*l.rows).min(l.rows);
+    let visible=(count(app)-l.page*l.rows).min(l.rows);
     let group=R {h:visible as i32*l.stride,..rows_rect(app)};
     layer(app,ctx,state::ease(app.settings_ui.tab_at,130),|ctx| {
         if let Some(notice)=addins_notice_rect(app) {wps_exit_notice(ctx,fonts,notice);}
@@ -234,32 +251,61 @@ fn draw_content(app:&App,fonts:&Fonts,ctx:&mut Ctx,icon:Option<&Pixmap>) {
             let Some(r)=row(app,index) else {continue};
             if index>l.page*l.rows {ctx.stroke_line(((r.x+14) as f32,r.y as f32),((r.x+r.w-14) as f32,r.y as f32),alpha(palette.border,105),1.0);}
             match (app.settings_ui.tab,index) {
-                (Tab::Appearance,0)=>{if r.w>=460 {card(ctx,fonts,r,"显示模式","浅色、深色或跟随系统",306);}else{text(ctx,fonts,"显示模式",R {x:r.x+12,y:r.y,w:r.w-24,h:23},13.0,palette.muted);}},
+                (Tab::Appearance,0)=>{if r.w>=460 {card(ctx,fonts,r,"显示模式","",306);}else{text(ctx,fonts,"显示模式",R {x:r.x+12,y:r.y,w:r.w-24,h:23},13.0,palette.muted);}},
                 (Tab::Appearance,1)=>{
-                    card(ctx,fonts,r,"主题色","调色盘 · 保留你的自定义颜色",122);
+                    card(ctx,fonts,r,"主题色","",122);
                     let sw=R {x:r.x+r.w-116,y:r.y+(r.h-28)/2,w:102,h:28};
                     ui::surface(ctx,sw,5.0,c(palette.surface),c(palette.border));
                     ctx.fill_round(R {x:sw.x+7,y:sw.y+6,w:16,h:16},4.0,c(app.theme.accent.rgb()));
                     text(ctx,fonts,&format!("#{:06X}",app.theme.accent.rgb()),R {x:sw.x+29,w:sw.w-32,..sw},11.0,palette.text);
                 }
-                (Tab::General,0)=>{card(ctx,fonts,r,"开机自动启动","登录桌面后启动",62);toggle(ctx,app,r,ui::Control::Setting(SetHit::Autostart),app.settings_ui.autostart);},
-                (Tab::General,5)=>card(ctx,fonts,r,"进程屏蔽  ›","选择需要暂停的进程",0),
-                (Tab::Addins,0)=>{card(ctx,fonts,r,"WPS 联动","始终开启，打开 WPS 后自动连接",94);text(ctx,fonts,if app.wps_connected {"● 已连接"}else{"○ 等待连接"},R {x:r.x+r.w-98,w:84,..r},12.0,palette.muted);},
-                (Tab::Addins,1)=>card(ctx,fonts,r,"重新登记加载项  ›","修复当前用户的 WPS 加载项登记",0),
-                (Tab::Addins,2)=>card(ctx,fonts,r,"清除加载项登记  ›","停止放映联动，可重新登记恢复",0),
+                (Tab::Appearance,5)=>{
+                    card(ctx,fonts,r,"放映时淡化工具栏","闲置 6 秒后变淡，轻点恢复",62);
+                    toggle(ctx,app,r,ui::Control::Setting(SetHit::FadeToolbarDuringShow),app.fade_toolbar_during_show);
+                }
+                (Tab::Appearance,6)=>{
+                    card(ctx,fonts,r,"工具栏图标模式","",62);
+                    toggle(ctx,app,r,ui::Control::Setting(SetHit::ToolbarIconsOnly),app.toolbar_icons_only);
+                }
+                (Tab::Experimental,0)=>{
+                    let detail=if r.w>=420 {"PPT 未联动且白板关闭时，拖动调速，松手停止"} else {"PPT 未联动且白板关闭时可用"};
+                    card(ctx,fonts,r,"长页面连续滚动",detail,62);
+                    toggle(ctx,app,r,ui::Control::Setting(SetHit::DocumentScroll),app.document_scroll_enabled);
+                },
+                #[cfg(unix)]
+                (Tab::Experimental,1)=>{
+                    let access=&app.settings_ui.scroll_access;
+                    let enabled=access.enabled==Some(true);
+                    let action=R {x:r.x+r.w-82,y:r.y+(r.h-32)/2,w:70,h:32};
+                    card(ctx,fonts,r,"系统辅助功能接口","供没有原生滚轮通道的桌面使用",86);
+                    if !enabled && !access.busy() {
+                        ui::surface(ctx,action,6.0,c(palette.surface),c(palette.control_border()));
+                    }
+                    let label=if access.busy() {"处理中…"} else if enabled {"已启用"} else {"启用"};
+                    ctx.text_center(fonts,action,label,13.0,c(if enabled {palette.muted}else{palette.text}));
+                }
+                (Tab::General,0)=>{card(ctx,fonts,r,"登录时自动启动","",62);toggle(ctx,app,r,ui::Control::Setting(SetHit::Autostart),app.settings_ui.autostart);},
+                (Tab::General,5)=>card(ctx,fonts,r,"进程屏蔽  ›","",0),
+                (Tab::Addins,0)=>{card(ctx,fonts,r,"WPS 联动","",94);text(ctx,fonts,if app.wps_connected {"● 已连接"}else{"○ 等待连接"},R {x:r.x+r.w-98,w:84,..r},12.0,palette.muted);},
+                (Tab::Addins,1)=>card(ctx,fonts,r,"重新登记加载项  ›","WPS 无法连接时使用",0),
+                (Tab::Addins,2)=>card(ctx,fonts,r,"清除加载项登记  ›","停止 WPS 演示联动",0),
                 (Tab::About,0)=>{draw_icon(ctx,icon,r.x+14,r.y+(r.h-32)/2,32.0);card(ctx,fonts,R {x:r.x+44,w:r.w-44,..r},"Sidera · 星罗",crate::app::VERSION,0);},
                 (Tab::About,1)=>contributors(ctx,fonts,r),
                 (Tab::About,2)=>card(ctx,fonts,r,"GNU GPL v3  ↗","Copyright © 2026 Carl_Jin · 本软件不提供担保",0),
-                (Tab::About,3)=>card(ctx,fonts,r,"GitHub 仓库  ↗","offduckling4825 / Sidera--screen-annotate-for-linux",0),
+                (Tab::About,3)=>card(ctx,fonts,r,"GitHub 仓库  ↗","",0),
                 _=>{},
             }
         }
         for s in sliders(app) {
             let spec=value_input::spec(app,Target::Setting(s.id));let compact=body.w<460;
-            let detail=match s.id {SliderId::AutoExpand=>"收起后等待 1–20 分钟，默认 2 分钟".into(),SliderId::Position=>"从顶部到下方 · 也可拖动工具栏".into(),_=>format!("{}–{} {}",spec.min,spec.max,spec.unit)};
+            let detail=match s.id {
+                SliderId::Threshold=>"触点达到此直径时开始擦除",
+                SliderId::EraseScale=>"按触点直径计算擦除宽度",
+                _=>"",
+            };
             let index=match s.id {SliderId::Alpha=>2,SliderId::Scale=>3,SliderId::Position=>4,SliderId::StartupDelay=>1,SliderId::AutoExpand=>2,SliderId::Threshold=>3,SliderId::EraseScale=>4};
             let r=row(app,index).unwrap();
-            if compact {text(ctx,fonts,s.label,R {x:r.x+12,y:r.y,w:r.w-24,h:22},15.0,palette.text);}else{card(ctx,fonts,r,s.label,&detail,286);}
+            if compact {text(ctx,fonts,s.label,R {x:r.x+12,y:r.y,w:r.w-24,h:22},15.0,palette.text);}else{card(ctx,fonts,r,s.label,detail,286);}
             ctx.fill_round(s.track,1.5,c(palette.border));let x=s.track.x+(s.track.w as f32*s.t()).round() as i32;
             ctx.fill_round(R {w:(x-s.track.x).max(1),..s.track},1.5,c(palette.accent));
             let cy=(s.track.y+1) as f32;
@@ -274,8 +320,8 @@ fn draw_content(app:&App,fonts:&Fonts,ctx:&mut Ctx,icon:Option<&Pixmap>) {
                 ctx.text_center(fonts,r,preference.label(),14.0,c(palette.text));
             }
             SetHit::ResetSlider(_)=>{icons::draw(ctx,Glyph::Reset,(r.x+(r.w-16)/2) as f32,(r.y+(r.h-16)/2) as f32,16.0,c(palette.muted),c(palette.muted));}
-            SetHit::Logs=>card(ctx,fonts,r,"运行日志  ›","查看与清理记录",0),
-            SetHit::SysInfo=>{ctx.stroke_line((r.x as f32,(r.y+12) as f32),(r.x as f32,(r.y+r.h-12) as f32),alpha(palette.border,130),1.0);card(ctx,fonts,r,"系统诊断  ›","环境与联动状态",0);}
+            SetHit::Logs=>card(ctx,fonts,r,"运行日志  ›","",0),
+            SetHit::SysInfo=>{ctx.stroke_line((r.x as f32,(r.y+12) as f32),(r.x as f32,(r.y+r.h-12) as f32),alpha(palette.border,130),1.0);card(ctx,fonts,r,"系统诊断  ›","",0);}
             _=>{},
         }}
     });
@@ -286,7 +332,7 @@ fn draw_content(app:&App,fonts:&Fonts,ctx:&mut Ctx,icon:Option<&Pixmap>) {
             let visual=R {y:r.y+(r.h-32)/2,h:32,..r};
             ui::surface(ctx,visual,6.0,c(palette.danger_light),alpha(palette.danger,90));
             icons::draw(ctx,Glyph::Exit,(r.x+10) as f32,(r.y+(r.h-18)/2) as f32,18.0,c(palette.danger),c(palette.danger));
-            text(ctx,fonts,"退出 Sidera",R {x:r.x+36,w:r.w-42,..r},15.0,palette.danger);
+            text(ctx,fonts,if wide {"退出 Sidera"} else {"退出应用"},R {x:r.x+36,w:r.w-42,..r},15.0,palette.danger);
         }
         SetHit::Done=>button(ctx,fonts,r,"完成",true),
         SetHit::SettingsPage(delta)=>{ctx.text_center(fonts,r,if delta<0 {"‹"}else{"›"},20.0,c(if ui::control_enabled(app,ui::Control::Setting(hit)){palette.text}else{palette.disabled_ink}));}
@@ -296,8 +342,8 @@ fn draw_content(app:&App,fonts:&Fonts,ctx:&mut Ctx,icon:Option<&Pixmap>) {
     let caption=if let Some(editor)=editing {value_input::message(app,editor.target).unwrap_or_default()}
         else if app.settings_ui.toast_until>now_ms(){app.settings_ui.toast.clone()}
         else if l.pages>1{format!("{} / {}",l.page+1,l.pages)}
-        else if app.settings_ui.tab==Tab::Addins {"登记变更后需重新打开 WPS".into()}
-        else{"更改即时生效 · 点击数值可输入".into()};
+        else if matches!(app.settings_ui.tab, Tab::General | Tab::Appearance) {"点数值可输入".into()}
+        else{String::new()};
     let dx=if l.pages>1{90}else{0};
     text(ctx,fonts,&caption,R {x:body.x+dx,y:p.y+p.h-50,w:(body.w-96-dx).max(1),h:36},12.0,
         if editing.is_some_and(|e|!e.error.is_empty()){palette.danger}else{palette.muted});
@@ -454,7 +500,7 @@ fn inspector_page_button(app:&App,delta:i32)->R {
 }
 pub fn inspector_body_rect(app:&App)->R {
     let p=ui::diag_rect(app);let footer=inspector_pager_rect(app);
-    R {x:p.x+22,y:p.y+74,w:p.w-44,h:(footer.y-p.y-86).max(20)}
+    R {x:p.x+22,y:p.y+60,w:p.w-44,h:(footer.y-p.y-72).max(20)}
 }
 pub fn inspector_controls(app: &App) -> Vec<(SetHit, R)> {
     let p = ui::diag_rect(app); let mut out = Vec::new();
@@ -516,7 +562,6 @@ pub fn draw_inspector(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
         text(ctx,fonts,app.settings_ui.inspector.title(),R { x:p.x+22,y:p.y+14,w:p.w-136,h:36 },19.0,palette.text);
         let lines=inspector_lines(app,fonts); let size=inspector_page_size(app); let pages=lines.len().div_ceil(size).max(1);
         let page=app.settings_ui.inspector_page.min(pages-1);
-        text(ctx,fonts,if pages>1 {"支持滚轮与上下滑动翻页"}else{"全部内容"},R { x:p.x+22,y:p.y+48,w:p.w-44,h:20 },12.0,palette.muted);
         let body=inspector_body_rect(app);
         let draw_page = |ctx: &mut Ctx, page: usize, offset: i32| {
             for (i,line) in lines.iter().skip(page*size).take(size).enumerate() {
@@ -634,7 +679,7 @@ pub fn draw_process(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
     layer(app,ctx,state::ease(app.settings_ui.overlay_at,160),|ctx| {
         let p=process_rect(app); let palette=ctx.palette; ui::panel(ctx,p,12.0,1.0);
         text(ctx,fonts,"进程屏蔽",R {x:p.x+20,y:p.y+10,w:p.w-174,h:34},20.0,palette.text);
-        text(ctx,fonts,"启用后暂停匹配进程，关闭屏蔽会恢复",R {x:p.x+20,y:p.y+44,w:p.w-40,h:20},12.0,palette.muted);
+        text(ctx,fonts,"暂停列表中的进程，关闭后恢复运行。",R {x:p.x+20,y:p.y+44,w:p.w-40,h:20},12.0,palette.muted);
         let rows=ui::process_rows(app);let list=process_list_rect(app);let visible=process_visible_rows(app);
         let start=app.process_scroll.min(rows.len().saturating_sub(visible));
         let visual=app.settings_ui.process_scroll_visual(app.process_scroll);
@@ -659,7 +704,7 @@ pub fn draw_process(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
                 H::Input => {
                     let visual=R {y:r.y+4,h:36,..r};
                     ui::surface(ctx,visual,6.0,c(palette.surface),c(if app.process_input_active {palette.accent_line}else{palette.border}));
-                    text(ctx,fonts,if app.process_input.is_empty() {"按进程名或路径添加"}else{&app.process_input},R {x:r.x+10,w:r.w-20,..r},13.0,if app.process_input.is_empty(){palette.muted}else{palette.text});
+                    text(ctx,fonts,if app.process_input.is_empty() {"进程名或完整路径"}else{&app.process_input},R {x:r.x+10,w:r.w-20,..r},13.0,if app.process_input.is_empty(){palette.muted}else{palette.text});
                 }
                 H::ScrollUp | H::ScrollDown=>{},
                 H::Scan if r.w<60=>{
@@ -673,7 +718,7 @@ pub fn draw_process(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
                     ctx.text_center(fonts,visual,"添加",13.0,c(palette.disabled_ink));
                 }
                 _ => {
-                    let label=match hit {H::Add=>"添加",H::Paste=>"粘贴",H::Scan=>"刷新列表",_=>"完成"};
+                    let label=match hit {H::Add=>"添加",H::Paste=>"粘贴",H::Scan=>"刷新",_=>"完成"};
                     button(ctx,fonts,r,label,matches!(hit,H::Done|H::Add));
                 }
             }
@@ -697,9 +742,7 @@ pub fn draw_process(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
         draw_process_pager(app, fonts, ctx, start, rows.len());
         if rows.is_empty() {
             let rules=app.settings_ui.process_view==state::ProcessView::Rules;
-            let top=list.y+(list.h-48)/2;
-            text(ctx,fonts,if rules {"还没有添加屏蔽规则"}else{"暂无运行中的进程"},R {x:list.x+18,y:top,w:list.w-36,h:24},14.0,palette.text);
-            text(ctx,fonts,if rules {"从“运行中”点选添加，或输入进程名"}else{"点击刷新，重新获取当前进程"},R {x:list.x+18,y:top+26,w:list.w-36,h:20},12.0,palette.muted);
+            text(ctx,fonts,if rules {"尚未添加进程"}else{"未找到进程"},R {x:list.x+18,w:list.w-36,..list},14.0,palette.muted);
         } else if rows.len()>visible {
             let h=(group.h*visible as i32/rows.len() as i32).max(18);
             let y=group.y+(group.h-h)*start as i32/(rows.len()-visible) as i32;
@@ -777,7 +820,7 @@ mod tests {
                 let layout = layout(&app);
                 assert!(layout.pages >= 1 && layout.page < layout.pages, "{w}x{h} {tab:?}");
                 app.settings_page = 0;
-                for index in 0..count(tab) {
+                for index in 0..count(&app) {
                     if let Some(r) = row(&app, index) {
                         assert!(r.w > 0 && r.h > 0, "{w}x{h} {tab:?} row {index}: {r:?}");
                     }

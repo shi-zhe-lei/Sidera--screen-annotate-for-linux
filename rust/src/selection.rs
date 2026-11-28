@@ -115,6 +115,7 @@ pub fn lift(app: &mut App, lasso: &[(f32, f32)]) -> Option<FloatingSelection> {
 
 /// Anchor movement in physical pixels, including at fractional display scales.
 pub fn move_to_pointer(app: &mut App, offset: (i32, i32), x: i32, y: i32) {
+    app.invalidate_board_preview();
     let Some(sel) = app.floating.as_mut() else { return };
     let scale = app.scale as f32;
     let max_x = app.canvas.width().saturating_sub(sel.pixmap.width()) as i32;

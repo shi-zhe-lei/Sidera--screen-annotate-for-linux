@@ -19,7 +19,11 @@ pub fn app_icon(size: u32) -> Option<tiny_skia::Pixmap> {
 }
 
 #[derive(Clone, Copy)]
-pub enum Glyph { Cursor, Pen, Eraser, Up, Down, More, Camera, Settings, Check, Info, Warning, Document, Left, Right, Reset, Exit }
+pub enum Glyph {
+    Cursor, Pen, Eraser, Up, Down, More, Screenshot, CollapseLeft, CollapseRight,
+    Trash, Undo, Restore, Board, CloseBoard, BoardColor, StartShow, EndShow,
+    Settings, Flask, Check, Info, Warning, Document, Left, Right, Reset, Exit,
+}
 
 fn paint(ink: Color) -> Paint<'static> {
     Paint { shader: Shader::SolidColor(ink), anti_alias: true, ..Default::default() }
@@ -112,7 +116,7 @@ pub fn draw(ctx: &mut Ctx, glyph: Glyph, x: f32, y: f32, size: f32, ink: Color, 
         Glyph::More => {
             for x in [5.0, 12.0, 19.0] { g.fill_circle(x, 12.0, 1.65, ink); }
         }
-        Glyph::Camera => {
+        Glyph::Screenshot => {
             let mut p = PathBuilder::new();
             p.move_to(5.0, 7.0); p.line_to(7.0, 7.0); p.line_to(9.0, 4.5);
             p.line_to(15.0, 4.5); p.line_to(17.0, 7.0); p.line_to(19.0, 7.0);
@@ -124,12 +128,82 @@ pub fn draw(ctx: &mut Ctx, glyph: Glyph, x: f32, y: f32, size: f32, ink: Color, 
             let mut p = PathBuilder::new(); p.push_circle(12.0, 13.0, 3.5);
             path(&mut g, p.finish(), None, Some(ink));
         }
+        Glyph::CollapseLeft | Glyph::CollapseRight => {
+            let (edge, tip, tail) = if matches!(glyph, Glyph::CollapseLeft) {
+                (4.0, 9.0, 15.0)
+            } else { (20.0, 15.0, 9.0) };
+            line(&mut g, (edge, 4.0), (edge, 20.0));
+            g.stroke_polyline(&[(tail, 6.0), (tip, 12.0), (tail, 18.0)], ink, 2.0, false);
+        }
+        Glyph::Trash => {
+            let mut p = PathBuilder::new();
+            p.move_to(3.5, 6.5); p.line_to(20.5, 6.5);
+            p.move_to(8.5, 6.5); p.line_to(9.2, 3.9);
+            p.quad_to(9.4, 3.0, 10.3, 3.0); p.line_to(13.7, 3.0);
+            p.quad_to(14.6, 3.0, 14.8, 3.9); p.line_to(15.5, 6.5);
+            p.move_to(5.5, 6.5); p.line_to(6.5, 19.4);
+            p.quad_to(6.6, 21.0, 8.3, 21.0); p.line_to(15.7, 21.0);
+            p.quad_to(17.4, 21.0, 17.5, 19.4); p.line_to(18.5, 6.5);
+            p.move_to(10.0, 10.5); p.line_to(10.0, 17.0);
+            p.move_to(14.0, 10.5); p.line_to(14.0, 17.0);
+            path(&mut g, p.finish(), None, Some(ink));
+        }
+        Glyph::Undo => {
+            let mut p = PathBuilder::new();
+            p.move_to(7.0, 8.4); p.line_to(14.1, 8.4);
+            p.cubic_to(22.4, 8.4, 22.4, 19.0, 14.1, 19.0); p.line_to(9.0, 19.0);
+            path(&mut g, p.finish(), None, Some(ink));
+            path(&mut g, polygon(&[(2.0, 8.4), (9.0, 2.7), (9.0, 14.1)]), Some(ink), None);
+        }
+        Glyph::Restore => {
+            let mut p = PathBuilder::new();
+            p.move_to(19.8, 16.0);
+            p.cubic_to(18.3, 19.2, 15.4, 21.0, 12.0, 21.0);
+            p.cubic_to(7.0, 21.0, 3.0, 17.0, 3.0, 12.0);
+            p.cubic_to(3.0, 7.0, 7.0, 3.0, 12.0, 3.0);
+            p.cubic_to(15.8, 3.0, 18.7, 5.1, 20.5, 9.5);
+            p.move_to(20.5, 3.8); p.line_to(20.5, 9.5); p.line_to(14.8, 9.5);
+            path(&mut g, p.finish(), None, Some(ink));
+        }
+        Glyph::Board => {
+            g.stroke_round(crate::ui::R { x: 3, y: 4, w: 18, h: 14 }, 1.8, ink, 1.8);
+            g.stroke_polyline(&[(6.5, 12.7), (10.0, 8.7), (11.0, 11.4), (14.4, 8.4)], ink, 1.6, false);
+            g.stroke_polyline(&[(13.5, 15.6), (17.5, 15.6)], ink, 1.8, false);
+            line(&mut g, (1.8, 20.5), (22.2, 20.5));
+        }
+        Glyph::CloseBoard => {
+            g.stroke_line((4.5, 4.5), (19.5, 19.5), ink, 2.6);
+            g.stroke_line((19.5, 4.5), (4.5, 19.5), ink, 2.6);
+        }
+        Glyph::BoardColor => {
+            let mut p = PathBuilder::new();
+            p.push_circle(12.0, 12.0, 8.0);
+            path(&mut g, p.finish(), None, Some(ink));
+            let mut half = PathBuilder::new();
+            half.move_to(17.65, 6.35);
+            half.cubic_to(20.8, 9.5, 20.8, 14.5, 17.65, 17.65);
+            half.cubic_to(14.5, 20.8, 9.5, 20.8, 6.35, 17.65);
+            half.close();
+            path(&mut g, half.finish(), Some(ink), None);
+        }
+        Glyph::StartShow => {
+            path(&mut g, polygon(&[(7.0, 4.0), (20.0, 12.0), (7.0, 20.0)]), Some(ink), None);
+        }
+        Glyph::EndShow => {
+            g.fill_round(crate::ui::R { x: 5, y: 5, w: 14, h: 14 }, 2.0, ink);
+        }
         Glyph::Settings => {
             for (y, x) in [(6.0, 9.0), (12.0, 15.0), (18.0, 9.0)] {
                 line(&mut g, (3.0, y), (21.0, y));
                 let mut p = PathBuilder::new(); p.push_circle(x, y, 2.2);
                 path(&mut g, p.finish(), Some(c(palette.paper)), Some(ink));
             }
+        }
+        Glyph::Flask => {
+            line(&mut g, (8.5, 3.0), (15.5, 3.0));
+            g.stroke_polyline(&[(10.0,3.0),(10.0,9.0),(4.4,18.5),(5.3,20.5),
+                (18.7,20.5),(19.6,18.5),(14.0,9.0),(14.0,3.0)],ink,1.8,false);
+            line(&mut g, (7.5, 14.0), (16.5, 14.0));
         }
         Glyph::Check => {
             line(&mut g, (5.0, 12.0), (10.0, 17.0));

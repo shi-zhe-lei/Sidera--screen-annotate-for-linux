@@ -30,8 +30,20 @@ static void cachePages() {
   toggleWhiteboard(); check(g.currentSlide == 3, "wrong restored overlay page");
   check(g.canvas->toImage().pixelColor(5, 5) == QColor(Qt::red), "overlay ink lost");
   toggleWhiteboard(); check(g.canvas->toImage().pixelColor(5, 5) == QColor(Qt::blue), "whiteboard ink lost");
-  clearAllPages(); check(g.canvas->toImage().pixelColor(5, 5) == QColor(Qt::blue), "external lifecycle erased whiteboard");
-  toggleWhiteboard(); g.pageHasInk = false; saveCurrentPage();
+  setWpsDebug(true, false);
+  check(g.wpsBridge != nullptr, "legacy WPS bridge did not start");
+  g.currentMode = 2;
+  g.wpsBridge->onSlideshowEnd();
+  check(g.currentMode == 2 && g.canvas->toImage().pixelColor(5, 5) == QColor(Qt::blue), "show end interrupted the whiteboard");
+  toggleWhiteboard();
+  check(g.currentMode == 0, "leaving the board restored an ended show's tool");
+  for (int mode : {1, 2}) {
+    g.currentMode = mode;
+    g.wpsBridge->onSlideshowEnd();
+    check(g.currentMode == 0, "legacy overlay kept the drawing tool after show end");
+  }
+  stopWpsApiServer();
+  g.pageHasInk = false; saveCurrentPage();
   delete g.canvas; g.canvas = nullptr;
 }
 static void nativeGeometry() {
@@ -78,6 +90,19 @@ static void nativeGeometry() {
   backend.touchId_ = 4; backend.drawing_ = true; backend.draggingSlider_ = 2;
   backend.cancelInput();
   check(backend.touchId_ == -1 && !backend.drawing_ && backend.draggingSlider_ == 0, "touch cancellation left active input");
+  for (int mode : {1, 2}) {
+    backend.setMode(mode);
+    backend.togglePopup(mode);
+    backend.drawing_ = true;
+    backend.wps_->onSlideshowEnd();
+    check(backend.mode_ == 0 && !backend.drawing_ && !backend.popupType_, "show end kept the drawing tool active");
+  }
+  backend.setMode(2);
+  backend.toggleWhiteboard();
+  backend.wps_->onSlideshowEnd();
+  check(backend.mode_ == 2, "show end interrupted the whiteboard eraser");
+  backend.toggleWhiteboard();
+  check(backend.mode_ == 0, "leaving the board restored an ended show's eraser");
 }
 int main(int argc, char** argv) {
   QApplication application(argc, argv);

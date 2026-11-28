@@ -578,6 +578,7 @@ fn run_application() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        xp.poll_document_scroll(&rt, &mut app, &mut ip, wps_bridge.as_ref());
         // 1. X 事件
         loop {
             match x11.conn.poll_for_event() {
@@ -661,7 +662,8 @@ fn run_application() -> Result<(), Box<dyn std::error::Error>> {
 
         // 输入区域变化后刷新 Mutter 的指针命中缓存。等释放事件处理完，
         // 再重映射同一覆盖层；批注画布保留并在本帧重新上屏。
-        let input_idle = active_x11_touches.is_empty() && !ip.dragging && ip.slider.is_none()
+        let input_idle = active_x11_touches.is_empty() && ip.ui_touch.is_none() && ip.pending_ui.is_none()
+            && !ip.dragging && ip.slider.is_none()
             && !app.is_drawing && !app.page_picker.as_ref().is_some_and(|p| p.dragging());
         if xp.refresh_input_window(input_idle)
             .map_err(|e| format!("刷新 X11 点击区域失败：{e}"))? {
@@ -676,7 +678,7 @@ fn run_application() -> Result<(), Box<dyn std::error::Error>> {
         // traffic while WPS is presenting and Sidera has no input.
         let busy = app.is_drawing || ip.dragging || ip.slider.is_some()
             || ip.pending_ui.is_some() || app.press.is_some()
-            || app.launch.active() || ui::sidebar_animating(&app)
+            || app.launch.active() || ui::sidebar_animating(&app) || app.tool_selector.animating()
             || app.settings_ui.animating()
             || app.open_anim != 0 || app.page_picker.is_some();
         std::thread::sleep(Duration::from_millis(if busy { 4 } else { 12 }));

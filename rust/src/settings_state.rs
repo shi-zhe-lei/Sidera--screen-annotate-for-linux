@@ -9,34 +9,28 @@ pub const REPOSITORY: &str = "https://github.com/offduckling4825/Sidera--screen-
 pub const LICENSE_URL: &str = "https://www.gnu.org/licenses/gpl-3.0.html";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Tab { #[default] Appearance, Addins, General, About }
+pub enum Tab { #[default] Appearance, Addins, General, Experimental, About }
 impl Tab {
-    pub const ALL: [Self; 4] = [Self::General, Self::Appearance, Self::Addins, Self::About];
+    pub const ALL: [Self; 5] = [Self::General, Self::Appearance, Self::Addins, Self::Experimental, Self::About];
     pub fn index(self) -> usize { Self::ALL.iter().position(|t| *t == self).unwrap_or(0) }
-    pub fn label(self) -> &'static str { match self { Self::Appearance => "外观", Self::Addins => "加载项", Self::General => "常规", Self::About => "关于" } }
-    pub fn subtitle(self) -> &'static str { match self {
-        Self::Appearance => "让颜色与工具栏适合你的课堂",
-        Self::Addins => "修改不当可能导致 WPS 联动异常",
-        Self::General => "启动、书写与课堂环境",
-        Self::About => "一起把课堂工具做得更好",
-    } }
+    pub fn label(self) -> &'static str { match self { Self::Appearance => "外观", Self::Addins => "加载项", Self::General => "常规", Self::Experimental => "实验性功能", Self::About => "关于" } }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialog { Addins, Register, Remove, ClearLogs }
 impl Dialog {
     pub fn title(self) -> &'static str { match self {
-        Self::Addins => "可能导致 WPS 联动异常", Self::Register => "重新登记 WPS 加载项？",
-        Self::Remove => "清除 WPS 加载项？", Self::ClearLogs => "清空运行日志？",
+        Self::Addins => "管理 WPS 加载项", Self::Register => "重新登记加载项？",
+        Self::Remove => "清除加载项登记？", Self::ClearLogs => "清空运行日志？",
     } }
     pub fn body(self) -> &'static str { match self {
-        Self::Addins => "不当修改加载项登记，可能影响 WPS 连接、翻页与放映同步。联动正常时无需修改。",
-        Self::Register => "将重新写入 Sidera 的加载项登记，用于修复 WPS 联动。操作不当可能影响连接与放映同步；不会修改课件内容。",
-        Self::Remove => "清除后，WPS 页码与放映联动将停止，屏幕批注仍可使用。可通过“重新登记”恢复；不会删除课件。",
-        Self::ClearLogs => "将删除已有的运行日志，无法撤回。\n诊断功能、批注和个人设置不受影响。",
+        Self::Addins => "修改登记可能导致 WPS 无法联动翻页。联动正常时请保留现有设置。",
+        Self::Register => "Sidera 会重新写入当前用户的加载项登记。",
+        Self::Remove => "清除后将停止 WPS 翻页和放映联动。重新登记即可恢复。",
+        Self::ClearLogs => "清空后无法恢复。",
     } }
     pub fn action(self) -> &'static str { match self {
-        Self::Addins => "了解风险，继续", Self::Register => "重新登记", Self::Remove => "确认清除", Self::ClearLogs => "清空日志",
+        Self::Addins => "进入管理", Self::Register => "重新登记", Self::Remove => "清除登记", Self::ClearLogs => "清空日志",
     } }
     pub fn destructive(self) -> bool { matches!(self, Self::Remove | Self::ClearLogs) }
     pub fn requires_wps_exit(self) -> bool { matches!(self, Self::Addins | Self::Register | Self::Remove) }
@@ -85,6 +79,8 @@ pub fn ease(start: i64, duration: i64) -> f32 {
 
 #[derive(Default)]
 pub struct State {
+    #[cfg(unix)]
+    pub(crate) scroll_access: crate::linux_scroll::ScrollAccess,
     #[cfg(unix)]
     pub(crate) window: Option<std::rc::Rc<crate::settings_window::Window>>,
     #[cfg(windows)]

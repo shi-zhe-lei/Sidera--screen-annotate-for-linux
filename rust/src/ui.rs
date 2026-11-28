@@ -7,7 +7,7 @@ use tiny_skia::{
     StrokeDash, Transform,
 };
 
-use crate::app::{color, App};
+use crate::app::App;
 use crate::text::Fonts;
 use crate::ui_icons::{self as icons, Glyph};
 use crate::ui_theme::{self as theme, alpha, c};
@@ -23,6 +23,12 @@ pub struct R {
 impl R {
     pub fn contains(&self, x: i32, y: i32) -> bool {
         x >= self.x && y >= self.y && x < self.x + self.w && y < self.y + self.h
+    }
+
+    // Rasterize curved edges inside the tile. Clipping exactly at a control's
+    // bounds can change the antialiased corner pixels between partial frames.
+    pub(crate) fn with_paint_margin(self) -> Self {
+        Self { x: self.x - 2, y: self.y - 2, w: self.w + 4, h: self.h + 4 }
     }
 }
 
@@ -40,6 +46,17 @@ pub enum Btn {
     Exit,
     Whiteboard,
     Screenshot,
+}
+
+impl Btn {
+    pub(crate) fn tool_mode(self) -> Option<i32> {
+        match self {
+            Self::Cursor => Some(0),
+            Self::Pen => Some(1),
+            Self::Eraser => Some(2),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -63,6 +80,11 @@ pub enum SetHit {
     Theme(theme::Preference),
     ResetSlider(SliderId),
     Autostart,
+    FadeToolbarDuringShow,
+    ToolbarIconsOnly,
+    DocumentScroll,
+    #[cfg(unix)]
+    EnableScrollAccess,
     WpsRemove,
     WpsRegister,
     ProcessBlock,
@@ -132,10 +154,26 @@ pub enum Control {
     Picker(crate::settings_state::PickerHit),
     Sidebar(Btn, bool), Popup(PopupHit), Setting(SetHit),
     Slider(SliderId), Confirm(ConfirmHit), DiagClose,
-    PageCount(bool), PagePicker(PagePickerHit), Whiteboard(WhiteboardControl),
+    PageCount(bool), DocumentScroll(bool), PagePicker(PagePickerHit), Whiteboard(WhiteboardControl),
+}
+
+impl Control {
+    fn pressed(self, app: &App) -> bool {
+        app.press.is_some_and(|press| press.control == self && press.active && !press.expired())
+    }
+
+    pub(crate) fn tool_segment(self) -> Option<(Btn, bool)> {
+        match self {
+            Self::Sidebar(button, right) if button.tool_mode().is_some() => Some((button, right)),
+            _ => None,
+        }
+    }
 }
 
 pub fn control_enabled(app: &App, control: Control) -> bool {
+    if matches!(control,Control::DocumentScroll(_)) {
+        return app.wants_scroll_rail() && app.scroll_rail.mix >= 0.75;
+    }
     if let Control::Process(hit)=control {
         let max=process_rows(app).len().saturating_sub(process_visible_rows(app));
         return match hit {
@@ -155,12 +193,6 @@ pub fn control_enabled(app: &App, control: Control) -> bool {
         return whiteboard::control_bounds(app, hit).is_some();
     }
     true
-}
-
-fn sidebar_button_selected(app: &App, button: Btn) -> bool {
-    control_enabled(app, Control::Sidebar(button, false))
-        && (matches!((button, app.mode), (Btn::Cursor, 0) | (Btn::Pen, 1) | (Btn::Eraser, 2))
-            || (button == Btn::Whiteboard && app.whiteboard))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -215,8 +247,7 @@ pub fn control_at(app: &App, x: i32, y: i32) -> Option<Control> {
     if app.eraser_popup_visible && eraser_popup_rect(app).contains(x, y) {
         return eraser_popup_hit(app, x, y).map(Control::Popup);
     }
-    page_count_at(app, x, y).map(Control::PageCount)
-        .or_else(|| sidebar_button_at(app, x, y).map(|(b, right)| Control::Sidebar(b, right)))
+    sidebar_control_at(app, x, y)
         .or_else(|| whiteboard_hit(app, x, y).map(Control::Whiteboard))
 }
 
@@ -252,26 +283,17 @@ pub fn control_rect(app: &App, control: Control) -> Option<R> {
     match control {
         Control::Process(hit) if app.process_block_open => process_block_controls(app).into_iter().find(|(h,_)|*h==hit).map(|(_,r)|r),
         Control::PageCount(right) if app.sidebar_page_visible() && !app.collapsed => Some(sidebar_page_rect(app, right)),
+        Control::DocumentScroll(right) if app.wants_scroll_rail() && !app.collapsed => Some(scroll_track_rect(app, right)),
         Control::PagePicker(hit) if app.page_picker.is_some() => Some(page_picker_control_rect(app, hit)),
         Control::Sidebar(b, right) => sidebar_buttons(app, right).into_iter().find(|(k, _)| *k == b).map(|(_, r)| r),
         Control::Setting(hit) if app.settings_open => settings_controls(app).into_iter().find(|(k, _)| *k == hit).map(|(_, r)| r),
         Control::Slider(id) if app.settings_open => settings_sliders(app).into_iter().find(|s| s.id == id).map(|s| s.hit),
         Control::Whiteboard(hit) => whiteboard::control_bounds(app, hit),
-        Control::Popup(PopupHit::Color(i)) if app.pen_popup_visible && i < 10 => {
-            let p = pen_popup_rect(app);
-            Some(R { x: p.x + 16 + (i % 4) as i32 * 48, y: p.y + 46 + (i / 4) as i32 * 48, w: 38, h: 38 })
+        Control::Popup(hit @ (PopupHit::Color(_) | PopupHit::PenSize(_))) if app.pen_popup_visible => {
+            pen_controls(pen_popup_rect(app)).find(|(key, _)| *key == hit).map(|(_, r)| r)
         }
-        Control::Popup(PopupHit::PenSize(i)) if app.pen_popup_visible && i < crate::app::PEN_SIZES.len() => {
-            let p = pen_popup_rect(app); let bw = tier_button_width(p.w, crate::app::PEN_SIZES.len());
-            Some(R { x: p.x + 16 + i as i32 * (bw + 10), y: p.y + 214, w: bw, h: 48 })
-        }
-        Control::Popup(PopupHit::EraserSize(i)) if app.eraser_popup_visible && i < crate::app::ERASER_SIZES.len() => {
-            let p = eraser_popup_rect(app); let bw = tier_button_width(p.w, crate::app::ERASER_SIZES.len());
-            Some(R { x: p.x + 16 + i as i32 * (bw + 10), y: p.y + 46, w: bw, h: 48 })
-        }
-        Control::Popup(PopupHit::ClearAll) if app.eraser_popup_visible => {
-            let p = eraser_popup_rect(app);
-            Some(R { x: p.x + 16, y: p.y + 110, w: p.w - 32, h: 48 })
+        Control::Popup(hit @ (PopupHit::EraserSize(_) | PopupHit::ClearAll)) if app.eraser_popup_visible => {
+            eraser_controls(eraser_popup_rect(app)).find(|(key, _)| *key == hit).map(|(_, r)| r)
         }
         Control::Confirm(hit) if app.confirm_quit => {
             confirm_controls(app).into_iter().find(|(h,_)|*h==hit).map(|(_,r)|r)
@@ -287,32 +309,27 @@ pub fn control_rect(app: &App, control: Control) -> Option<R> {
 fn draw_press_feedback(app: &App, ctx: &mut Ctx) {
     let palette = ctx.palette;
     let Some(press) = app.press.filter(|p| p.active && !p.expired()) else { return };
+    // Toolbar controls paint their pressed face underneath their own glyph.
+    if matches!(press.control, Control::Sidebar(..) | Control::PageCount(_) | Control::Popup(_)
+        | Control::PagePicker(_) | Control::Whiteboard(_)) { return; }
     if !control_enabled(app, press.control) { return; }
-    if sidebar_animating(app) && matches!(press.control, Control::Sidebar(_, _)) { return; }
     let Some(r) = control_rect(app, press.control) else { return };
-    if matches!(press.control, Control::Slider(_) | Control::PagePicker(PagePickerHit::Wheel)
+    if matches!(press.control, Control::Slider(_)
         | Control::Picker(crate::settings_state::PickerHit::Field | crate::settings_state::PickerHit::Hue | crate::settings_state::PickerHit::Edit(_))
         | Control::Editor(_) | Control::Setting(SetHit::EditSlider(_) | SetHit::InspectorPage(_))
-        | Control::Process(ProcessHit::ScrollUp | ProcessHit::ScrollDown)
-        | Control::PagePicker(PagePickerHit::Input)) { return; }
-    let radius = match press.control {
-        Control::Popup(PopupHit::Color(_)) => 19.0,
-        Control::Sidebar(_, _) => (r.w as f32 * 0.24).min(10.0),
-        _ => 9.0,
-    };
+        | Control::Process(ProcessHit::ScrollUp | ProcessHit::ScrollDown)) { return; }
     let inset = R { x: r.x + 2, y: r.y + 2, w: r.w - 4, h: r.h - 4 };
-    let filled_action = matches!(press.control, Control::Setting(SetHit::Done)
-        | Control::DiagClose | Control::PagePicker(PagePickerHit::Jump))
+    let filled_action = matches!(press.control, Control::Setting(SetHit::Done) | Control::DiagClose)
         || matches!(press.control, Control::Setting(SetHit::Theme(p)) if p == app.theme.preference);
     let feedback = if matches!(press.control, Control::Setting(SetHit::Quit)) {
         palette.danger
-    } else if filled_action || matches!(press.control, Control::Sidebar(button, _) if sidebar_button_selected(app, button)) {
+    } else if filled_action {
         palette.on_accent
     } else {
         palette.accent
     };
-    ctx.fill_round(inset, radius, alpha(feedback, 32));
-    ctx.stroke_round(inset, radius, c(feedback), 2.0);
+    ctx.fill_round(inset, 9.0, alpha(feedback, 32));
+    ctx.stroke_round(inset, 9.0, c(feedback), 2.0);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -344,9 +361,11 @@ impl SliderDef {
     }
 }
 
+pub(crate) const POPUP_FADE_MS: i64 = 160;
+
 fn anim_t(app: &App) -> f32 {
     let el = (crate::app::now_ms() - app.open_anim) as f32;
-    (el / 160.0).clamp(0.0, 1.0)
+    (el / POPUP_FADE_MS as f32).clamp(0.0, 1.0)
 }
 
 fn solid(c: Color) -> Paint<'static> {
@@ -548,16 +567,31 @@ pub(crate) fn surface(ctx: &mut Ctx, r: R, radius: f32, fill: Color, border: Col
         (radius - 1.0).max(1.0), border, 1.0);
 }
 
+// The touch target can be larger than its visible face. Use the face's own
+// fill and stroke paths in both states, including at fractional display scales.
+fn button_surface(app: &App, ctx: &mut Ctx, control: Control, r: R, radius: f32, fill: Color, border: Color) -> Color {
+    let (fill, border) = if control.pressed(app) && control_enabled(app, control) {
+        let p = ctx.palette;
+        let ink = match control {
+            Control::Sidebar(Btn::Whiteboard, _) if app.whiteboard => p.danger,
+            Control::PagePicker(PagePickerHit::Jump) | Control::Whiteboard(WhiteboardControl::Done | WhiteboardControl::SelDone) => p.on_accent,
+            Control::Whiteboard(WhiteboardControl::Delete) => p.danger,
+            _ => p.accent,
+        };
+        let pixel = fill.to_color_u8();
+        let rgb = u32::from_be_bytes([0, pixel.red(), pixel.green(), pixel.blue()]);
+        (c(theme::mix(rgb, ink, 0.14)), c(ink))
+    } else {
+        (fill, border)
+    };
+    surface(ctx, r, radius, fill, border);
+    fill
+}
+
 pub(crate) fn panel(ctx: &mut Ctx, r: R, radius: f32, opacity: f32) {
     let palette = ctx.palette;
     let a = (255.0 * opacity.clamp(0.0, 1.0)) as u8;
     surface(ctx, r, radius, alpha(palette.paper, a), alpha(palette.border, a));
-}
-
-fn choice(ctx: &mut Ctx, r: R, selected: bool) {
-    let palette = ctx.palette;
-    surface(ctx, r, 10.0, c(if selected { palette.accent_light } else { palette.surface }),
-        c(if selected { palette.accent } else { palette.border }));
 }
 
 // ---------------- 几何 ----------------
@@ -587,6 +621,13 @@ fn sidebar_tab_rect(app: &App, right: bool) -> R {
     R { x: if right { app.screen_w - w } else { 0 }, y: app.sidebar_y(h), w, h }
 }
 
+pub(crate) fn sidebar_tab_face(app: &App, right: bool) -> R {
+    let target = sidebar_tab_rect(app, right);
+    let w = (28.0 * app.sb_scale).round().clamp(24.0, 34.0) as i32;
+    R { x: if right { target.x + target.w - w - 2 } else { target.x + 2 },
+        y: target.y + 2, w, h: target.h - 4 }
+}
+
 fn expanded_sidebar_rect(app: &App, right: bool) -> R {
     let x = if right { app.sb_x_right() } else { app.sb_x_left() };
     R {
@@ -603,7 +644,7 @@ pub fn sidebar_transition_rect(app: &App, right: bool) -> R {
     let full = crate::app::sb_height_of(app.sb_scale);
     // Include every position between the full toolbar and its tucked tab.
     // Near the bottom, expanding tools rise into view instead of being clipped.
-    let y = app.sidebar_y(full);
+    let y = app.sidebar_y(full).max(0);
     let bottom = (y + full).max(app.sidebar_y(app.collapsed_h()) + app.collapsed_h()).min(app.screen_h);
     R { x: if right { app.screen_w - w } else { 0 }, y, w, h: bottom - y }
 }
@@ -625,17 +666,45 @@ pub fn sidebar_input_rect(app: &App, right: bool) -> R {
     else { sidebar_rect(app, right) }
 }
 
-/// 命中检测：点 (x,y) 落在哪个侧栏按钮上
-pub fn sidebar_button_at(app: &App, x: i32, y: i32) -> Option<(Btn, bool)> {
-    if sidebar_animating(app) { return None; }
+fn sidebar_control_at(app: &App, x: i32, y: i32) -> Option<Control> {
+    if app.avoid_active || app.sidebar_anim_start.is_some() || y < 0 || y >= app.screen_h { return None; }
     for right in [false, true] {
-        for (k, r) in sidebar_buttons(app, right) {
-            if r.contains(x, y) {
-                return Some((k, right));
+        let sb = sidebar_rect(app, right);
+        if !sb.contains(x, y) { continue; }
+        if app.collapsed { return Some(Control::Sidebar(Btn::Collapse, right)); }
+        // Keep the side gutters and both end grips available for dragging.
+        if x < sb.x + 4 || x >= sb.x + sb.w - 4 { return None; }
+        if let Some(button) = app.tool_selector.anchored_button(app.mode, right, x, y) {
+            return Some(Control::Sidebar(button, right));
+        }
+        let opening = app.drawing_tools.animating();
+        if !opening && app.document_scroll_enabled {
+            if scroll_hit_rect(app, right).contains(x, y)
+                && (app.wants_scroll_rail() || app.scroll_rail.mix > 0.25) {
+                return Some(Control::DocumentScroll(right));
             }
         }
+        let buttons = expanded_sidebar_buttons(app, right).into_iter()
+            .filter(|(button, _)| !app.wants_scroll_rail() || !matches!(button, Btn::Prev | Btn::Next))
+            .filter(|(button, _)| !opening || button.tool_mode().is_some())
+            .map(|(button, rect)| (Control::Sidebar(button, right), rect));
+        let page = (!opening && app.sidebar_page_visible()).then(|| (Control::PageCount(right), sidebar_page_rect(app, right)));
+        // Split each gap at its midpoint. A release near the neighbour must
+        // resolve to exactly one target, including alongside the page count.
+        return buttons.chain(page).filter_map(|(control, rect)| {
+            let distance = (rect.y - y).max(y - (rect.y + rect.h - 1)).max(0);
+            let reach = if control.tool_segment().is_some() { 3 } else { 2 };
+            (distance <= reach).then_some((distance, control))
+        }).min_by_key(|(distance, _)| *distance).map(|(_, control)| control);
     }
     None
+}
+
+pub fn sidebar_button_at(app: &App, x: i32, y: i32) -> Option<(Btn, bool)> {
+    match sidebar_control_at(app, x, y) {
+        Some(Control::Sidebar(button, right)) => Some((button, right)),
+        _ => None,
+    }
 }
 
 pub fn sidebar_buttons(app: &App, right: bool) -> Vec<(Btn, R)> {
@@ -646,88 +715,230 @@ pub fn sidebar_buttons(app: &App, right: bool) -> Vec<(Btn, R)> {
     expanded_sidebar_buttons(app, right)
 }
 
-fn expanded_sidebar_buttons(app: &App, right: bool) -> Vec<(Btn, R)> {
+fn sidebar_pen_rect(app: &App, right: bool) -> R {
     let sb = expanded_sidebar_rect(app, right);
     let btn = app.sb_btn();
-    let bx = sb.x + (sb.w - btn) / 2;
-    let mut y = sb.y + 12;
-    let mut v = Vec::new();
-    // Whiteboard has no collapse button; the remaining buttons move up.
-    let top: &[Btn] = if app.whiteboard { &[Btn::Cursor, Btn::Pen] }
-        else { &[Btn::Collapse, Btn::Cursor, Btn::Pen] };
-    for &k in top {
-        v.push((k, R { x: bx, y, w: btn, h: btn }));
-        y += btn + 6;
-    }
-    if app.drawing_tools.fraction() >= 1.0 { v.extend(drawing_tool_buttons(app, right)); }
-    y += app.drawing_tools_height();
+    let slot = if app.whiteboard { 1 } else { 2 };
+    R { x: sb.x + (sb.w - btn) / 2, y: sb.y + 12 + slot * (btn + 6), w: btn, h: btn }
+}
+
+fn tool_segments(app: &App, right: bool) -> [(Btn, R); 3] {
+    let pen = sidebar_pen_rect(app, right);
+    let step = pen.h + 6;
+    [(Btn::Cursor, R { y: pen.y - step, ..pen }), (Btn::Pen, pen),
+        (Btn::Eraser, R { y: pen.y + step, ..pen })]
+}
+
+const TOOL_TRACK_INSET: i32 = 3;
+
+pub(crate) fn tool_track_rect(app: &App, right: bool) -> R {
+    let [(_, first), (_, pen), _] = tool_segments(app, right);
+    // The visual well sits just inside the key faces. The full touch slots and
+    // the drag gutters still use the original sidebar geometry.
+    R { x: first.x + 1, y: first.y + 1, w: first.w - 2,
+        h: pen.y + pen.h - first.y - 2 + app.eraser_row_height() }
+}
+
+pub(crate) fn tool_track_hit(app: &App, right: bool, x: i32, y: i32) -> Option<(Btn, f32)> {
+    let (button, side) = control_at(app, x, y)?.tool_segment()?;
+    if side != right { return None; }
+    let pen = sidebar_pen_rect(app, right);
+    let position = 1.0 + (y - (pen.y + pen.h / 2)) as f32 / (pen.h + 6) as f32;
+    let last = if app.eraser_row_height() == pen.h + 6 { 2.0 } else { 1.0 };
+    Some((button, position.clamp(0.0, last)))
+}
+
+fn expanded_sidebar_buttons(app: &App, right: bool) -> Vec<(Btn, R)> {
+    let pen = sidebar_pen_rect(app, right);
+    let step = pen.h + 6;
+    let mut v = Vec::with_capacity(11);
+    if !app.whiteboard { v.push((Btn::Collapse, R { y: pen.y - 2 * step, ..pen })); }
+    let [cursor, pen_button, eraser] = tool_segments(app, right);
+    v.extend([cursor, pen_button]);
+    if app.eraser_row_height() == step { v.push(eraser); }
+    v.extend(drawing_tool_buttons(app, right).filter(|(_, _, height)| *height == step)
+        .map(|(button, rect, _)| (button, rect)));
+    // Borrow four pixels from within the navigation group for the gap after
+    // the drawing tools. The rail footprint and everything below Next stay put.
+    let group_gap = if app.sidebar_page_space() > 0 { 4 } else { 0 };
+    let mut y = navigation_top(app, pen);
     for k in [Btn::Prev, Btn::Next, Btn::Exit, Btn::Whiteboard, Btn::Screenshot] {
-        v.push((k, R { x: bx, y, w: btn, h: btn }));
-        y += btn + 6;
-        if k == Btn::Prev { y += app.sidebar_page_space(); }
+        v.push((k, R { y, ..pen }));
+        y += step;
+        if k == Btn::Prev { y += app.sidebar_page_space() - group_gap; }
     }
     v
 }
 
-fn drawing_tool_buttons(app: &App, right: bool) -> Vec<(Btn, R)> {
-    let sb = expanded_sidebar_rect(app, right);
-    let btn = app.sb_btn();
-    let clear_or_restore = if app.can_restore_cleared() { Btn::Restore } else { Btn::Clear };
-    let top = if app.whiteboard { 2 } else { 3 };
-    [Btn::Eraser, clear_or_restore, Btn::Undo].into_iter().enumerate().map(|(i, k)|
-        (k, R { x: sb.x + (sb.w - btn) / 2, y: sb.y + 12 + (top + i as i32) * (btn + 6),
-            w: btn, h: btn })).collect()
+fn navigation_top(app: &App, pen: R) -> i32 {
+    pen.y + pen.h + 6 + app.drawing_tools_height() + if app.sidebar_page_space() > 0 { 4 } else { 0 }
+}
+
+pub(crate) fn scroll_track_rect(app: &App, right: bool) -> R {
+    let pen = sidebar_pen_rect(app, right);
+    let gap = if app.sidebar_page_space() > 0 { 4 } else { 0 };
+    R { y: navigation_top(app, pen), h: 2 * pen.h + 6 + app.sidebar_page_space() - gap, ..pen }
+}
+
+pub(crate) fn scroll_hit_rect(app: &App, right: bool) -> R {
+    let bar = sidebar_rect(app, right);
+    let track = scroll_track_rect(app, right);
+    R { x: bar.x + 4, w: bar.w - 8, y: track.y - 2, h: track.h + 4 }
+}
+
+pub(crate) fn scroll_thumb_geometry(app: &App, right: bool) -> (i32, f32, i32) {
+    let r = scroll_track_rect(app, right);
+    let badge = page_counter_face(app, sidebar_page_rect(app, right));
+    let middle = badge.y + badge.h / 2;
+    let height = badge.h.clamp(14, 26);
+    let travel = (middle - r.y).min(r.y + r.h - middle) - height / 2 - 4;
+    (middle, travel.max(1) as f32, height)
+}
+
+pub(crate) fn scroll_notice_rect(app: &App, right: bool) -> R {
+    let track = scroll_track_rect(app, right);
+    let width = 180.min(app.screen_w.max(1));
+    let x = if right { track.x - width - 12 } else { track.x + track.w + 12 };
+    R { x: x.clamp(0,app.screen_w-width), y: (track.y+track.h/2-16).clamp(0,(app.screen_h-32).max(0)), w:width,h:32 }
+}
+
+fn draw_scroll_navigation(app: &App, fonts: &Fonts, ctx: &mut Ctx, right: bool) {
+    let r = scroll_track_rect(app, right);
+    let badge = page_counter_face(app, sidebar_page_rect(app, right));
+    let (middle, travel, height) = scroll_thumb_geometry(app, right);
+    let blend = app.scroll_rail.mix;
+    let area = R { x: r.x.min(badge.x), w: r.w.max(badge.w), ..r };
+    let palette = ctx.palette;
+    let cx = (r.x + r.w / 2) as f32;
+    let radius = ((r.w as f32) * 0.30).min(12.0);
+    draw_with_opacity(app, ctx, area, blend, |ctx| {
+        surface(ctx, r, radius, c(palette.surface), c(palette.control_border()));
+        ctx.stroke_line((cx, (r.y + 11) as f32),(cx, (r.y + r.h - 11) as f32),alpha(palette.muted,84),1.4);
+        for (y, sign) in [(r.y + 10, -1.0), (r.y + r.h - 10, 1.0)] {
+            let y = y as f32;
+            ctx.stroke_polyline(&[(cx-3.5,y),(cx,y+sign*3.0),(cx+3.5,y)],c(palette.muted),1.5,false);
+        }
+    });
+    let interpolate = |a: i32,b: i32| (a as f32 + (b-a) as f32 * blend).round() as i32;
+    let width = interpolate(badge.w, r.w - 8);
+    let h = interpolate(badge.h, height);
+    let thumb = R { x: r.x + (r.w-width)/2, y: middle - h/2 + (app.scroll_rail.thumb * travel * blend).round() as i32, w: width, h };
+    draw_with_opacity(app, ctx, area, 1.0 - blend, |ctx| {
+        let btn = app.sb_btn();
+        let shift = (blend * btn as f32 * 0.18).round() as i32;
+        draw_btn(app,fonts,ctx,Btn::Prev,right,R {y:r.y+shift,h:btn,..r});
+        draw_btn(app,fonts,ctx,Btn::Next,right,R {y:r.y+r.h-btn-shift,h:btn,..r});
+        let numbers = if app.sidebar_page_visible() { sidebar_page_numbers(app) } else { app.scroll_rail.last_page };
+        draw_page_face(app,fonts,ctx,right,thumb,numbers);
+    });
+    draw_with_opacity(app, ctx, area, blend, |ctx| {
+        let held = app.scroll_rail.held == Some(right);
+        let fill = if held { palette.accent_light } else { palette.paper };
+        let border = if held { palette.accent } else { palette.control_border() };
+        surface(ctx,thumb,(h as f32*0.36).min(8.0),c(fill),c(border));
+        let cy = (thumb.y + thumb.h/2) as f32;
+        if held && app.scroll_rail.unavailable {
+            icons::draw(ctx,Glyph::Info,cx-7.0,cy-7.0,14.0,c(palette.muted),c(palette.muted));
+        } else {
+            let handle = (thumb.w as f32 * 0.23).clamp(3.0,7.0);
+            for dy in [-1.5, 1.5] { ctx.stroke_line((cx-handle,cy+dy),(cx+handle,cy+dy),c(palette.muted),1.5); }
+        }
+    });
+}
+
+fn drawing_tool_buttons(app: &App, right: bool) -> impl Iterator<Item = (Btn, R, i32)> {
+    let pen = sidebar_pen_rect(app, right);
+    let tools = app.eraser_row_height();
+    let action = app.clear_row_height();
+    let y = pen.y + pen.h + 6 + tools;
+    // A page switch can leave the old slot on screen until the finger lifts.
+    // Only the page owning the snapshot gets a Restore control.
+    let button = if app.can_restore_cleared() { Some(Btn::Restore) }
+        else if app.drawing_tools.expanded() || tools > 0 { Some(Btn::Clear) } else { None };
+    [button.map(|b| (b, R { y, ..pen }, action)),
+        Some((Btn::Undo, R { y: y + action, ..pen }, tools))].into_iter().flatten()
 }
 
 pub fn sidebar_page_rect(app: &App, right: bool) -> R {
     let sb = expanded_sidebar_rect(app, right);
-    let top = if app.whiteboard { 3 } else { 4 };
-    R { x: sb.x + 4, y: sb.y + 12 + top * (app.sb_btn() + 6) + app.drawing_tools_height(),
+    let pen = sidebar_pen_rect(app, right);
+    R { x: sb.x + 4, y: pen.y + 2 * (pen.h + 6) + app.drawing_tools_height() + 2,
         w: sb.w - 8, h: app.sb_page_h() }
 }
 
 pub fn sidebar_page_values(app: &App) -> (String, String) {
-    let (page, total) = if app.whiteboard {
+    page_labels(sidebar_page_numbers(app))
+}
+
+pub(crate) fn sidebar_page_numbers(app: &App) -> (i32, i32) {
+    if app.whiteboard {
         (app.current_slide, crate::app::CACHE_BOARD)
     } else if app.wps_debug && app.wps_connected {
         (app.wps_page_index, app.wps_page_total)
-    } else { (-1, -1) };
+    } else { (-1, -1) }
+}
+
+fn page_labels((page, total): (i32, i32)) -> (String, String) {
     let value = |n: i32| if n > 0 { n.to_string() } else { "—".to_string() };
     (value(page), value(total))
 }
 
+fn page_counter_face(app: &App, hit: R) -> R {
+    let h = (28.0 * app.sb_scale).round().clamp(24.0, 36.0) as i32;
+    R { y: hit.y + (hit.h - h) / 2, h, ..hit }
+}
+
 pub fn page_count_at(app: &App, x: i32, y: i32) -> Option<bool> {
-    if app.collapsed || !app.sidebar_page_visible() || sidebar_animating(app) { return None; }
-    [false, true].into_iter().find(|right| sidebar_page_rect(app, *right).contains(x, y))
-}
-
-fn page_picker_has_thumbnail(app: &App) -> bool {
-    app.page_picker.as_ref().is_some_and(|p| matches!(p.source, crate::page_picker::Source::Wps(_)))
-}
-
-pub fn page_picker_thumb_rect(app: &App) -> R {
-    let p = page_picker_rect(app);
-    R { x: p.x + 16, y: p.y + 76, w: p.w - 32, h: 128 }
+    if !app.sidebar_page_visible() { return None; }
+    match sidebar_control_at(app, x, y) {
+        Some(Control::PageCount(right)) => Some(right),
+        _ => None,
+    }
 }
 
 pub fn page_picker_rect(app: &App) -> R {
-    let w = 260;
-    let h = if page_picker_has_thumbnail(app) { 512 } else { 376 };
     let sb = sidebar_rect(app, app.popup_on_right);
+    let available = if app.popup_on_right { sb.x } else { app.screen_w - sb.x - sb.w };
+    let max_w = if available >= 200 { available - 12 } else { app.screen_w };
+    let w = (if app.page_preview_enabled() { 378 } else { 212 }).min(max_w);
+    let h = (if app.page_preview_enabled() { 254 } else { 242 }).min(app.screen_h);
     let anchor = sidebar_page_rect(app, app.popup_on_right);
     R { x: (if app.popup_on_right { sb.x - w - 8 } else { sb.x + sb.w + 8 })
             .clamp(0, (app.screen_w - w).max(0)),
         y: (anchor.y + anchor.h / 2 - h / 2).clamp(0, (app.screen_h - h).max(0)), w, h }
 }
 
+fn page_picker_body(p: R) -> R {
+    let top = 52.min(p.h / 4);
+    let footer = 68.min(p.h / 3);
+    R { x: p.x + 12, y: p.y + top, w: (p.w - 24).max(1), h: (p.h - top - footer).max(1) }
+}
+
+fn page_wheel_width(body: R) -> i32 { (body.w / 4).clamp(52, 76).min(body.w) }
+
+pub fn page_picker_thumb_rect(app: &App) -> R {
+    let body = page_picker_body(page_picker_rect(app));
+    if !app.page_preview_enabled() { return R { w: 0, h: 0, ..body }; }
+    R { w: (body.w - page_wheel_width(body) - 10).max(1), ..body }
+}
+
 pub fn page_picker_control_rect(app: &App, hit: PagePickerHit) -> R {
     let p = page_picker_rect(app);
-    let (wheel_y, footer_y) = if page_picker_has_thumbnail(app) { (212, 452) } else { (74, 314) };
+    let body = page_picker_body(p);
+    let width = ((body.w - 8) / 2).clamp(1, 100);
+    let footer = R { x: body.x, y: body.y + body.h + 10, w: width, h: (p.y + p.h - body.y - body.h - 22).clamp(1, 48) };
     match hit {
-        PagePickerHit::Wheel => R { x: p.x + 16, y: p.y + wheel_y, w: p.w - 32, h: 220 },
-        PagePickerHit::Input => R {x:p.x+p.w-104,y:p.y+14,w:88,h:40},
-        PagePickerHit::Cancel => R { x: p.x + 16, y: p.y + footer_y, w: 92, h: 44 },
-        PagePickerHit::Jump => R { x: p.x + 118, y: p.y + footer_y, w: 126, h: 44 },
+        PagePickerHit::Wheel if app.page_preview_enabled() => {
+            let w = page_wheel_width(body);
+            R { x: body.x + body.w - w, w, ..body }
+        }
+        PagePickerHit::Wheel => body,
+        PagePickerHit::Input => {
+            let w = (p.w - 106).clamp(60, 150).min(body.w);
+            R { x: body.x + body.w - w, y: p.y + 2, w, h: (body.y - p.y - 4).max(1) }
+        }
+        PagePickerHit::Cancel => footer,
+        PagePickerHit::Jump => R { x: body.x + body.w - width, ..footer },
     }
 }
 
@@ -736,108 +947,21 @@ pub fn page_picker_hit(app: &App, x: i32, y: i32) -> Option<PagePickerHit> {
         .find(|hit| page_picker_control_rect(app, *hit).contains(x, y))
 }
 
-fn tier_button_width(popup_w: i32, tiers: usize) -> i32 {
-    let gaps = 10 * (tiers.max(1) as i32 - 1);
-    (popup_w - 32 - gaps) / tiers.max(1) as i32
-}
+#[path = "ui/pen_palette.rs"]
+mod pen_palette;
+pub use pen_palette::{pen_popup_hit, pen_popup_rect};
+use pen_palette::{draw_pen_popup, pen_controls};
 
-pub fn pen_popup_rect(app: &App) -> R {
-    let w = 296;
-    let h = 286;
-    let sb = sidebar_rect(app, app.popup_on_right);
-    let x = if app.popup_on_right {
-        sb.x - w - 8
-    } else {
-        sb.x + sb.w + 8
-    };
-    let y = sb.y + (sb.h - h) / 2;
-    R {
-        x: x.clamp(0, (app.screen_w - w).max(0)),
-        y: y.clamp(0, (app.screen_h - h).max(0)),
-        w,
-        h,
-    }
-}
-
-pub fn eraser_popup_rect(app: &App) -> R {
-    let w = 308;
-    let h = 184;
-    let sb = sidebar_rect(app, app.popup_on_right);
-    let x = if app.popup_on_right {
-        sb.x - w - 8
-    } else {
-        sb.x + sb.w + 8
-    };
-    let y = sb.y + (sb.h - h) / 2;
-    R {
-        x: x.clamp(0, (app.screen_w - w).max(0)),
-        y: y.clamp(0, (app.screen_h - h).max(0)),
-        w,
-        h,
-    }
-}
-
-
-pub fn pen_popup_hit(app: &App, x: i32, y: i32) -> Option<PopupHit> {
-    let p = pen_popup_rect(app);
-    if !p.contains(x, y) {
-        return None;
-    }
-    let start_y = p.y + 46;
-    for i in 0..10 {
-        let row = (i / 4) as i32;
-        let col = (i % 4) as i32;
-        let cx = p.x + 16 + col * 48 + 19;
-        let cy = start_y + row * 48 + 19;
-        let rr = R {
-            x: cx - 19,
-            y: cy - 19,
-            w: 38,
-            h: 38,
-        };
-        if rr.contains(x, y) {
-            return Some(PopupHit::Color(i));
-        }
-    }
-    let sy = p.y + 214;
-    let tiers = crate::app::PEN_SIZES.len();
-    let bw = tier_button_width(p.w, tiers);
-    for i in 0..tiers {
-        let bx = p.x + 16 + i as i32 * (bw + 10);
-        let rr = R { x: bx, y: sy, w: bw, h: 48 };
-        if rr.contains(x, y) {
-            return Some(PopupHit::PenSize(i));
-        }
-    }
-    None
-}
-
-pub fn eraser_popup_hit(app: &App, x: i32, y: i32) -> Option<PopupHit> {
-    let p = eraser_popup_rect(app);
-    if !p.contains(x, y) {
-        return None;
-    }
-    let sy = p.y + 46;
-    let tiers = crate::app::ERASER_SIZES.len();
-    let bw = tier_button_width(p.w, tiers);
-    for i in 0..tiers {
-        let bx = p.x + 16 + i as i32 * (bw + 10);
-        let rr = R { x: bx, y: sy, w: bw, h: 48 };
-        if rr.contains(x, y) {
-            return Some(PopupHit::EraserSize(i));
-        }
-    }
-    let cy = p.y + 110;
-    let rr = R { x: p.x + 16, y: cy, w: p.w - 32, h: 48 };
-    if rr.contains(x, y) {
-        return Some(PopupHit::ClearAll);
-    }
-    None
-}
+#[path = "ui/eraser_palette.rs"]
+mod eraser_palette;
+pub use eraser_palette::{eraser_popup_hit, eraser_popup_rect};
+use eraser_palette::{draw_eraser_popup, eraser_controls};
 
 
 #[path = "ui/whiteboard.rs"]
 mod whiteboard;
+#[path = "ui/whiteboard_preview.rs"]
+mod whiteboard_preview;
 pub use whiteboard::{direction_menu_rect, selection_bar_rect, whiteboard_bar_rect,
     whiteboard_edit_bar_rect, whiteboard_hit, whiteboard_ui_contains};
 use whiteboard::draw_whiteboard_controls;
@@ -919,20 +1043,13 @@ pub fn process_rows(app: &App) -> Vec<(ProcessRow, String, String)> {
     let mut rows = Vec::new();
     if app.settings_ui.process_view==crate::settings_state::ProcessView::Rules {
         for (index,rule) in app.process_rules.iter().enumerate() {
-            rows.push((ProcessRow::Rule(index),rule.clone(),if rule.contains('/') {"按完整路径匹配"}else{"按进程名称匹配"}.into()));
+            rows.push((ProcessRow::Rule(index),rule.clone(),if rule.contains('/') {"完整路径"}else{"进程名"}.into()));
         }
         return rows;
     }
     for (index, proc) in app.process_scan.iter().enumerate() {
-        let added = app
-            .process_rules
-            .iter()
-            .any(|rule| crate::process_block::matches(rule, proc));
-        let detail = if added {
-            format!("已添加 · {}", proc.exe)
-        } else {
-            format!("pid {} · {}", proc.pid, proc.exe)
-        };
+        let mut detail = format!("PID {}", proc.pid);
+        if !proc.exe.is_empty() { detail.push_str("  "); detail.push_str(&proc.exe); }
         rows.push((ProcessRow::Proc(index), proc.name.clone(), detail));
     }
     rows
@@ -988,7 +1105,7 @@ pub fn draw_confirm(app:&App,fonts:&Fonts,ctx:&mut Ctx) {
         let p=confirm_rect(app); let palette=ctx.palette;
         panel(ctx,p,12.0,1.0);
         ctx.text(fonts,"退出 Sidera？",(p.x+24) as f32,(p.y+42) as f32,19.0,c(palette.text));
-        let lines=crate::settings_panel::wrapped(fonts,"退出后当前批注不会保留。\n请先截图保存需要的内容。",14.0,p.w-48);
+        let lines=crate::settings_panel::wrapped(fonts,"退出会清除当前批注。需要保留的内容请先截图。",14.0,p.w-48);
         for (i,line) in lines.iter().enumerate() {
             if 72+i as i32*24>p.h-72 {break;}
             ctx.text(fonts,line,(p.x+24) as f32,(p.y+72+i as i32*24) as f32,14.0,c(palette.muted));
@@ -997,7 +1114,7 @@ pub fn draw_confirm(app:&App,fonts:&Fonts,ctx:&mut Ctx) {
             if hit==ConfirmHit::Yes {
                 let r=R {y:r.y+6,h:r.h-12,..r};
                 surface(ctx,r,6.0,c(palette.danger_light),c(palette.danger));
-                ctx.text_center(fonts,r,"确定退出",14.0,c(palette.text));
+                ctx.text_center(fonts,r,"退出",14.0,c(palette.text));
             } else {crate::settings_panel::button(ctx,fonts,r,"取消",false);}
         }
     });
@@ -1048,11 +1165,10 @@ pub fn draw_input_group_prompt(app:&App,fonts:&Fonts,ctx:&mut Ctx) {
     panel(ctx,p,12.0,1.0);
     ctx.text(fonts,"触屏输入权限",(p.x+24) as f32,(p.y+42) as f32,19.0,c(palette.text));
     let body=match app.input_group_state {
-        0 if p.h<250 => "触屏需要访问输入设备。\n授权后需重新登录。",
-        0 => "触屏批注需要读取输入设备。\n授权会允许当前用户读取输入设备事件。\n添加后请注销并重新登录。",
-        1 => "请在系统授权窗口中完成授权。",
-        2 => "权限已添加。\n注销并重新登录后生效。",
-        _ => "授权未完成。\n可以稍后重新尝试。",
+        0 => "授权后，当前用户可读取触屏和键盘输入。\n注销并重新登录后生效。",
+        1 => "请在系统窗口中授权。",
+        2 => "已授权，重新登录后生效。",
+        _ => "未获得输入权限。",
     };
     let lines=crate::settings_panel::wrapped(fonts,body,14.0,p.w-48);
     for (i,line) in lines.iter().enumerate() {
@@ -1097,7 +1213,7 @@ pub fn set_autostart(on: bool) {
             let _ = std::fs::create_dir_all(parent);
         }
         let entry = format!(
-            "[Desktop Entry]\nType=Application\nName=Sidera\nComment=Sidera软件\nExec=sidera --autostart\nIcon={}\nTerminal=false\n",
+            "[Desktop Entry]\nType=Application\nName=Sidera\nComment=屏幕批注与白板\nExec=sidera --autostart\nIcon={}\nTerminal=false\n",
             autostart_icon());
         let _ = std::fs::write(p, entry);
     } else {
@@ -1319,7 +1435,7 @@ pub fn render_region(
         }
         let mut ctx = Ctx { palette: board_palette(app), pm: &mut pm, tr };
         let board_fonts = fonts.for_settings();
-        draw_coord_foci(app, &board_fonts, &mut ctx);
+        if let Some(coord) = &app.coord { draw_coord_foci(coord, &board_fonts, &mut ctx); }
         draw_selection_outline(app, &mut ctx);
         draw_coord_handles(app, &mut ctx);
     }
@@ -1332,11 +1448,12 @@ pub fn render_region(
             let (cw, ch) = (((r.w as f32) * sc).round().max(1.0) as u32,
                 ((r.h as f32) * sc).round().max(1.0) as u32);
             let mut cache = app.launch.card.borrow_mut();
-            if cache.as_ref().is_none_or(|pm| pm.width() != cw || pm.height() != ch) {
-                *cache = Some(crate::splash_paint::draw(fonts, icon, &app.launch, cw, ch, palette));
+            if cache.as_ref().is_none_or(|card| card.pixels.width() != cw || card.pixels.height() != ch) {
+                *cache = Some(crate::splash_paint::Card::new(fonts, icon, cw, ch, palette));
             }
-            if let Some(card) = cache.as_ref() {
-                ctx.pm.draw_pixmap(0, 0, card.as_ref(), &tiny_skia::PixmapPaint {
+            if let Some(card) = cache.as_mut() {
+                card.update(fonts, &app.launch);
+                ctx.pm.draw_pixmap(0, 0, card.pixels.as_ref(), &tiny_skia::PixmapPaint {
                     opacity: app.launch.panel_alpha(), ..Default::default()
                 }, tr.pre_translate(r.x as f32, r.y as f32).pre_scale(1.0 / sc, 1.0 / sc), None);
             }
@@ -1393,7 +1510,7 @@ pub fn render_region(
                 ctx.text_center(
                     fonts,
                     r,
-                    "已达到白板页数上限",
+                    "已翻回第 1 页",
                     34.0,
                     page_ink,
                 );
@@ -1403,9 +1520,22 @@ pub fn render_region(
         if app.whiteboard { draw_whiteboard_controls(app, fonts, &mut ctx); }
 
         let sidebar_progress = if app.previewing_sidebars() { 0.0 } else { app.sidebar_retract() };
-        draw_sidebar(app, fonts, &mut ctx, false, sidebar_progress);
-        draw_sidebar(app, fonts, &mut ctx, true, sidebar_progress);
+        let opacity = if app.toolbar_can_fade() { app.presentation_fade.opacity() } else { 1.0 };
+        for right in [false, true] {
+            if opacity < 1.0 {
+                draw_with_opacity(app, &mut ctx, sidebar_input_rect(app, right), opacity,
+                    |ctx| draw_sidebar(app, fonts, ctx, right, sidebar_progress));
+            } else {
+                draw_sidebar(app, fonts, &mut ctx, right, sidebar_progress);
+            }
+        }
 
+        if let Some(right) = app.scroll_rail.held.filter(|_| app.scroll_rail.unavailable && app.wants_scroll_rail() && !app.collapsed) {
+            let r = scroll_notice_rect(app,right);
+            surface(&mut ctx,r,7.0,c(palette.paper),c(palette.control_border()));
+            let notice = "当前窗口无法接收滚动";
+            ctx.text_center(fonts,r,notice,13.0,c(palette.text));
+        }
         if app.pen_popup_visible {
             draw_pen_popup(app, fonts, &mut ctx);
         }
@@ -1459,14 +1589,18 @@ pub fn draw_settings_window(
     draw_press_feedback(app, &mut ctx);
 }
 
+fn launch_piece_opacity(target: R, visible: R, r: R) -> f32 {
+    let space = (r.y - visible.y).min(visible.y + visible.h - r.y - r.h);
+    let final_space = (r.y - target.y).min(target.y + target.h - r.y - r.h).clamp(1, 18);
+    // A button fades in only after it fits completely: no squashed icons or
+    // sliced labels along the moving top/bottom edges.
+    (space as f32 / final_space as f32).clamp(0.0, 1.0)
+}
+
 fn draw_launch_piece(app: &App, ctx: &mut Ctx, target: R, visible: R, r: R,
     draw: impl FnOnce(&mut Ctx)) {
     if r.w <= 0 || r.h <= 0 { return; }
-    let space = (r.y - visible.y).min(visible.y + visible.h - r.y - r.h);
-    let final_space = (r.y - target.y).min(target.y + target.h - r.y - r.h).clamp(1, 18);
-    let opacity = (space as f32 / final_space as f32).clamp(0.0, 1.0);
-    // A button fades in only after it fits completely: no squashed icons or
-    // sliced labels along the moving top/bottom edges.
+    let opacity = launch_piece_opacity(target, visible, r);
     if opacity <= 0.0 { return; }
     let scale = app.scale as f32;
     let Some(mut tile) = Pixmap::new((r.w as f32 * scale).ceil() as u32,
@@ -1477,26 +1611,55 @@ fn draw_launch_piece(app: &App, ctx: &mut Ctx, target: R, visible: R, r: R,
         ctx.tr.pre_translate(r.x as f32, r.y as f32).pre_scale(1.0 / scale, 1.0 / scale), None);
 }
 
+fn draw_sidebar_shell(app: &App, ctx: &mut Ctx, sb: R, held: bool) {
+    let p = ctx.palette;
+    let radius = (sb.w as f32 * 0.27).min(17.0).min(sb.h as f32 / 2.0);
+    let rim = if held { p.accent } else { theme::mix(p.border, p.text, 0.22) };
+    let shell = if held { p.accent_light } else { p.surface };
+    surface(ctx, sb, radius, alpha(shell, app.sidebar_alpha), c(rim));
+    // Keep the housing translucent. Each touch key has its own opaque face.
+    if sb.h > app.screen_h && app.screen_h > 16 {
+        let travel = (app.screen_h - 12) as f32;
+        let fraction = app.screen_h as f32 / sb.h as f32;
+        let top = 6.0 + (-sb.y as f32 / sb.h as f32) * travel;
+        let edge = if sb.x < app.screen_w / 2 { sb.x + 2 } else { sb.x + sb.w - 3 };
+        ctx.stroke_line((edge as f32, top), (edge as f32, top + travel * fraction), c(p.muted), 2.0);
+    }
+    let cx = (sb.x + sb.w / 2) as f32;
+    let grip = (app.sb_dot() as f32 * 0.32).round();
+    for y in [sb.y + 6, sb.y + sb.h - 5] {
+        if held {
+            let w = (app.sb_dot() + 6).clamp(20, sb.w - 6);
+            ctx.fill_round(R { x: sb.x + (sb.w - w) / 2, y: y - 4, w, h: 8 }, 4.0, c(p.accent));
+        }
+        ctx.stroke_line((cx - grip, y as f32), (cx + grip, y as f32),
+            c(if held { p.on_accent } else { p.muted }), 2.0);
+    }
+}
+
 fn draw_launch_sidebar(app: &App, fonts: &Fonts, ctx: &mut Ctx, right: bool) {
     if app.avoid_active { return; }
-    let palette = ctx.palette;
     let p = app.launch.reveal();
     if p <= 0.0 { return; }
     if p >= 1.0 { draw_sidebar(app, fonts, ctx, right, app.sidebar_retract()); return; }
     let target = sidebar_rect(app, right);
     let visible = sidebar_launch_rect(app, right);
-    let radius = (visible.w as f32 * 0.30).min(20.0).min(visible.h as f32 / 2.0);
-    surface(ctx, visible, radius, alpha(palette.surface, app.sidebar_alpha), alpha(palette.border, 225));
-    let cx = visible.x as f32 + visible.w as f32 / 2.0;
-    let grip = app.sb_dot() as f32 * 0.25;
-    for y in [visible.y + 6, visible.y + visible.h - 5] {
-        ctx.stroke_line((cx - grip, y as f32), (cx + grip, y as f32), c(palette.muted), 1.8);
+    if app.collapsed {
+        let face = sidebar_tab_face(app, right);
+        draw_sidebar_tab(app, ctx, right, face, false, 1.0, launch_piece_opacity(target, visible, face));
+        return;
     }
-    if app.collapsed { return; }
+    draw_sidebar_shell(app, ctx, visible, false);
+    draw_launch_piece(app, ctx, target, visible, tool_track_rect(app, right).with_paint_margin(),
+        |local| draw_tool_track(app, fonts, local, right));
     for (button, r) in expanded_sidebar_buttons(app, right) {
-        draw_launch_piece(app, ctx, target, visible, r, |local| draw_btn(app, fonts, local, button, r));
+        if button.tool_mode().is_some() || (app.document_scroll_enabled && matches!(button, Btn::Prev | Btn::Next)) { continue; }
+        draw_launch_piece(app, ctx, target, visible, r, |local| draw_btn(app, fonts, local, button, right, r));
     }
-    if app.sidebar_page_visible() {
+    if app.document_scroll_enabled {
+        draw_launch_piece(app, ctx, target, visible, scroll_track_rect(app, right).with_paint_margin(),
+            |local| draw_scroll_navigation(app, fonts, local, right));
+    } else if app.sidebar_page_visible() {
         draw_launch_piece(app, ctx, target, visible, sidebar_page_rect(app, right),
             |local| draw_sidebar_pages(app, fonts, local, right));
     }
@@ -1504,90 +1667,161 @@ fn draw_launch_sidebar(app: &App, fonts: &Fonts, ctx: &mut Ctx, right: bool) {
 
 fn draw_sidebar(app: &App, fonts: &Fonts, ctx: &mut Ctx, right: bool, progress: f32) {
     if app.avoid_active && !app.settings_open { return; }
-    let palette = ctx.palette;
     let drag = app.sidebar_drag.filter(|drag| drag.right == right);
     let held = drag.is_some();
-    let stroke_width = 2.0;
     if progress < 1.0 {
         let sb = expanded_sidebar_rect(app, right);
         let dx = (sb.w + 4) as f32 * progress * if right { 1.0 } else { -1.0 };
         let mut moving = Ctx { palette: app.palette(), pm: &mut *ctx.pm, tr: ctx.tr.pre_translate(dx, 0.0) };
-        let radius = (sb.w as f32 * 0.30).min(20.0);
-        let fill = if held { alpha(palette.accent_light, app.sidebar_alpha.max(200)) }
-            else { alpha(palette.surface, app.sidebar_alpha) };
-        surface(&mut moving, sb, radius, fill, if held { c(palette.accent) } else { alpha(palette.border, 225) });
-        if held {
-            moving.stroke_round(R { x: sb.x + 2, y: sb.y + 2, w: sb.w - 4, h: sb.h - 4 },
-                (radius - 2.0).max(1.0), c(palette.accent), stroke_width);
-        }
-        let cx = sb.x as f32 + sb.w as f32 / 2.0;
-        let grip = app.sb_dot() as f32 * 0.25;
-        for y in [sb.y + 6, sb.y + sb.h - 5] {
-            if held {
-                let w = (app.sb_dot() + 6).clamp(20, sb.w - 6);
-                moving.fill_round(R { x: sb.x + (sb.w - w) / 2, y: y - 4, w, h: 8 }, 4.0, c(palette.accent));
+        draw_sidebar_shell(app, &mut moving, sb, held);
+        draw_tool_track(app, fonts, &mut moving, right);
+        for (k, r) in expanded_sidebar_buttons(app, right) {
+            if k.tool_mode().is_none() && !(app.document_scroll_enabled && matches!(k, Btn::Prev | Btn::Next)) {
+                draw_btn(app, fonts, &mut moving, k, right, r);
             }
-            moving.stroke_line((cx - grip, y as f32), (cx + grip, y as f32),
-                c(if held { palette.on_accent } else { palette.muted }), if held { 2.2 } else { 1.8 });
         }
-        for (k, r) in expanded_sidebar_buttons(app, right) { draw_btn(app, fonts, &mut moving, k, r); }
         draw_opening_tools(app, fonts, &mut moving, right);
-        draw_sidebar_pages(app, fonts, &mut moving, right);
+        if app.document_scroll_enabled { draw_scroll_navigation(app, fonts, &mut moving, right); }
+        else { draw_sidebar_pages(app, fonts, &mut moving, right); }
     }
     if progress > 0.0 {
-        let tab = sidebar_tab_rect(app, right);
-        let dx = tab.w as f32 * (1.0 - progress) * if right { 1.0 } else { -1.0 };
-        let mut moving = Ctx { palette: app.palette(), pm: &mut *ctx.pm, tr: ctx.tr.pre_translate(dx, 0.0) };
-        // Extend under the screen edge so only the inward corners are rounded.
-        let outline = R { x: tab.x - if right { 0 } else { 12 }, w: tab.w + 12, ..tab };
-        surface(&mut moving, outline, 12.0, c(if held { palette.accent_light } else { palette.paper }),
-            c(if held { palette.accent } else { palette.accent_line }));
-        if held {
-            moving.stroke_round(R { x: outline.x + 2, y: outline.y + 2, w: outline.w - 4, h: outline.h - 4 },
-                10.0, c(palette.accent), stroke_width);
+        let face = sidebar_tab_face(app, right);
+        draw_sidebar_tab(app, ctx, right, face, held, progress, 1.0);
+    }
+}
+
+fn draw_sidebar_tab(app: &App, ctx: &mut Ctx, right: bool, face: R, held: bool, progress: f32, opacity: f32) {
+    if opacity <= 0.0 { return; }
+    let scale = app.scale as f32;
+    let edge_gap = if right { app.screen_w - face.x - face.w } else { face.x };
+    let travel = (face.w + 2) as f32 * (1.0 - progress);
+    let gap_px = ((edge_gap as f32 - travel) * scale).round();
+    let (origin_px, direction) = if right { (app.canvas_w() as f32 - gap_px, -1.0) } else { (gap_px, 1.0) };
+    let origin = ctx.tr.pre_translate(origin_px / scale, face.y as f32);
+    let (x, y) = (origin.tx.round() as i32, origin.ty.round() as i32);
+    let pixel_w = (face.w as f32 * scale).ceil() as i32;
+    let pixel_h = (face.h as f32 * scale).ceil() as i32;
+    let left = if right { x - pixel_w } else { x };
+    if left >= ctx.pm.width() as i32 || left + pixel_w <= 0
+        || y >= ctx.pm.height() as i32 || y + pixel_h <= 0 { return; }
+
+    // Mirror the finished pixels so even the curved edges and dash caps have identical coverage.
+    let Some(mut tile) = Pixmap::new(pixel_w as u32, pixel_h as u32) else { return };
+    let tr = Transform::from_scale(scale, scale);
+    let p = ctx.palette;
+    let mut tab = Ctx { palette: p, pm: &mut tile, tr };
+    let radius = (face.w as f32 * 0.22).round();
+    tab.fill_round(R { x: 0, y: 0, ..face }, radius, c(if held { p.accent_light } else { p.paper }));
+
+    let width = ((face.w as f32 * 0.09).clamp(2.0, 3.0) * scale).round() / scale;
+    let inset = width * 0.5;
+    let (w, h) = (face.w as f32 - width, face.h as f32 - width);
+    let rim_radius = radius - inset;
+    if let Some(path) = rounded_path(inset, inset, w, h, rim_radius) {
+        let mut stroke = Stroke { width, line_cap: LineCap::Round, ..Default::default() };
+        let level = app.sidebar_countdown;
+        let track = theme::mix(p.paper, p.border, 0.8);
+        tab.pm.stroke_path(&path, &solid(c(track)), &stroke, tr, None);
+        if level > 0 {
+            if level < u8::MAX {
+                // Each quadratic corner in rounded_path has a length of 1.623225 × its radius.
+                let straight = 2.0 * (w + h - 4.0 * rim_radius);
+                let perimeter = straight + 4.0 * 1.623225 * rim_radius;
+                let length = perimeter * f32::from(level) / f32::from(u8::MAX);
+                stroke.dash = StrokeDash::new(vec![length, perimeter], 0.0);
+            }
+            tab.pm.stroke_path(&path, &solid(c(p.accent)), &stroke, tr, None);
         }
-        let cx = tab.x as f32 + tab.w as f32 / 2.0;
-        let cy = tab.y as f32 + tab.h as f32 / 2.0;
-        let direction = if right { -1.0 } else { 1.0 };
-        moving.stroke_line((cx - direction * 3.0, cy - 6.0), (cx + direction * 3.0, cy), c(palette.accent), 2.4);
-        moving.stroke_line((cx + direction * 3.0, cy), (cx - direction * 3.0, cy + 6.0), c(palette.accent), 2.4);
+    }
+    let cx = face.w as f32 / 2.0;
+    let cy = face.h as f32 / 2.0;
+    let wing = face.w as f32 * 0.12;
+    let half_height = face.w as f32 * 0.22;
+    tab.stroke_polyline(&[(cx - wing, cy - half_height), (cx + wing, cy), (cx - wing, cy + half_height)],
+        c(if held { p.accent } else { theme::mix(p.muted, p.accent, 0.42) }), 2.0, false);
+    let placement = Transform::from_translate(x as f32, y as f32).pre_scale(direction, 1.0);
+    ctx.pm.draw_pixmap(0, 0, tile.as_ref(), &tiny_skia::PixmapPaint { opacity, ..Default::default() }, placement, None);
+}
+
+fn draw_tool_track(app: &App, fonts: &Fonts, ctx: &mut Ctx, right: bool) {
+    let p = ctx.palette;
+    let track = tool_track_rect(app, right);
+    let well = theme::mix(p.surface, p.border, 0.16);
+    let segments = tool_segments(app, right);
+    let first = segments[0].1;
+    let step = first.h + 6;
+    let eraser_height = app.eraser_row_height();
+    let position = app.tool_selector.position(app.mode).min(1.0 + eraser_height as f32 / step as f32);
+    let pad = TOOL_TRACK_INSET;
+    let size = track.w - 2 * pad;
+    let thumb = R { x: track.x + pad, y: track.y + pad + (position * (first.h + 6) as f32).round() as i32, w: size, h: size };
+    let radius = (size as f32 * 0.42).round();
+    surface(ctx, track, radius + pad as f32, c(well), c(p.control_border()));
+    for (index, (_, slot)) in segments[1..].iter().enumerate() {
+        if index == 1 && eraser_height < step { continue; }
+        // Only separate the two idle tools. Fade the line as the thumb approaches.
+        let opacity = ((position - (index as f32 + 0.5)).abs() - 0.5).clamp(0.0, 1.0);
+        if opacity <= 0.0 { continue; }
+        let y = (slot.y - 3) as f32;
+        ctx.stroke_line(((slot.x + 7) as f32, y), ((slot.x + slot.w - 7) as f32, y),
+            alpha(theme::mix(p.border, p.muted, 0.30), (255.0 * opacity).round() as u8), 1.0);
+    }
+    let rim = if theme::contrast(p.accent, well) < 3.0 { p.text } else { theme::mix(p.accent, p.text, 0.22) };
+    let contact = app.press.filter(|press| press.active && !press.expired()
+        && press.control.tool_segment().is_some_and(|(_, side)| side == right));
+    let (fill, rim) = match contact {
+        Some(press) if press.until.is_none() => (theme::mix(p.accent, p.on_accent, 0.18), theme::mix(rim, p.on_accent, 0.80)),
+        Some(_) => (theme::mix(p.accent, p.on_accent, 0.09), theme::mix(rim, p.on_accent, 0.47)),
+        None => (p.accent, rim),
+    };
+    surface(ctx, thumb, radius, c(fill), c(rim));
+    for (tool, r) in segments {
+        if tool != Btn::Eraser || eraser_height == step { draw_btn(app, fonts, ctx, tool, right, r); }
     }
 }
 
 fn draw_opening_tools(app: &App, fonts: &Fonts, ctx: &mut Ctx, right: bool) {
-    let fraction = app.drawing_tools.fraction();
-    let h = app.drawing_tools_height();
-    if fraction <= 0.0 || fraction >= 1.0 || h == 0 { return; }
-    let sb = expanded_sidebar_rect(app, right);
-    let y = sb.y + 12 + 3 * (app.sb_btn() + 6);
+    if !app.drawing_tools.animating() { return; }
+    let (eraser, rect) = tool_segments(app, right)[2];
+    let buttons = std::iter::once((eraser, rect, app.eraser_row_height())).chain(drawing_tool_buttons(app, right));
     let scale = app.scale as f32;
-    for (button, r) in drawing_tool_buttons(app, right) {
-        let bottom = r.y + r.h - y;
-        // Fade only complete controls into the revealed space. Never cut a
-        // label or squeeze an icon against the moving navigation controls.
-        let opacity = ((h - bottom) as f32 / (app.drawing_tools_full_height() - bottom) as f32).clamp(0.0, 1.0);
-        if opacity <= 0.0 { continue; }
+    for (button, r, height) in buttons {
+        let step = r.h + 6;
+        if height >= step || height * 2 <= step { continue; }
+        let reveal = height as f32 / step as f32;
+        let opacity = 2.0 * reveal - 1.0;
         let Some(mut tile) = Pixmap::new((r.w as f32 * scale).ceil() as u32,
             (r.h as f32 * scale).ceil() as u32) else { continue };
         let mut local = Ctx { palette: app.palette(), pm: &mut tile,
             tr: Transform::from_scale(scale, scale).pre_translate(-r.x as f32, -r.y as f32) };
-        draw_btn(app, fonts, &mut local, button, r);
+        draw_btn(app, fonts, &mut local, button, right, r);
         ctx.pm.draw_pixmap(0, 0, tile.as_ref(), &tiny_skia::PixmapPaint {
             opacity, ..Default::default()
-        }, ctx.tr.pre_translate(r.x as f32, r.y as f32).pre_scale(1.0 / scale, 1.0 / scale), None);
+        }, ctx.tr.pre_translate(r.x as f32 + r.w as f32 * (1.0 - reveal) / 2.0,
+            r.y as f32).pre_scale(reveal / scale, reveal / scale), None);
     }
 }
 
 fn draw_sidebar_pages(app: &App, fonts: &Fonts, ctx: &mut Ctx, right: bool) {
-    let palette = ctx.palette;
     if !app.sidebar_page_visible() { return; }
-    let r = sidebar_page_rect(app, right);
-    let (page, total) = sidebar_page_values(app);
+    let r = page_counter_face(app, sidebar_page_rect(app, right));
+    draw_page_face(app, fonts, ctx, right, r, sidebar_page_numbers(app));
+}
+
+fn draw_page_face(app: &App, fonts: &Fonts, ctx: &mut Ctx, right: bool, r: R, numbers: (i32,i32)) {
+    let palette = ctx.palette;
+    let (page, total) = page_labels(numbers);
     let text = format!("{page} / {total}");
     let available_picker = app.page_picker_context().is_some();
     let opened = app.page_picker.is_some() && app.popup_on_right == right;
-    surface(ctx, r, 6.0, c(if opened { palette.accent_light } else { palette.surface }),
-        c(if available_picker { palette.accent_line } else { palette.border }));
+    let (fill, border) = if opened {
+        (palette.accent_light, palette.accent)
+    } else if available_picker {
+        (palette.surface, palette.control_border())
+    } else {
+        (palette.surface, palette.border)
+    };
+    button_surface(app, ctx, Control::PageCount(right), r, 6.0, c(fill), c(border));
     let available = (r.w - 6).max(1) as f32;
     let nominal = (13.0 * app.sb_scale as f32).clamp(11.0, 16.0);
     let fit = |text: &str, size: f32| size * (available / fonts.text_width(text, size).max(1.0)).min(1.0);
@@ -1607,91 +1841,78 @@ fn draw_sidebar_pages(app: &App, fonts: &Fonts, ctx: &mut Ctx, right: bool) {
 }
 
 fn draw_button_label(fonts: &Fonts, ctx: &mut Ctx, r: R, label: &str, ink: Color) {
-    // 按“步进宽度”收字：中文字形墨迹比步进窄，用墨迹算字号会让两字标签溢出按钮。
-    let Some((left, top, right, bottom)) = fonts.text_bounds(label, 1.0) else { return };
-    let width = fonts.text_width(label, 1.0).max(0.01);
-    let ink_width = (right - left).max(0.01);
-    let height = (bottom - top).max(0.01);
-    let padding = (r.w.min(r.h) as f32 * 0.10).max(2.0);
-    let size = (r.w as f32 * 0.49).max(11.0)
-        .min((r.w as f32 - 2.0 * padding).max(1.0) / width)
-        .min((r.h as f32 - 2.0 * padding).max(1.0) / height);
-    let x = r.x as f32 + (r.w as f32 - ink_width * size) / 2.0 - left * size;
-    let baseline = r.y as f32 + (r.h as f32 - height * size) / 2.0 - top * size;
-    ctx.text(fonts, label, x, baseline, size, ink);
+    let nominal = (r.w as f32 * 0.34).round().max(9.0).min((r.h - 2).max(1) as f32);
+    let width = fonts.text_width(label, nominal).max(1.0);
+    let size = nominal * ((r.w - 2) as f32 / width).min(1.0);
+    ctx.text_center(fonts, r, label, size, ink);
 }
 
-fn draw_btn(app: &App, fonts: &Fonts, ctx: &mut Ctx, k: Btn, r: R) {
+fn centered_glyph(ctx: &mut Ctx, glyph: Glyph, r: R, size: f32, ink: Color, accent: Color) {
+    let size = size.min(r.w.min(r.h) as f32 * 0.82);
+    let x = r.x as f32 + (r.w as f32 - size) / 2.0;
+    let y = r.y as f32 + (r.h as f32 - size) / 2.0;
+    icons::draw(ctx, glyph, x, y, size, ink, accent);
+}
+
+fn draw_btn(app: &App, fonts: &Fonts, ctx: &mut Ctx, k: Btn, right: bool, r: R) {
     let palette = ctx.palette;
     let btn = app.sb_btn() as f32;
-    let radius = (r.w as f32 * 0.24).min(10.0);
+    let radius = (r.w as f32 * 0.17).min(9.0);
     if k == Btn::Exit && !app.whiteboard {
-        draw_presentation_button(app, fonts, ctx, r, radius);
+        draw_presentation_button(app, fonts, ctx, right, r, radius);
         return;
     }
-    let selected = sidebar_button_selected(app, k);
-    let mut fill = c(if selected { palette.accent } else { palette.paper });
-    let mut edge = c(if selected { palette.text } else { palette.border });
-    let mut ink = c(if selected { palette.on_accent } else { palette.text });
-    if !control_enabled(app, Control::Sidebar(k, false)) {
-        fill = c(palette.disabled_surface);
-        edge = c(palette.disabled_border);
-        ink = c(palette.disabled_ink);
-    }
-    if k == Btn::Whiteboard && app.whiteboard {
-        fill = c(palette.danger_light);
-        edge = c(palette.danger);
-        ink = c(palette.danger);
-    }
-    if k == Btn::Exit {
-        fill = app.whiteboard_bg_color();
-        ink = theme::on_color(fill);
-    }
-    surface(ctx, r, radius, fill, edge);
-    match k {
-        Btn::Collapse => draw_button_label(fonts, ctx, r, "收起", c(palette.muted)),
-        Btn::Cursor | Btn::Pen | Btn::Eraser | Btn::Prev | Btn::Next => {
-            let glyph = match k {
-                Btn::Cursor => Glyph::Cursor, Btn::Pen => Glyph::Pen, Btn::Eraser => Glyph::Eraser,
-                Btn::Prev => Glyph::Up, Btn::Next => Glyph::Down, _ => Glyph::More,
-            };
-            // 21 / 24 / 27 logical pixels at default scale: visible size cues,
-            // with a fixed centre and fixed hit target at every toolbar scale.
-            let factor = if k == Btn::Eraser {
-                let last = (crate::app::ERASER_SIZES.len() - 1).max(1) as f32;
-                0.86 + 0.26 * app.cur_eraser.min(crate::app::ERASER_SIZES.len() - 1) as f32 / last
-            } else { 1.0 };
-            let size = (app.sb_icon() as f32 * factor).min(r.w.min(r.h) as f32 * 0.82);
-            let x = r.x as f32 + (r.w as f32 - size) / 2.0;
-            let y = r.y as f32 + (r.h as f32 - size) / 2.0;
-            // Filled stationery keeps its own outline, while plain arrows/dots
-            // use the label contrast of the selected button.
-            let glyph_ink = if selected && matches!(k, Btn::Cursor | Btn::Pen | Btn::Eraser) {
-                c(palette.text)
-            } else { ink };
-            icons::draw(ctx, glyph, x, y, size, glyph_ink, app.pen_color());
-        }
-        Btn::Clear => draw_button_label(fonts, ctx, r, "清除", c(palette.danger)),
-        Btn::Restore => draw_button_label(fonts, ctx, r, "恢复", ink),
-        Btn::Screenshot => draw_button_label(fonts, ctx, r, "截图", ink),
-        Btn::Undo => draw_button_label(fonts, ctx, r, "撤回", ink),
-        Btn::Whiteboard => {
-            if app.whiteboard {
-                let top = R { h: r.h / 2, ..r };
-                let bottom = R { y: r.y + top.h, h: r.h - top.h, ..r };
-                draw_button_label(fonts, ctx, top, "关闭", ink);
-                draw_button_label(fonts, ctx, bottom, "白板", ink);
-            } else {
-                draw_button_label(fonts, ctx, r, "白板", ink);
-            }
-        }
+    let control = Control::Sidebar(k, right);
+    let ink = match k {
         Btn::Exit => {
-            ctx.text_multiline_center(fonts, r, "背景\n颜色", (btn * 0.42).max(10.0), ink);
+            let bg = app.whiteboard_bg_color();
+            button_surface(app, ctx, control, r, radius, bg, c(palette.control_border()));
+            theme::on_color(bg)
         }
+        Btn::Whiteboard if app.whiteboard => {
+            button_surface(app, ctx, control, r, radius, c(palette.danger_light), c(palette.danger));
+            c(palette.danger)
+        }
+        Btn::Cursor | Btn::Pen | Btn::Eraser => c(palette.text),
+        _ => {
+            button_surface(app, ctx, control, r, radius, c(palette.paper), c(palette.control_border()));
+            c(if k == Btn::Clear { theme::mix(palette.danger, palette.text, 0.30) } else { palette.text })
+        }
+    };
+    let saved = k == Btn::Screenshot && app.screenshot_feedback.visible();
+    let (glyph, caption) = match k {
+        Btn::Collapse if !app.toolbar_icons_only => return draw_button_label(fonts, ctx, r, "收起", ink),
+        Btn::Exit if !app.toolbar_icons_only => {
+            ctx.text_multiline_center(fonts, r, "背景\n颜色", (btn * 0.42).max(10.0), ink);
+            return;
+        }
+        Btn::Collapse => (if right { Glyph::CollapseRight } else { Glyph::CollapseLeft }, None),
+        Btn::Exit => (Glyph::BoardColor, None),
+        Btn::Cursor => (Glyph::Cursor, None), Btn::Pen => (Glyph::Pen, None), Btn::Eraser => (Glyph::Eraser, None),
+        Btn::Prev => (Glyph::Up, None), Btn::Next => (Glyph::Down, None),
+        Btn::Screenshot if saved => (Glyph::Check, Some("已保存")),
+        Btn::Screenshot => (Glyph::Screenshot, Some("截图")),
+        Btn::Clear => (Glyph::Trash, Some("清空")), Btn::Restore => (Glyph::Restore, Some("恢复")),
+        Btn::Undo => (Glyph::Undo, Some("撤销")),
+        Btn::Whiteboard if app.whiteboard => (Glyph::CloseBoard, Some("退出")),
+        Btn::Whiteboard => (Glyph::Board, Some("白板")),
+    };
+    if let Some(label) = caption.filter(|_| !app.toolbar_icons_only || saved) {
+        let icon_height = if matches!(glyph, Glyph::CloseBoard) { r.h * 2 / 3 } else { r.h * 3 / 5 };
+        let top = R { y: r.y + 1, h: icon_height, ..r };
+        centered_glyph(ctx, glyph, top, app.sb_icon() as f32, ink, ink);
+        let bottom = R { y: top.y + top.h, h: r.h - top.h - 3, ..r };
+        ctx.text_center(fonts, bottom, label, (r.w as f32 * 0.27).min(16.0), ink);
+        return;
     }
+    let factor = if k == Btn::Eraser {
+        let last = crate::app::ERASER_SIZES.len() - 1;
+        0.86 + 0.26 * app.cur_eraser.min(last) as f32 / last as f32
+    } else { 1.0 };
+    centered_glyph(ctx, glyph, r, app.sb_icon() as f32 * factor, ink, app.pen_color());
 }
 
-fn draw_presentation_button(app: &App, fonts: &Fonts, ctx: &mut Ctx, r: R, radius: f32) {
+fn draw_presentation_button(app: &App, fonts: &Fonts, ctx: &mut Ctx, right: bool, r: R, radius: f32) {
     let palette = ctx.palette;
     let weights = app.presentation_transition.weights();
     let blend = |colors: [u32; 3]| {
@@ -1701,171 +1922,125 @@ fn draw_presentation_button(app: &App, fonts: &Fonts, ctx: &mut Ctx, r: R, radiu
         };
         Color::from_rgba8(channel(16), channel(8), channel(0), 255)
     };
-    surface(ctx, r, radius,
+    button_surface(app, ctx, Control::Sidebar(Btn::Exit, right), r, radius,
         blend([palette.paper, palette.success, palette.danger_light]),
-        blend([palette.border, palette.success, palette.danger]));
+        blend([palette.control_border(), palette.success, palette.danger]));
     // Fade through: only one label is visible, so Esc and the two-line Chinese
     // captions never overlap. Deriving opacity from the same sampled weights
     // also keeps interrupted transitions continuous, on both sidebars.
-    for (index, (label, ink, factor)) in [
-        ("Esc", palette.text, 0.50),
-        ("开始\n放映", palette.on_success, 0.42),
-        ("结束\n放映", palette.danger, 0.42),
+    for (index, (label, glyph, ink, factor)) in [
+        ("Esc", None, palette.text, 0.43),
+        ("开始\n放映", Some(Glyph::StartShow), palette.on_success, 0.36),
+        ("结束\n放映", Some(Glyph::EndShow), palette.danger, 0.36),
     ].into_iter().enumerate() {
         let opacity = (2.0 * weights[index] - 1.0).clamp(0.0, 1.0);
         if opacity <= 0.0 { continue; }
-        ctx.text_multiline_center(fonts, r, label, (app.sb_btn() as f32 * factor).max(10.0),
-            alpha(ink, (255.0 * opacity).round() as u8));
+        let ink = alpha(ink, (255.0 * opacity).round() as u8);
+        if let Some(glyph) = glyph.filter(|_| app.toolbar_icons_only) {
+            centered_glyph(ctx, glyph, r, app.sb_icon() as f32, ink, ink);
+        } else {
+            ctx.text_multiline_center(fonts, r, label, (app.sb_btn() as f32 * factor).round().max(9.0), ink);
+        }
     }
 }
 
-fn draw_page_picker(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
-    let opacity = anim_t(app);
-    if opacity >= 1.0 { draw_page_picker_content(app, fonts, ctx); return; }
+fn draw_fading_popup(app: &App, ctx: &mut Ctx, p: R, draw: impl FnOnce(&mut Ctx)) {
+    draw_with_opacity(app, ctx, p, anim_t(app), draw);
+}
+
+fn draw_with_opacity(app: &App, ctx: &mut Ctx, p: R, opacity: f32, draw: impl FnOnce(&mut Ctx)) {
+    let p = p.with_paint_margin();
+    let (tr, w, h) = region_origin(app, p.x, p.y, p.x + p.w, p.y + p.h);
+    let x = (ctx.tr.tx - tr.tx).round() as i32;
+    let y = (ctx.tr.ty - tr.ty).round() as i32;
+    if x >= ctx.pm.width() as i32 || y >= ctx.pm.height() as i32
+        || x + w as i32 <= 0 || y + h as i32 <= 0 { return; }
+    if opacity >= 1.0 { draw(ctx); return; }
     if opacity <= 0.0 { return; }
-    let p = page_picker_rect(app);
-    let scale = app.scale as f32;
-    let Some(mut tile) = Pixmap::new((p.w as f32 * scale).ceil() as u32,
-        (p.h as f32 * scale).ceil() as u32) else { return };
-    let mut local = Ctx { palette: app.palette(), pm: &mut tile,
-        tr: Transform::from_scale(scale, scale).pre_translate(-p.x as f32, -p.y as f32) };
-    draw_page_picker_content(app, fonts, &mut local);
-    ctx.pm.draw_pixmap(0, 0, tile.as_ref(), &tiny_skia::PixmapPaint { opacity, ..Default::default() },
-        ctx.tr.pre_translate(p.x as f32, p.y as f32).pre_scale(1.0 / scale, 1.0 / scale), None);
+    let Some(mut tile) = Pixmap::new(w, h) else { return };
+    draw(&mut Ctx { palette: ctx.palette, pm: &mut tile, tr });
+    // Composite on the same device pixels as the settled frame, including
+    // when this repaint covers only a dirty region at fractional scale.
+    ctx.pm.draw_pixmap(x, y, tile.as_ref(), &tiny_skia::PixmapPaint { opacity, ..Default::default() },
+        Transform::identity(), None);
+}
+
+fn draw_page_picker(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
+    draw_fading_popup(app, ctx, page_picker_rect(app), |ctx| draw_page_picker_content(app, fonts, ctx));
 }
 
 fn draw_page_picker_content(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
     let palette = ctx.palette;
     let Some(picker) = &app.page_picker else { return };
     let p = page_picker_rect(app);
-    panel(ctx, p, 16.0, 1.0);
-    ctx.text(fonts, "跳转页面", (p.x + 18) as f32, (p.y + 35) as f32, 18.0, c(palette.text));
-    crate::value_input::draw_value(app,fonts,ctx,crate::value_input::Target::Page,
-        page_picker_control_rect(app,PagePickerHit::Input),16.0,""," 页");
-    let hint = crate::value_input::message(app,crate::value_input::Target::Page)
-        .unwrap_or_else(||format!("共 {} 页 · 拨动选页或点击页码输入",picker.total));
-    let hint_size = 12.0 * ((p.w - 36) as f32 / fonts.text_width(&hint, 12.0).max(1.0)).min(1.0);
-    let error=app.settings_ui.editor.as_ref().is_some_and(|e|e.target==crate::value_input::Target::Page&&!e.error.is_empty());
-    ctx.text(fonts, &hint, (p.x + 18) as f32, (p.y + 56) as f32, hint_size, c(if error{palette.danger}else{palette.muted}));
-    if page_picker_has_thumbnail(app) {
-        let thumb = page_picker_thumb_rect(app);
+    panel(ctx, p, 12.0, 1.0);
+    let input = page_picker_control_rect(app, PagePickerHit::Input);
+    let error = app.settings_ui.editor.as_ref()
+        .filter(|e| e.target == crate::value_input::Target::Page && !e.error.is_empty());
+    let heading = if let Some(editor) = error { editor.error.as_str() } else { "选页" };
+    let room = (input.x - p.x - 22).max(1) as f32;
+    let nominal = if error.is_some() { 13.0 } else { 17.0 };
+    let size = nominal * (room / fonts.text_width(heading, nominal).max(1.0)).min(1.0);
+    let baseline = input.y as f32 + (input.h as f32 + size * 0.72) / 2.0;
+    ctx.text(fonts, heading, (p.x + 15) as f32, baseline, size, c(if error.is_some() { palette.danger } else { palette.text }));
+    let suffix = format!(" / {}", picker.total);
+    let size = 16.0 * ((input.w - 10).max(1) as f32 / fonts.text_width(&format!("{}{suffix}", picker.total), 16.0).max(1.0)).min(1.0);
+    crate::value_input::draw_value(app, fonts, ctx, crate::value_input::Target::Page, input, size, "", &suffix);
+    let thumb = page_picker_thumb_rect(app);
+    if thumb.h > 0 {
         surface(ctx, thumb, 8.0, c(palette.surface), c(palette.border));
-        let (epoch, page) = match &picker.source {
-            crate::page_picker::Source::Wps(epoch) => (*epoch, picker.selected()),
-            _ => (0, picker.selected()),
-        };
-        if let Some(pm) = app.thumbs.get(&(epoch, page)) {
-            let scale = (thumb.w as f32 / pm.width() as f32)
-                .min(thumb.h as f32 / pm.height() as f32);
-            let dx = thumb.x as f32 + (thumb.w as f32 - pm.width() as f32 * scale) / 2.0;
-            let dy = thumb.y as f32 + (thumb.h as f32 - pm.height() as f32 * scale) / 2.0;
-            ctx.pm.draw_pixmap(0, 0, pm.as_ref(),
-                &tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() },
-                ctx.tr.pre_translate(dx, dy).pre_scale(scale, scale), None);
-        } else {
-            ctx.text_center(fonts, thumb, "缩略图加载中…", 14.0, c(palette.muted));
+        let page = picker.selected();
+        match picker.source {
+            crate::page_picker::Source::Whiteboard => {
+                let inset = R { x: thumb.x + 4, y: thumb.y + 4, w: thumb.w - 8, h: thumb.h - 8 };
+                if let Some(image) = whiteboard_preview::render(app, fonts, picker, page, inset) {
+                    draw_thumbnail(ctx, inset, &image);
+                }
+            }
+            crate::page_picker::Source::Wps(epoch) => match app.thumbs.get(&(epoch, page)) {
+                Some(image) => draw_thumbnail(ctx, R { x: thumb.x + 3, y: thumb.y + 3, w: thumb.w - 6, h: thumb.h - 6 }, image),
+                None => centered_glyph(ctx, Glyph::Document, thumb, 28.0, c(palette.muted), c(palette.muted)),
+            },
         }
     }
     let wheel = page_picker_control_rect(app, PagePickerHit::Wheel);
-    surface(ctx, wheel, 12.0, c(palette.surface), c(palette.border));
+    surface(ctx, wheel, 8.0, c(palette.surface), c(palette.control_border()));
     let center = wheel.y as f64 + wheel.h as f64 / 2.0;
-    let band = R { x: wheel.x + 8, y: center as i32 - 22, w: wheel.w - 16, h: 44 };
-    surface(ctx, band, 9.0, c(palette.accent_light), c(palette.accent_line));
-    if picker.dragging() { ctx.stroke_round(band, 9.0, c(palette.accent), 2.0); }
+    let band = R { x: wheel.x + 4, y: center as i32 - 19, w: wheel.w - 8, h: 38 };
+    ctx.fill_round(band, 5.0, c(palette.accent_light));
+    if picker.dragging() { ctx.stroke_round(band, 5.0, c(palette.accent_line), 1.0); }
     let nearest = picker.position.round() as i32;
     // Only five nearby rows are painted, independent of the deck's page count.
     for page in nearest.saturating_sub(3).max(1)..=nearest.saturating_add(3).min(picker.total) {
         let distance = page as f64 - picker.position;
         if distance.abs() > 2.2 { continue; }
-        let size = (30.0 - 7.0 * distance.abs()).max(17.0) as f32;
-        // Size and the selection band supply depth; keep neighbouring page
-        // numbers readable in a classroom instead of fading them almost away.
-        let opacity = (1.0 - distance.abs() / 10.0).clamp(0.80, 1.0) as f32;
-        let ink = palette.text;
+        let size = (24.0 - 7.0 * distance.abs()).max(15.0) as f32;
+        if (distance * crate::page_picker::ROW).abs() + f64::from(size) / 2.0 > f64::from(wheel.h) / 2.0 { continue; }
+        let ink = theme::mix(palette.text, palette.muted, distance.abs().min(1.0) as f32);
         let text = page.to_string();
-        let fit = size * ((wheel.w - 36) as f32 / fonts.text_width(&text, size).max(1.0)).min(1.0);
+        let fit = size * ((wheel.w - 12).max(1) as f32 / fonts.text_width(&text, size).max(1.0)).min(1.0);
         let x = wheel.x as f32 + (wheel.w as f32 - fonts.text_width(&text, fit)) / 2.0;
         ctx.text(fonts, &text, x, (center + distance * crate::page_picker::ROW) as f32 + fit * 0.35,
-            fit, alpha(ink, (opacity * 255.0) as u8));
+            fit, c(ink));
     }
     for (hit, title, selected) in [
-        (PagePickerHit::Cancel, "取消".to_string(), false),
-        (PagePickerHit::Jump, format!("跳至第 {} 页", picker.selected()), true),
+        (PagePickerHit::Cancel, "取消", false),
+        (PagePickerHit::Jump, "跳转", true),
     ] {
         let r = page_picker_control_rect(app, hit);
-        surface(ctx, r, 10.0, c(if selected { palette.accent } else { palette.paper }), c(palette.accent_line));
-        let size = 18.0 * ((r.w - 12) as f32 / fonts.text_width(&title, 18.0).max(1.0)).min(1.0);
-        ctx.text_center(fonts, r, &title, size, c(if selected { palette.on_accent } else { palette.text }));
+        button_surface(app, ctx, Control::PagePicker(hit), r, 7.0, c(if selected { palette.accent } else { palette.paper }),
+            c(if selected { palette.accent } else { palette.control_border() }));
+        ctx.text_center(fonts, r, title, 15.0, c(if selected { palette.on_accent } else { palette.text }));
     }
 }
 
-fn draw_pen_popup(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
-    let palette = ctx.palette;
-    let p = pen_popup_rect(app);
-    let t = anim_t(app);
-    panel(ctx, p, 16.0, t);
-    if t < 0.02 { return; }
-    ctx.text(fonts, "画笔颜色", (p.x + 16) as f32, (p.y + 32) as f32, 21.0, c(palette.text));
-    icons::draw(ctx, Glyph::Pen, (p.x + p.w - 42) as f32, (p.y + 12) as f32, 24.0, c(palette.text), app.pen_color());
-    let start_y = p.y + 46;
-    for i in 0..10usize {
-        let (r, g, b) = crate::app::COLORS[i];
-        let cx = (p.x + 16 + (i % 4) as i32 * 48 + 19) as f32;
-        let cy = (start_y + (i / 4) as i32 * 48 + 19) as f32;
-        ctx.fill_circle(cx, cy, 16.0, color(r, g, b, 255));
-        ctx.stroke_round(R { x: cx as i32 - 16, y: cy as i32 - 16, w: 32, h: 32 },
-            16.0, alpha(palette.text, 55), 1.0);
-        if i == app.cur_color {
-            ctx.stroke_round(R { x: cx as i32 - 19, y: cy as i32 - 19, w: 38, h: 38 },
-                19.0, c(palette.accent), 2.0);
-            let check = theme::on_color(color(r, g, b, 255));
-            icons::draw(ctx, Glyph::Check, cx - 10.0, cy - 10.0, 20.0, check, check);
-        }
-    }
-    let names = ["红色", "蓝色", "绿色", "黄色", "白色", "青色", "紫色", "黄绿", "橙色", "黑色"];
-    ctx.text(fonts, "当前颜色", (p.x + 124) as f32, (p.y + 156) as f32, 15.0, c(palette.muted));
-    ctx.text(fonts, names[app.cur_color.min(9)], (p.x + 124) as f32, (p.y + 177) as f32, 20.0, c(palette.text));
-    let sy = p.y + 214;
-    ctx.text(fonts, "画笔粗细", (p.x + 16) as f32, (sy - 14) as f32, 19.0, c(palette.muted));
-    let tiers = crate::app::PEN_SIZES.len();
-    let bw = tier_button_width(p.w, tiers);
-    for i in 0..tiers {
-        let r = R { x: p.x + 16 + i as i32 * (bw + 10), y: sy, w: bw, h: 48 };
-        choice(ctx, r, i == app.cur_pen);
-        let label = crate::app::PEN_SIZES[i].to_string();
-        ctx.text_center(fonts, R { h: 28, ..r }, &label, 18.0, c(palette.text));
-        let a = ((r.x + r.w / 2 - 12) as f32, (r.y + 36) as f32);
-        let b = ((r.x + r.w / 2 + 12) as f32, (r.y + 36) as f32);
-        let width = crate::app::PEN_SIZES[i] as f32;
-        if app.cur_color == 4 { ctx.stroke_line(a, b, c(palette.border), width + 2.0); }
-        ctx.stroke_line(a, b, app.pen_color(), width);
-    }
-}
-
-fn draw_eraser_popup(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
-    let palette = ctx.palette;
-    let p = eraser_popup_rect(app);
-    let t = anim_t(app);
-    panel(ctx, p, 16.0, t);
-    if t < 0.02 { return; }
-    ctx.text(fonts, "橡皮大小", (p.x + 16) as f32, (p.y + 32) as f32, 21.0, c(palette.text));
-    let size = 20.0 + crate::app::ERASER_SIZES[app.cur_eraser.min(crate::app::ERASER_SIZES.len() - 1)] as f32 * 0.15;
-    icons::draw(ctx, Glyph::Eraser, p.x as f32 + p.w as f32 - 30.0 - size / 2.0,
-        p.y as f32 + 24.0 - size / 2.0, size, c(palette.text), c(palette.eraser));
-    let tiers = crate::app::ERASER_SIZES.len();
-    let bw = tier_button_width(p.w, tiers);
-    for i in 0..tiers {
-        let r = R { x: p.x + 16 + i as i32 * (bw + 10), y: p.y + 46, w: bw, h: 48 };
-        choice(ctx, r, i == app.cur_eraser);
-        let size = 16.0 + crate::app::ERASER_SIZES[i] as f32 * 0.16;
-        icons::draw(ctx, Glyph::Eraser, r.x as f32 + 19.0 - size / 2.0, r.y as f32 + 24.0 - size / 2.0,
-            size, c(palette.text), c(palette.eraser));
-        let label = crate::app::ERASER_SIZES[i].to_string();
-        ctx.text_center(fonts, R { x: r.x + 33, w: r.w - 37, ..r }, &label, 18.0, c(palette.text));
-    }
-    let r = R { x: p.x + 16, y: p.y + 110, w: p.w - 32, h: 48 };
-    surface(ctx, r, 10.0, c(palette.danger_light), alpha(palette.danger, 75));
-    ctx.text_center(fonts, r, "清空当前页", 20.0, c(palette.danger));
+fn draw_thumbnail(ctx: &mut Ctx, bounds: R, pm: &Pixmap) {
+    let scale = (bounds.w as f32 / pm.width() as f32).min(bounds.h as f32 / pm.height() as f32);
+    let x = bounds.x as f32 + (bounds.w as f32 - pm.width() as f32 * scale) / 2.0;
+    let y = bounds.y as f32 + (bounds.h as f32 - pm.height() as f32 * scale) / 2.0;
+    ctx.pm.draw_pixmap(0, 0, pm.as_ref(),
+        &tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() },
+        ctx.tr.pre_translate(x, y).pre_scale(scale, scale), None);
 }
 
 
@@ -1976,8 +2151,7 @@ fn draw_coord_curve(ctx: &mut Ctx, coord: &crate::app::CoordGuide,
     }
 }
 
-fn draw_coord_foci(app: &App, fonts: &Fonts, ctx: &mut Ctx) {
-    let Some(coord) = app.coord.as_ref() else { return };
+fn draw_coord_foci(coord: &crate::app::CoordGuide, fonts: &Fonts, ctx: &mut Ctx) {
     if coord.conic == crate::app::ConicKind::None { return; }
     let palette = ctx.palette;
     let foci = crate::conic::foci(coord);
@@ -2056,6 +2230,203 @@ mod tests {
         App::new(pm, 2560, 1600)
     }
 
+    fn assert_press_fits_face(app: &mut App, fonts: &Fonts, control: Control, face: R, radius: f32) {
+        let tile = face.with_paint_margin();
+        let render = |app: &App| render_region(app, fonts, None, tile.x, tile.y, tile.w, tile.h).unwrap();
+        app.press = None;
+        let idle = render(app);
+        app.press = Some(PressFeedback::new(control));
+        let down = render(app);
+        let (tr, w, h) = region_origin(app, tile.x, tile.y, tile.x + tile.w, tile.y + tile.h);
+        let mut mask = Pixmap::new(w, h).unwrap();
+        surface(&mut Ctx { pm: &mut mask, tr, palette: app.palette() }, face, radius, Color::WHITE, Color::WHITE);
+        for ((a, b), m) in idle.pixels().iter().zip(down.pixels()).zip(mask.pixels()) {
+            if m.alpha() == 0 { assert_eq!(a, b, "{control:?} painted outside its face at {}×", app.scale); }
+        }
+        // A perpendicular cut through each straight side crosses the existing
+        // rim and the fill. Neither may leave a strip of the idle face visible.
+        let (x, y) = (face.x as f32, face.y as f32);
+        let (w, h) = (face.w as f32, face.h as f32);
+        for d in [0.5, 1.5, 2.5] {
+            for (px, py) in [(x+d, y+h/2.0), (x+w-d, y+h/2.0), (x+w/2.0, y+d), (x+w/2.0, y+h-d)] {
+                let (i, j) = ((px*tr.sx + tr.tx).floor() as u32, (py*tr.sy + tr.ty).floor() as u32);
+                assert_ne!(idle.pixel(i, j), down.pixel(i, j), "{control:?} missed ({px}, {py}) at {}×", app.scale);
+            }
+        }
+        app.press = None;
+    }
+
+    #[test]
+    fn toolbar_press_fits_the_key_thumb_badge_and_menu_faces() {
+        let fonts = Fonts::load();
+        let mut app = App::new(Pixmap::new(900, 720).unwrap(), 900, 720);
+        app.whiteboard = true;
+        for preference in [theme::Preference::Light, theme::Preference::Dark] {
+            app.theme.preference = preference;
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                app.set_scale(scale);
+                for right in [false, true] {
+                    app.popup_on_right = right;
+                    let next = Control::Sidebar(Btn::Next, right);
+                    let key = control_rect(&app, next).unwrap();
+                    assert_press_fits_face(&mut app, &fonts, next, key, (key.w as f32 * 0.17).min(9.0));
+                    let badge = page_counter_face(&app, sidebar_page_rect(&app, right));
+                    assert_press_fits_face(&mut app, &fonts, Control::PageCount(right), badge, 6.0);
+                    let track = tool_track_rect(&app, right);
+                    let size = track.w - 2 * TOOL_TRACK_INSET;
+                    let thumb = R { x: track.x + TOOL_TRACK_INSET, y: track.y + TOOL_TRACK_INSET, w: size, h: size };
+                    assert_press_fits_face(&mut app, &fonts, Control::Sidebar(Btn::Cursor, right), thumb, (size as f32 * 0.42).round());
+                    app.eraser_popup_visible = true;
+                    let clear = Control::Popup(PopupHit::ClearAll);
+                    let face = control_rect(&app, clear).unwrap();
+                    assert_press_fits_face(&mut app, &fonts, clear, face, 9.0);
+                    app.eraser_popup_visible = false;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn collapsed_tab_countdown_drains_one_continuous_rim_in_both_themes() {
+        let fonts = Fonts::load();
+        let mut app = App::new(Pixmap::new(640, 360).unwrap(), 640, 360);
+        app.set_sidebar_collapsed(true);
+        app.sidebar_anim_start = None;
+        for (preference, accent) in [
+            (theme::Preference::Light, theme::Accent::Teal),
+            (theme::Preference::Dark, theme::Accent::Teal),
+            (theme::Preference::Light, theme::Accent::Custom(0xDDD7EF)),
+            (theme::Preference::Dark, theme::Accent::Custom(0x453B54)),
+        ] {
+            app.theme.preference = preference;
+            app.theme.accent = accent;
+            let accent_rgb = app.palette().accent;
+            let ink = c(accent_rgb).to_color_u8().premultiply();
+            for scale in [1.0, 1.25, 2.0] {
+                app.set_scale(scale);
+                for right in [false, true] {
+                    let face = sidebar_tab_face(&app, right);
+                    let mut frame = |level| {
+                        app.sidebar_countdown = level;
+                        render_region(&app, &fonts, None, face.x, face.y, face.w, face.h).unwrap()
+                    };
+                    let empty = frame(0);
+                    let half = frame(128);
+                    let full = frame(255);
+                    let changed = |a: &Pixmap, b: &Pixmap| a.pixels().iter().zip(b.pixels()).filter(|(p, q)| p != q).count();
+                    let total = changed(&full, &empty);
+                    let remaining = changed(&half, &empty);
+                    assert!(total > 80 && remaining > total * 4 / 10 && remaining < total * 6 / 10);
+                    let y = full.height() / 2;
+                    let solid_band = (0..full.width() / 4).filter(|&x| full.pixel(x, y) == Some(ink)).count();
+                    assert!(solid_band >= (2.0 * scale).floor() as usize);
+                    let track = empty.pixel(scale.round() as u32, y).unwrap();
+                    assert!(theme::contrast(accent_rgb, u32::from_be_bytes([0, track.red(), track.green(), track.blue()])) >= 3.0);
+                    if scale == 1.0 {
+                        for edge in [0, full.height() - 1] {
+                            let flat = (0..full.width()).filter(|&x| full.pixel(x, edge) == Some(ink)).count();
+                            assert!(flat >= full.width() as usize / 2);
+                            assert_eq!(full.pixel(0, edge).unwrap().alpha(), 0);
+                        }
+                    }
+                    // Half the time left lights the edge facing the middle of the screen.
+                    for x in 0..full.width() {
+                        let inward = (x < full.width() / 2) == right;
+                        let reference = if inward { &full } else { &empty };
+                        assert_eq!(half.pixel(x, y), reference.pixel(x, y));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn collapsed_tabs_mirror_the_whole_countdown_at_fractional_scales() {
+        let fonts = Fonts::load();
+        let mut app = App::new(Pixmap::new(641, 360).unwrap(), 641, 360);
+        app.set_sidebar_collapsed(true);
+        app.sidebar_anim_start = None;
+        for (scale, toolbar_scale) in [(1.0, 1.0), (1.25, 0.6), (1.25, 1.0), (1.5, 1.4), (2.0, 1.0)] {
+            app.set_scale(scale);
+            app.sb_scale = toolbar_scale;
+            for level in [0, 32, 64, 128, 192, 224, 255] {
+                app.sidebar_countdown = level;
+                let [left, right] = [false, true].map(|side| {
+                    let r = sidebar_tab_rect(&app, side);
+                    let x = if side { app.screen_w - 64 } else { 0 };
+                    render_region(&app, &fonts, None, x, r.y, 64, r.h).unwrap()
+                });
+                assert_eq!((left.width(), left.height()), (right.width(), right.height()));
+                let stride = left.width() as usize * 4;
+                for (l, r) in left.data().chunks_exact(stride).zip(right.data().chunks_exact(stride)) {
+                    assert!(l.chunks_exact(4).eq(r.chunks_exact(4).rev()), "scale {scale}, countdown {level}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn toolbar_thumb_only_divides_idle_tools_and_shows_the_touch_on_its_own_side() {
+        let fonts = Fonts::load();
+        let mut app = App::new(Pixmap::new(900, 720).unwrap(), 900, 720);
+        app.drawing_tools.set_expanded(true);
+        app.drawing_tools.settle();
+        for side in [false, true] {
+            let track = tool_track_rect(&app, side);
+            let segments = tool_segments(&app, side);
+            let rail = sidebar_rect(&app, side);
+            assert!(track.x - rail.x >= 6 && rail.x + rail.w - track.x - track.w >= 6);
+            let render = |app: &App| render_region(app, &fonts, None, track.x, track.y, track.w, track.h).unwrap();
+            for (i, (button, _)) in segments.iter().enumerate() {
+                app.mode = i as i32;
+                app.press = None;
+                let rest = render(&app);
+                for (gap, (_, slot)) in segments[1..].iter().enumerate() {
+                    let x = (track.w / 2) as u32;
+                    let y = (slot.y - 3 - track.y) as u32;
+                    assert_eq!(rest.pixel(x, y) != rest.pixel(x, y - 1), i != gap && i != gap + 1);
+                }
+                app.press = Some(PressFeedback::new(Control::Sidebar(*button, !side)));
+                assert_eq!(render(&app).data(), rest.data());
+                app.press = Some(PressFeedback::new(Control::Sidebar(*button, side)));
+                assert_ne!(render(&app).data(), rest.data());
+                app.press.as_mut().unwrap().release();
+                assert_ne!(render(&app).data(), rest.data());
+            }
+            app.mode = 0;
+            app.tool_selector.begin(Btn::Cursor, side, 0, 0);
+            app.tool_selector.motion(70, Some((Btn::Pen, 1.4)));
+            app.press = None;
+            let moving = render(&app);
+            app.press = Some(PressFeedback::new(Control::Sidebar(Btn::Cursor, side)));
+            let pressed = render(&app);
+            let cursor_end = (segments[0].1.y + segments[0].1.h - track.y) as usize * moving.width() as usize * 4;
+            assert_eq!(&moving.data()[..cursor_end], &pressed.data()[..cursor_end]);
+            assert!(moving.data()[cursor_end..] != pressed.data()[cursor_end..]);
+            app.tool_selector.cancel_press();
+            app.press = None;
+            let hit = sidebar_page_rect(&app, side);
+            let face = page_counter_face(&app, hit);
+            assert_eq!(face.h, 28);
+            assert!(hit.h > face.h && hit.y + hit.h / 2 == face.y + face.h / 2);
+        }
+    }
+
+    #[test]
+    fn toolbar_icon_mode_hides_the_screenshot_caption_and_keeps_esc() {
+        let fonts = Fonts::load();
+        let mut app = App::new(Pixmap::new(900, 720).unwrap(), 900, 720);
+        let render = |app: &App, button| {
+            let r = control_rect(app, Control::Sidebar(button, false)).unwrap();
+            render_region(app, &fonts, None, r.x, r.y, r.w, r.h).unwrap()
+        };
+        let esc = render(&app, Btn::Exit);
+        let screenshot = render(&app, Btn::Screenshot);
+        app.toolbar_icons_only = true;
+        assert!(esc.data() == render(&app, Btn::Exit).data());
+        assert!(screenshot.data() != render(&app, Btn::Screenshot).data());
+    }
+
     #[test]
     fn small_settings_reach_every_control_without_overlap_or_offscreen_targets() {
         for (w, h) in [(320, 240), (360, 640), (480, 270), (640, 360), (980, 512),
@@ -2091,7 +2462,7 @@ mod tests {
                     }
                 }
                 }
-                for expected in [SetHit::Autostart,
+                for expected in [SetHit::Autostart, SetHit::ToolbarIconsOnly, SetHit::FadeToolbarDuringShow,
                     SetHit::WpsRemove, SetHit::WpsRegister, SetHit::ProcessBlock, SetHit::ThemeAccent,
                     SetHit::Logs, SetHit::SysInfo, SetHit::License, SetHit::Repository, SetHit::Quit, SetHit::Done] {
                     assert!(reached.contains(&expected), "unreachable {expected:?} at {w}x{h}");
@@ -2109,12 +2480,16 @@ mod tests {
     #[test]
     fn settings_page_clamps_after_resize() {
         let mut a = App::new(Pixmap::new(640, 360).unwrap(), 640, 360);
+        a.settings_ui.tab = crate::settings_state::Tab::Appearance;
         a.settings_page = usize::MAX;
-        assert!(settings_layout(&a).page < settings_layout(&a).pages);
-        assert!(settings_controls(&a).iter().any(|(hit, _)| *hit == SetHit::ResetSlider(SliderId::Position)));
+        let compact = settings_layout(&a);
+        assert!(compact.pages > 1);
+        assert_eq!(compact.page + 1, compact.pages);
+        assert!(settings_controls(&a).iter().any(|(hit, _)| *hit == SetHit::ToolbarIconsOnly));
         a.screen_h = 1080;
         assert_eq!(settings_layout(&a).page, 0);
         assert_eq!(settings_layout(&a).pages, 1);
+        assert!(settings_controls(&a).iter().any(|(hit, _)| *hit == SetHit::ResetSlider(SliderId::Position)));
     }
 
     #[test]
@@ -2260,7 +2635,8 @@ mod tests {
                 a.settings_ui.theme_from = None;
                 let r = launch_rect(&a);
                 let pixels = render_region(&a, &fonts, None, r.x, r.y, r.w, r.h).unwrap();
-                assert_eq!(pixels.pixel((4.0 * scale) as u32, pixels.height() / 2).unwrap(),
+                // The upper two thirds now contain the shared artwork.
+                assert_eq!(pixels.pixel((4.0 * scale) as u32, pixels.height() * 4 / 5).unwrap(),
                     c(a.theme.palette().paper).to_color_u8().premultiply());
                 assert!(a.launch.card.borrow().is_some());
             }

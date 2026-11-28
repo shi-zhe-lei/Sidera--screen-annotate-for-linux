@@ -840,6 +840,7 @@ pub struct X11Plat {
     input_refresh_pending: Cell<bool>,
     text_keyboard_grabbed: Cell<bool>,
     key_injector: RefCell<Option<crate::uinput::KeyInjector>>,
+    scroll_rail: RefCell<crate::gnome::scroll::CompatRail>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -905,9 +906,29 @@ impl X11Plat {
             input_refresh_pending: Cell::new(false),
             text_keyboard_grabbed: Cell::new(false),
             key_injector,
+            scroll_rail: Default::default(),
         };
         plat.raise_overlays()?;
         Ok(plat)
+    }
+
+    pub fn poll_document_scroll(&self, rt: &crate::Rt, app: &mut crate::app::App,
+        ip: &mut crate::Ip, wps: Option<&crate::wps::WpsBridge>) {
+        if !self.refresh_input_regions { return; }
+        use crate::gnome::scroll::Contact;
+        let size = crate::backend::Backend::screen_size(self);
+        let events = self.scroll_rail.borrow_mut().poll(size);
+        for event in events {
+            let dragging = matches!(ip.pending_ui, Some(crate::ui::Control::DocumentScroll(_)));
+            match event {
+                Contact::Down(x,y) if matches!(crate::ui::control_at(app,x,y),Some(crate::ui::Control::DocumentScroll(_))) =>
+                    crate::on_press(rt,app,ip,wps,x,y,1),
+                Contact::Move(x,y) if dragging => crate::on_motion(rt,app,ip,x,y),
+                Contact::Up(x,y) if dragging => crate::on_release(rt,app,ip,wps,x,y,1),
+                Contact::Cancel if dragging => crate::cancel_input(rt,app,ip),
+                _ => {}
+            }
+        }
     }
 
     pub fn sync_geometry(&self) -> XResult<Option<(i32, i32, f64)>> {
@@ -1108,6 +1129,12 @@ fn fp_value(mask: &[u32], values: &[Fp3232], idx: u16) -> Option<f64> {
 }
 
 impl crate::backend::Backend for X11Plat {
+    fn set_scroll_rails(&self, rails: Option<[[i32; 4]; 2]>) {
+        if self.refresh_input_regions { self.scroll_rail.borrow_mut().geometry(rails); }
+    }
+    fn document_scroll_target(&self) -> Option<Box<dyn crate::document_scroll::ScrollTarget>> {
+        self.scroll_rail.borrow().target().or_else(|| Some(Box::new(crate::linux_scroll::Document::open())))
+    }
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -1144,10 +1171,18 @@ impl crate::backend::Backend for X11Plat {
         }) {
             return;
         }
+        // A pen tap expands the input shape from the rails to the canvas.
+        // If the pointer is already on this window, Mutter has the right
+        // target. Unmapping it here can drop the next press of a double tap.
+        let keep_target = full && self.refresh_input_regions && !self.input_refresh_pending.get()
+            && self.input_region.borrow().is_some()
+            && xproto::query_pointer(&self.x11.conn, self.x11.root).ok()
+                .and_then(|query| query.reply().ok())
+                .is_some_and(|pointer| pointer.same_screen && pointer.child == self.win);
         match self.x11.set_input_shape(self.win, &region.1, full) {
             Ok(()) => {
                 *self.input_region.borrow_mut() = Some(region);
-                self.input_refresh_pending.set(self.refresh_input_regions);
+                self.input_refresh_pending.set(self.refresh_input_regions && !keep_target);
             }
             Err(error) => log::warn!("[WARN] 更新 X11 点击区域失败: {error}"),
         }

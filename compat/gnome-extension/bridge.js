@@ -121,7 +121,7 @@ export class Peer {
     }
 }
 
-export function listen(onConnection) {
+export function listen(onConnection, filename = 'bridge.sock') {
     const directory = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'sidera-gnome']);
     GLib.mkdir_with_parents(directory, 0o700);
     const root = Gio.File.new_for_path(directory);
@@ -130,7 +130,7 @@ export function listen(onConnection) {
     if (info.get_file_type() !== Gio.FileType.DIRECTORY || info.get_attribute_uint32('unix::uid') !== uid)
         throw new Error('Unsafe Sidera runtime directory');
     root.set_attribute_uint32('unix::mode', 0o700, Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
-    const path = GLib.build_filenamev([directory, 'bridge.sock']);
+    const path = GLib.build_filenamev([directory, filename]);
     const file = Gio.File.new_for_path(path);
     try { file.delete(null); } catch (e) {
         if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)) throw e;

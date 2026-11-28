@@ -55,23 +55,38 @@ fn snapshot_len(snapshot: &Snapshot) -> usize {
 }
 pub struct PageCache {
     pages: BTreeMap<i32, Snapshot>,
+    // Only the ten-page whiteboard keeps reduced ink alongside its lossless snapshots.
+    previews: Option<BTreeMap<i32, Pixmap>>,
     directory: Option<PathBuf>,
     budget: usize,
 }
 impl Default for PageCache {
-    fn default() -> Self { Self { pages: BTreeMap::new(), directory: None, budget: 32 * 1024 * 1024 } }
+    fn default() -> Self { Self { pages: BTreeMap::new(), previews: None, directory: None, budget: 32 * 1024 * 1024 } }
 }
 impl PageCache {
+    pub fn with_previews() -> Self {
+        let mut cache = Self::default();
+        cache.previews = Some(BTreeMap::new());
+        cache
+    }
+    pub fn preview(&self, page: i32) -> Option<&Pixmap> {
+        self.previews.as_ref()?.get(&page)
+    }
     pub fn contains_key(&self, page: &i32) -> bool { self.pages.contains_key(page) }
     #[cfg(test)]
     pub fn is_empty(&self) -> bool { self.pages.is_empty() }
     pub fn remove(&mut self, page: &i32) {
+        if let Some(image) = self.previews.as_mut().and_then(|p| p.remove(page)) {
+            account_sub(image.data().len());
+        }
         if let Some(snapshot) = self.pages.remove(page) {
             account_sub(snapshot_len(&snapshot));
             if let Snapshot::File(path) = snapshot { let _ = fs::remove_file(path); }
         }
     }
     pub fn clear(&mut self) {
+        account_sub(self.preview_bytes());
+        if let Some(previews) = &mut self.previews { previews.clear(); }
         for snapshot in self.pages.values() {
             account_sub(snapshot_len(snapshot));
             if let Snapshot::File(path) = snapshot { let _ = fs::remove_file(path); }
@@ -87,7 +102,11 @@ impl PageCache {
         if result.is_none() { log::error!("无法读取第 {page} 页笔迹缓存"); }
         result
     }
+    fn preview_bytes(&self) -> usize {
+        self.previews.iter().flat_map(|pages| pages.values()).map(|image| image.data().len()).sum()
+    }
     pub fn insert(&mut self, page: i32, pixmap: Pixmap) {
+        let preview = self.previews.as_ref().and_then(|_| ink_preview(&pixmap));
         let mut data = Vec::new();
         // Encode the premultiplied bytes verbatim, unlike exported PNGs; restore
         // them verbatim too, so translucent strokes do not change after paging.
@@ -99,9 +118,13 @@ impl PageCache {
         };
         let new_len = snapshot_len(&snapshot);
         self.remove(&page);
+        if let (Some(previews), Some(preview)) = (&mut self.previews, preview) {
+            account_add(preview.data().len());
+            previews.insert(page, preview);
+        }
         self.pages.insert(page, snapshot);
         account_add(new_len);
-        let mut bytes: usize = self.pages.values().map(snapshot_len).sum();
+        let mut bytes = self.pages.values().map(snapshot_len).sum::<usize>() + self.preview_bytes();
         if !should_spill(bytes, self.budget, live_bytes(), global_budget()) { return; }
         let directory = match self.directory() {
             Ok(path) => path,
@@ -140,6 +163,26 @@ impl PageCache {
         Err(std::io::Error::other("无法创建独立缓存目录"))
     }
 }
+/// Area-average premultiplied ink so thin strokes survive on a classroom-size canvas.
+pub(crate) fn ink_preview(source: &Pixmap) -> Option<Pixmap> {
+    let size = preview_size(source.width(), source.height(), 456, 256);
+    reduced_ink(source, size)
+}
+
+pub(crate) fn reduced_ink(source: &Pixmap, size: IntSize) -> Option<Pixmap> {
+    if size.width() == source.width() && size.height() == source.height() { return Some(source.clone()); }
+    let image = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
+        source.width(), source.height(), source.data())?;
+    let small = image::imageops::thumbnail(&image, size.width(), size.height());
+    Pixmap::from_vec(small.into_raw(), size)
+}
+
+pub(crate) fn preview_size(width: u32, height: u32, max_w: u32, max_h: u32) -> IntSize {
+    let scale = (max_w as f64 / width as f64).min(max_h as f64 / height as f64).min(1.0);
+    IntSize::from_wh((width as f64 * scale).round().max(1.0) as u32,
+                     (height as f64 * scale).round().max(1.0) as u32).unwrap()
+}
+
 fn decode(data: &[u8]) -> Option<Pixmap> {
     let image = image::load_from_memory_with_format(data, image::ImageFormat::Png).ok()?.into_rgba8();
     let size = IntSize::from_wh(image.width(), image.height())?;
@@ -155,6 +198,33 @@ impl Drop for PageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn whiteboard_previews_keep_fine_ink_across_spill_replace_and_remove() {
+        let mut cache = PageCache::with_previews();
+        cache.budget = 1; // Force the full snapshot to disk.
+        let mut ink = Pixmap::new(1920, 1080).unwrap();
+        for row in ink.data_mut().chunks_exact_mut(1920 * 4) {
+            row[903 * 4..904 * 4].copy_from_slice(&[96, 0, 0, 96]);
+        }
+        cache.insert(4, ink);
+        assert!(matches!(cache.pages.get(&4), Some(Snapshot::File(_))));
+        let preview = cache.preview(4).unwrap();
+        assert!(preview.width() <= 456 && preview.height() <= 256);
+        let middle = preview.height() / 2;
+        assert!((0..preview.width()).any(|x| {
+            let ink = preview.pixel(x, middle).unwrap();
+            ink.alpha() > 0 && ink.alpha() < 96 && ink.red() == ink.alpha()
+        }));
+        cache.insert(4, Pixmap::new(17, 23).unwrap());
+        assert_eq!(cache.preview(4).unwrap().width(), 17);
+        assert!(cache.preview(4).unwrap().pixels().iter().all(|p| p.alpha() == 0));
+        cache.remove(&4);
+        assert!(cache.preview(4).is_none());
+        cache.insert(1, Pixmap::new(10, 10).unwrap());
+        cache.clear();
+        assert!(cache.preview(1).is_none());
+    }
+
     #[test]
     fn more_than_twenty_pages_spill_restore_replace_and_clear_losslessly() {
         let mut cache = PageCache::default(); cache.budget = 512;

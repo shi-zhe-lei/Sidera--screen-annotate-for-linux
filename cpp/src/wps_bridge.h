@@ -50,6 +50,7 @@ private:
   QTimer*     ping_   = nullptr;
   QQueue<QPair<qint64, QString>> queue_;
   QElapsedTimer clock_;
+  QElapsedTimer missingPosition_;
   QMap<QString, quint64> sequences_;
   bool whiteboard_ = false;
   bool    connected_ = false;

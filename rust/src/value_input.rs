@@ -27,9 +27,9 @@ pub fn spec(app: &App, target: Target) -> Spec {
         Setting(SliderId::Scale)=>("工具栏大小",60.0,140.0,0,"%",app.sb_scale as f32*100.0),
         Setting(SliderId::Position)=>("工具栏垂直位置",0.0,100.0,0,"%",position(app)),
         Setting(SliderId::StartupDelay)=>("自动启动延迟",5.0,20.0,0,"秒",app.startup_delay as f32),
-        Setting(SliderId::AutoExpand)=>("自动展开时间",1.0,20.0,0,"分钟",app.sidebar_expand_minutes as f32),
-        Setting(SliderId::Threshold)=>("大触点阈值",20.0,260.0,0,"px",app.large_touch_threshold as f32),
-        Setting(SliderId::EraseScale)=>("大触点橡皮倍率",0.8,2.5,1,"×",app.large_erase_scale10 as f32/10.0),
+        Setting(SliderId::AutoExpand)=>("工具栏收起后自动展开",1.0,20.0,0,"分钟",app.sidebar_expand_minutes as f32),
+        Setting(SliderId::Threshold)=>("手掌擦除阈值",20.0,260.0,0,"px",app.large_touch_threshold as f32),
+        Setting(SliderId::EraseScale)=>("手掌擦除倍率",0.8,2.5,1,"×",app.large_erase_scale10 as f32/10.0),
         Page=>("跳转页码",1.0,app.page_picker.as_ref().map_or(1,|p|p.total) as f32,0,"页",app.page_picker.as_ref().map_or(1,|p|p.selected()) as f32),
         Hue=>("色相 H",0.0,360.0,1,"°",app.settings_ui.picker.as_ref().map_or(0.0,|p|p.hue*360.0)),
         Saturation=>("饱和度 S",0.0,100.0,1,"%",app.settings_ui.picker.as_ref().map_or(0.0,|p|p.saturation*100.0)),
@@ -55,7 +55,7 @@ impl Editor {
     fn clear_selection(&mut self) {if self.selected {self.text.clear();self.cursor=0;self.selected=false;}}
     pub fn insert(&mut self,text:&str) {
         if !text.chars().all(|ch| if self.target==Target::Hex {ch.is_ascii_hexdigit() || ch=='#'} else {ch.is_ascii_digit() || matches!(ch,'.'|'-'|'+')}) {
-            self.error="请输入数字或有效颜色代码".into();return;
+            self.error=if self.target==Target::Hex {"颜色代码只含 0–9 和 A–F"} else {"请输入数字"}.into();return;
         }
         let accepted:String=text.chars().take(16).collect();
         if accepted.is_empty() {return;}
@@ -82,12 +82,12 @@ pub fn parse(app:&App)->Result<f32,String> {
     let editor=app.settings_ui.editor.as_ref().ok_or("没有正在编辑的数值")?;
     if editor.target==Target::Hex {
         let text=editor.text.trim(); let hex=text.strip_prefix('#').unwrap_or(text);
-        if hex.len()!=6 {return Err("请输入 6 位颜色代码，例如 #287A70".into());}
-        return u32::from_str_radix(hex,16).map(|v|v as f32).map_err(|_|"颜色代码只能包含 0–9 和 A–F".into());
+        if hex.len()!=6 {return Err("需要 6 位颜色代码，如 #287A70".into());}
+        return u32::from_str_radix(hex,16).map(|v|v as f32).map_err(|_|"颜色代码只含 0–9 和 A–F".into());
     }
     let s=spec(app,editor.target);
     let value=editor.text.trim().parse::<f32>().ok().filter(|v|v.is_finite())
-        .ok_or_else(||"请输入有效数字".to_string())?;
+        .ok_or_else(||"请输入数字".to_string())?;
     if value<s.min || value>s.max {return Err(format!("请输入 {}–{} {}",s.min,s.max,s.unit));}
     let scale=10.0f32.powi(s.digits as i32);Ok((value*scale).round()/scale)
 }
@@ -108,8 +108,8 @@ pub fn message(app:&App,target:Target)->Option<String> {
     let editor=app.settings_ui.editor.as_ref().filter(|e|e.target==target)?;
     if !editor.error.is_empty(){return Some(editor.error.clone());}
     let s=spec(app,target);
-    Some(if target==Target::Hex {"6 位 HEX · Enter 确认，Esc 取消".into()}
-        else {format!("{}–{} {} · Enter 确认，Esc 取消",s.min,s.max,s.unit)})
+    Some(if target==Target::Hex {"如 #287A70　回车确认，Esc 取消".into()}
+        else {format!("{}–{} {}　回车确认，Esc 取消",s.min,s.max,s.unit)})
 }
 
 /// Values remain plain labels. Editing adds selection and a caret in the same place.

@@ -80,7 +80,7 @@ test('health check reports online only after a successful bridge response', asyn
   f.context.OnSaPing(); assert.equal(messages.length, 0);
   await f.fail(0); assert.match(messages[0], /未连接/);
   f.context.OnSaPing(); await f.answer(1, 'OK sidera');
-  assert.match(messages[1], /联动桥在线/);
+  assert.equal(messages[1], '已连接 Sidera');
   assert.equal(f.timeouts.size, 0);
 });
 

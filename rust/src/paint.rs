@@ -147,6 +147,7 @@ pub fn commit_stroke(app: &mut App) {
     let c = app.pen_color();
     let tf = Transform::from_scale(app.scale as f32, app.scale as f32);
     if let Some(p) = build_stroke_path(&app.stroke_pts) {
+        app.invalidate_board_preview();
         app.canvas.fill_path(&p, &solid(c, BlendMode::SourceOver), FillRule::Winding, tf, None);
         app.page_has_ink = true;
     }

@@ -10,13 +10,17 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 static BUSY: AtomicBool = AtomicBool::new(false);
 static TOKEN: AtomicU64 = AtomicU64::new(0);
 
-pub fn screenshot_nonblocking() {
+pub fn screenshot_nonblocking(saved: std::sync::Arc<AtomicBool>) {
     if BUSY.swap(true, Ordering::AcqRel) { return; }
-    std::thread::spawn(|| {
+    std::thread::spawn(move || {
         struct Reset;
         impl Drop for Reset { fn drop(&mut self) { BUSY.store(false, Ordering::Release); } }
         let _reset = Reset;
-        if let Err(error) = future::block_on(run()) { log::warn!("截图未完成：{error}"); }
+        match future::block_on(run()) {
+            Ok(true) => saved.store(true, Ordering::Relaxed),
+            Ok(false) => {}
+            Err(error) => log::warn!("截图未完成：{error}"),
+        }
     });
 }
 
@@ -29,7 +33,7 @@ fn local_file(uri: &str) -> Result<std::path::PathBuf, Error> {
     url.to_file_path().map_err(|_| "无效的截图文件路径".into())
 }
 
-async fn run() -> Result<(), Error> {
+async fn run() -> Result<bool, Error> {
     let conn = future::race(async { Ok::<_, Error>(zbus::Connection::session().await?) }, async {
         async_io::Timer::after(Duration::from_secs(5)).await;
         Err("无法连接桌面截图服务".into())
@@ -77,9 +81,9 @@ async fn run() -> Result<(), Error> {
         let bytes = std::fs::read(local_file(&uri)?)?;
         let image = image::load_from_memory(&bytes)?.to_rgba8();
         let (w, h) = image.dimensions();
-        crate::save_and_clipboard(image.into_raw(), w, h);
+        return Ok(crate::save_and_clipboard(image.into_raw(), w, h));
     }
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]

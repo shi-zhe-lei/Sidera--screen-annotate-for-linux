@@ -42,10 +42,11 @@ impl ClearHistory {
         if !self.available(page, whiteboard) {
             return None;
         }
-        let entry = self.entries.pop_back()?;
-        let snapshot = self.snapshots.get(&entry.key);
-        self.snapshots.remove(&entry.key);
-        snapshot
+        let key = self.entries.back()?.key;
+        let snapshot = self.snapshots.get(&key)?;
+        self.entries.pop_back();
+        self.snapshots.remove(&key);
+        Some(snapshot)
     }
 
     pub fn clear(&mut self) {

@@ -100,6 +100,7 @@ struct AppState {
 
   // 白板模式：透明可穿透画布 ↔ 不透明白板（全屏可输入）
   bool whiteboard = false;
+  bool cursorAfterWhiteboard = false;
   QPushButton* wbBtnL = nullptr;
   QPushButton* wbBtnR = nullptr;
   // 白板背景色索引（会话内记忆，重启回默认；0=墨绿 1=白，默认白）
@@ -301,4 +302,15 @@ void checkWpsState();
 void openSettings();
 void closeSettings();
 void showSystemInfo();
-void showSplashFor(QApplication& app);
+class StartupSplash final : public QWidget {
+public:
+  StartupSplash();
+  void reportReady();
+protected:
+  void paintEvent(QPaintEvent*) override;
+private:
+  QPixmap artwork, mark;
+  QString displayLine;
+  QElapsedTimer elapsed;
+  qint64 readyAt = -1;
+};

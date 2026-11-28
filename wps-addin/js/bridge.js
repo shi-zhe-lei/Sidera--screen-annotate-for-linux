@@ -25,13 +25,12 @@ function OnAddinLoad(ribbonUI) {
 }
 
 function OnSaPing() {
-    var st = bridgeState()
     var finished = false
     function finish(online) {
         if (finished) return
         finished = true
         clearTimeout(timer)
-        alert((online ? '批注联动桥在线' : '未连接批注联动桥，请先打开 Sidera') + '\npos=' + st.pos + ' click=' + st.click)
+        alert(online ? '已连接 Sidera' : '未连接，请先打开 Sidera。')
     }
     var timer = setTimeout(function () { finish(false) }, 3000)
     bridgeFetch('/hello?m=health-check', function () { finish(false) }, null,

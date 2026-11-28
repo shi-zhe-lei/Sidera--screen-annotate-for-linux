@@ -17,6 +17,8 @@ use crate::text::Fonts;
 
 const TILE: u32 = 256;
 type Batch = Vec<Vec<u8>>;
+#[path = "gnome_scroll.rs"]
+pub(crate) mod scroll;
 
 fn packet(kind: u8, bytes: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(bytes.len() + 5);
@@ -56,16 +58,22 @@ fn read_hello(stream: &mut UnixStream) -> Result<Value, Box<dyn std::error::Erro
 
 pub struct Prepared { stream: UnixStream, hello: Value }
 pub fn prepare() -> Result<Option<Prepared>, Box<dyn std::error::Error>> {
+    let Some(mut stream) = connect_socket("bridge.sock")? else { return Ok(None) };
+    let hello = read_hello(&mut stream)?;
+    Ok(Some(Prepared { stream, hello }))
+}
+
+fn connect_socket(name: &str) -> Result<Option<UnixStream>, Box<dyn std::error::Error>> {
     let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else { return Ok(None) };
     let directory = std::path::PathBuf::from(runtime).join("sidera-gnome");
-    let path = directory.join("bridge.sock");
+    let path = directory.join(name);
     if !path.exists() { return Ok(None); }
     let metadata = std::fs::symlink_metadata(&directory)?;
     let uid = unsafe { libc::geteuid() };
     if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
         return Err("GNOME 扩展通信目录权限无效".into());
     }
-    let mut stream = match UnixStream::connect(&path) {
+    let stream = match UnixStream::connect(&path) {
         Ok(s) => s,
         Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => return Ok(None),
         Err(e) => return Err(e.into()),
@@ -78,8 +86,7 @@ pub fn prepare() -> Result<Option<Prepared>, Box<dyn std::error::Error>> {
     }
     stream.set_read_timeout(Some(Duration::from_secs(4)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let hello = read_hello(&mut stream)?;
-    Ok(Some(Prepared { stream, hello }))
+    Ok(Some(stream))
 }
 
 #[derive(Clone)]
@@ -144,15 +151,18 @@ struct GnomePlat {
     monitor: RefCell<Monitor>, transport: Transport,
     back: RefCell<Pixmap>, dirty: RefCell<BTreeSet<(u32, u32)>>,
     input: RefCell<(Vec<IRect>, bool)>, input_dirty: Cell<bool>,
+    scroll_rails: Cell<Option<[[i32; 4]; 2]>>,
+    wheel: scroll::Gesture,
     commands: RefCell<VecDeque<Value>>, fullscreen: Cell<bool>,
     wps_presentation: Cell<bool>,
     keyboard: bool, hotkey: bool,
 }
 impl GnomePlat {
     fn new(monitor: Monitor, transport: Transport, capabilities: &Value) -> Self {
-        Self { monitor: RefCell::new(monitor), transport,
+        Self { monitor: RefCell::new(monitor), transport, wheel: Default::default(),
             back: RefCell::new(Pixmap::new(1, 1).unwrap()), dirty: RefCell::new(BTreeSet::new()),
             input: RefCell::new((Vec::new(), false)), input_dirty: Cell::new(true),
+            scroll_rails: Cell::new(None),
             commands: RefCell::new(VecDeque::new()), fullscreen: Cell::new(false),
             wps_presentation: Cell::new(false),
             keyboard: capabilities["keyboard"] == true, hotkey: capabilities["hotkey"] == true }
@@ -170,6 +180,7 @@ impl GnomePlat {
         self.input_dirty.set(true);
         self.commands.borrow_mut().clear();
         self.wps_presentation.set(false);
+        self.wheel.cancel();
     }
     fn command(&self, mut value: Value) {
         let m = self.monitor.borrow(); value["generation"] = json!(m.generation); value["index"] = json!(m.index);
@@ -200,6 +211,14 @@ impl Backend for GnomePlat {
         true
     }
     fn set_text_input(&self, on: bool) { self.command(json!({"type":"text_input", "enabled":on})); }
+    fn document_scroll_target(&self) -> Option<Box<dyn crate::document_scroll::ScrollTarget>> {
+        let m = self.monitor.borrow();
+        self.wheel.target(&self.transport, m.generation, m.index)
+            .or_else(|| Some(Box::new(crate::linux_scroll::Document::open())))
+    }
+    fn set_scroll_rails(&self, rails: Option<[[i32; 4]; 2]>) {
+        if self.scroll_rails.replace(rails) != rails { self.input_dirty.set(true); }
+    }
     fn set_input_region(&self, rects: &[IRect], full: bool) {
         let old = self.input.borrow();
         let equal = old.1 == full && old.0.len() == rects.len() && old.0.iter().zip(rects).all(|(a,b)|
@@ -250,7 +269,8 @@ impl Backend for GnomePlat {
         if self.input_dirty.get() {
             let input = self.input.borrow();
             let rects: Vec<_> = input.0.iter().map(|r| [r.x,r.y,r.w,r.h]).collect();
-            batch.push(control(&json!({"type":"input","generation":m.generation,"index":m.index,"full":input.1,"rects":rects})));
+            batch.push(control(&json!({"type":"input","generation":m.generation,"index":m.index,"full":input.1,
+                "rects":rects,"scrollRails":self.scroll_rails.get()})));
         }
         for command in self.commands.borrow().iter() { batch.push(control(command)); }
         drop(dirty);
@@ -290,20 +310,35 @@ pub fn run(prepared: Prepared, fonts: Fonts, icon: Option<Pixmap>, icon_big: Opt
             match kind {
                 "hello" => { generation = configure(&mut desktop,&transport,&value)?; continue; }
                 "toggle" => { desktop.toggle(); continue; }
-                "screenshot" => { log::info!("截图已保存并复制：{}", value["path"]); continue; }
+                "screenshot" => {
+                    if let Some(path) = value["path"].as_str().filter(|path| !path.is_empty()) {
+                        log::info!("截图已保存并复制：{path}");
+                        for output in desktop.outputs.values() {
+                            output.app.screenshot_feedback.saved.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    continue;
+                }
                 "error" => { log::warn!("GNOME 扩展：{}",value["message"]); continue; }
                 _ => (),
             }
             if value["generation"].as_u64() != Some(generation as u64) { continue; }
             if kind == "state" {
+                let wps_focused = value["wpsPresentation"] == true;
+                // The presentation tool is shared by all monitors, including the editor's monitor.
+                let wps_fullscreen = wps_focused && value["fullscreen"].as_i64().is_some_and(|m| m >= 0);
                 for output in desktop.outputs.values() {
                     let backend = output.rt.backend.as_any().downcast_ref::<GnomePlat>().unwrap();
-                    backend.fullscreen.set(value["fullscreen"].as_i64() == Some(backend.monitor.borrow().index as i64));
-                    backend.wps_presentation.set(value["wpsPresentation"] == true);
+                    backend.fullscreen.set(wps_fullscreen);
+                    backend.wps_presentation.set(wps_focused);
                 }
                 continue;
             }
             let Some(id) = value["id"].as_str() else { continue };
+            if let Some(output) = desktop.outputs.get(id) {
+                let backend = output.rt.backend.as_any().downcast_ref::<GnomePlat>().unwrap();
+                backend.wheel.receive(&value);
+            }
             let (x,y) = (value["x"].as_i64().unwrap_or(0).clamp(-32768,32768) as i32,
                 value["y"].as_i64().unwrap_or(0).clamp(-32768,32768) as i32);
             match kind {

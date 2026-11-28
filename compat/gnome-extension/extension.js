@@ -12,6 +12,7 @@ import {Peer, listen} from './bridge.js';
 import {chromeParameters} from './chrome.js';
 import {keyText} from './keyboard.js';
 import {isWpsPresentation} from './presentation.js';
+import {DocumentWheel} from './documentWheel.js';
 
 const TILE = 256;
 const MAX_PIXELS = 67108864;
@@ -45,8 +46,11 @@ class Output {
         this.buttons = new Set();
         this.touches = new Set();
         this.pointerGrab = null;
+        this.railPointerSource = 0;
         this.grabRevokedId = 0;
         this.rects = [];
+        this.scrollRails = [];
+        this.wheel = null;
         this.inputDirty = true;
         this.ready = false;
         this.textInputOn = false;
@@ -104,8 +108,11 @@ class Output {
         this.visibility();
     }
 
-    input(rects, full) {
+    input(rects, full, scrollRails) {
         if (!Array.isArray(rects) || rects.length > 32) throw new Error('Invalid input region');
+        this.scrollRails = Array.isArray(scrollRails) ? scrollRails.slice(0, 2).filter(r =>
+            Array.isArray(r) && r.length === 4 && r.every(Number.isFinite) && r[2] > 0 && r[3] > 0) : [];
+        if (!this.scrollRails.length) this.endWheel();
         const {width, height} = this.monitor;
         const bounded = [];
         for (const r of rects) {
@@ -125,6 +132,7 @@ class Output {
     }
 
     clearInput() {
+        this.stopRailPointer();
         this.releasePointer();
         const inputs = this.inputs;
         if (inputs.includes(global.stage.get_key_focus())) global.stage.set_key_focus(null);
@@ -200,6 +208,69 @@ class Output {
         grab.dismiss();
     }
 
+    stopRailPointer() {
+        if (this.railPointerSource) GLib.source_remove(this.railPointerSource);
+        this.railPointerSource = 0;
+    }
+
+    beginWheel(x, y, finger, device) {
+        if (this.wheel || !this.scrollRails.some(([rx, ry, w, h]) =>
+            x >= rx && x < rx + w && y >= ry && y < ry + h)) return 0;
+        this.wheel = new DocumentWheel(finger, device);
+        return this.wheel.id;
+    }
+
+    endWheel() {
+        this.wheel?.finish();
+        this.wheel = null;
+    }
+
+    wheelCommand(message) {
+        const wheel = this.wheel;
+        if (!wheel || message.gesture !== wheel.id) return;
+        if (!message.pixels) { wheel.finish(); return; }
+        if (!this.owner.active() || !wheel.scroll(this.owner.pointer, message.pixels)) {
+            this.owner.peer?.send({type: 'wheelFailed', id: this.monitor.id,
+                generation: this.owner.generation, gesture: wheel.id});
+            this.endWheel();
+        }
+    }
+
+    trackRailPointer(x, y) {
+        this.stopRailPointer();
+        const window = global.display.focus_window;
+        const header = {generation: this.owner.generation, id: this.monitor.id};
+        // Outside reactive Shell chrome the client may receive the remaining
+        // pointer events. Observe only this held primary drag, without taking
+        // the browser's keyboard focus or moving the system pointer.
+        this.railPointerSource = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 16, () => {
+            if (!this.owner.active() || global.display.focus_window !== window) {
+                this.railPointerSource = 0;
+                this.cancel();
+                return GLib.SOURCE_REMOVE;
+            }
+            const [sx, sy, mask] = global.get_pointer();
+            const [px, py] = this.wheel?.position(sx, sy) ?? [sx, sy];
+            const nx = Math.round(px - this.monitor.x), ny = Math.round(py - this.monitor.y);
+            if (!(mask & Clutter.ModifierType.BUTTON1_MASK) || !this.buttons.has(1)) {
+                const gesture = this.wheel?.finger === 'mouse' ? this.wheel.id : 0;
+                if (gesture) this.endWheel();
+                this.railPointerSource = 0;
+                if (this.buttons.delete(1))
+                    this.owner.peer?.send({...header, type: 'release', x: nx, y: ny, button: 1, gesture});
+                this.owner.later(() => this.applyInput());
+                return GLib.SOURCE_REMOVE;
+            }
+            if (nx !== x || ny !== y) {
+                const point = this.wheel?.deliveryPoint;
+                if (!this.wheel?.returnPoint && point && sx === point[0] && sy === point[1]) return GLib.SOURCE_CONTINUE;
+                x = nx; y = ny;
+                this.owner.peer?.send({...header, type: 'motion', x, y});
+            }
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
     event(actor, event) {
         if (this.destroyed || !this.owner.active()) {
             if (this.pointerGrab) this.cancel();
@@ -223,6 +294,10 @@ class Output {
         // Clutter supplies real touch events as well as optional emulated mouse
         // events. Processing both would draw and activate buttons twice.
         if (event.is_pointer_emulated?.()) return Clutter.EVENT_STOP;
+        // Only the held touch sequence or the primary-button tracker drives
+        // the thumb. A delivered wheel also causes virtual pointer crossings.
+        if (this.wheel && [Clutter.EventType.MOTION, Clutter.EventType.ENTER, Clutter.EventType.LEAVE].includes(kind))
+            return Clutter.EVENT_STOP;
         if (kind === Clutter.EventType.MOTION) this.reconcileButtons(event.get_state());
         const [sx, sy] = event.get_coords();
         const x = Math.round(sx - this.monitor.x), y = Math.round(sy - this.monitor.y);
@@ -246,13 +321,28 @@ class Output {
             value.type = 'scroll'; value.delta = Math.max(-8, Math.min(8, delta));
             break;
         }
-        case Clutter.EventType.BUTTON_PRESS:
+        case Clutter.EventType.BUTTON_PRESS: {
             value.type = 'press'; value.button = event.get_button();
             this.buttons.add(value.button);
-            if ([1, 3].includes(value.button) && !this.grabPointer(actor)) return Clutter.EVENT_STOP;
+            // A stage grab also takes keyboard focus away from the web page.
+            const rail = value.button === 1 && this.scrollRails.some(([rx, ry, w, h]) =>
+                x >= rx && x < rx + w && y >= ry && y < ry + h);
+            if (rail) {
+                value.gesture = this.beginWheel(x, y, 'mouse', event.get_source_device());
+                this.trackRailPointer(x, y);
+            }
+            else if ([1, 3].includes(value.button) && !this.grabPointer(actor)) return Clutter.EVENT_STOP;
             break;
+        }
         case Clutter.EventType.BUTTON_RELEASE:
             value.type = 'release'; value.button = event.get_button();
+            if (value.button === 1) {
+                if (this.wheel?.finger === 'mouse') {
+                    value.gesture = this.wheel.id;
+                    this.endWheel();
+                }
+                this.stopRailPointer();
+            }
             this.buttons.delete(value.button);
             if (!this.buttons.size) this.releasePointer();
             break;
@@ -265,8 +355,17 @@ class Output {
             value.kind = kind === Clutter.EventType.TOUCH_BEGIN ? 'begin' :
                 kind === Clutter.EventType.TOUCH_UPDATE ? 'update' :
                     kind === Clutter.EventType.TOUCH_END ? 'end' : 'cancel';
-            if (value.kind === 'begin') this.touches.add(touch);
-            if (value.kind === 'end' || value.kind === 'cancel') this.touches.delete(touch);
+            if (value.kind === 'begin') {
+                this.touches.add(touch);
+                value.gesture = this.beginWheel(x, y, touch, event.get_source_device());
+            }
+            if (value.kind === 'end' || value.kind === 'cancel') {
+                if (this.wheel?.finger === touch) {
+                    value.gesture = this.wheel.id;
+                    this.endWheel();
+                }
+                this.touches.delete(touch);
+            }
             break;
         }
         default: return Clutter.EVENT_PROPAGATE;
@@ -302,6 +401,7 @@ class Output {
     }
 
     cancel() {
+        this.endWheel();
         this.buttons.clear(); this.touches.clear();
         this.owner.peer?.send({type: 'cancel', id: this.monitor.id, generation: this.owner.generation});
         this.clearInput();
@@ -334,6 +434,8 @@ export default class SideraNative extends Extension {
         this.signals = [];
         this.monitors = [];
         this.peer = null;
+        this.scrollPeer = null;
+        this.compatOutput = null;
         this.shooting = false;
         this.keyboard = null;
         this.pointer = null;
@@ -343,8 +445,11 @@ export default class SideraNative extends Extension {
         this.focusTitleSignal = 0;
         try {
             this.stopListening = listen(connection => this.connected(connection));
+            this.stopScrollListening = listen(connection => this.connectScroll(connection), 'scroll.sock');
             const watch = (object, signal, callback) => this.signals.push([object, object.connect(signal, callback)]);
-            watch(Main.layoutManager, 'monitors-changed', () => this.refreshMonitors());
+            watch(Main.layoutManager, 'monitors-changed', () => {
+                this.scrollPeer?.close(); this.refreshMonitors();
+            });
             const visibilityChanged = () => { this.visibility(); this.sendState(); };
             watch(Main.sessionMode, 'updated', visibilityChanged);
             watch(Main.overview, 'showing', visibilityChanged);
@@ -355,6 +460,8 @@ export default class SideraNative extends Extension {
             this.timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
                 if (this.peer && GLib.get_monotonic_time() - this.peer.lastSeen > 5000000)
                     this.peer.close();
+                if (this.scrollPeer && GLib.get_monotonic_time() - this.scrollPeer.lastSeen > 5000000)
+                    this.scrollPeer.close();
                 return GLib.SOURCE_CONTINUE;
             });
             this.refreshMonitors();
@@ -373,7 +480,10 @@ export default class SideraNative extends Extension {
         });
         this.sources.add(id);
     }
-    visibility() { for (const output of this.outputs.values()) output.visibility(); }
+    visibility() {
+        for (const output of this.outputs.values()) output.visibility();
+        this.compatOutput?.visibility();
+    }
     wpsForeground() {
         const window = global.display.focus_window;
         return Boolean(this.active() && window &&
@@ -388,6 +498,9 @@ export default class SideraNative extends Extension {
     trackFocus() {
         const window = global.display.focus_window;
         if (window !== this.focusWindow) {
+            for (const output of [...this.outputs.values(), this.compatOutput]) {
+                if (output?.wheel) { output.cancel(); this.later(() => output.applyInput()); }
+            }
             this.clearFocus();
             this.focusWindow = window;
             if (window)
@@ -425,9 +538,58 @@ export default class SideraNative extends Extension {
         this.hotkey = false;
     }
 
+    // An XWayland mouse press creates an implicit client grab. Give only the
+    // two compatibility rails to Shell so a wheel can reach the document
+    // throughout the drag. All other controls and rendering stay with X11.
+    connectScroll(connection) {
+        if (this.peer || this.scrollPeer) { connection.close(null); return; }
+        const monitor = {id: 'compat-scroll', x: 0, y: 0, width: global.stage.width, height: global.stage.height};
+        let sx = 1, sy = 1;
+        const peer = new Peer(connection, message => {
+            if (message?.type === 'ping') { peer.send({type: 'pong'}); return; }
+            if (message?.type === 'documentWheel') { this.compatOutput?.wheelCommand(message); return; }
+            if (message?.type !== 'rails') throw new Error('Invalid scroll message');
+            const {width, height, rails} = message;
+            if (![width, height].every(n => Number.isInteger(n) && n > 0 && n <= 32768) ||
+                !Array.isArray(rails) || ![0, 2].includes(rails.length)) throw new Error('Invalid scroll bounds');
+            sx = monitor.width / width; sy = monitor.height / height;
+            const rects = rails.map((r, index) => {
+                if (!Array.isArray(r) || r.length !== 4 || !r.every(Number.isInteger)) throw new Error('Invalid rail');
+                const [x,y,w,h] = r;
+                if (w < 1 || w > Math.min(260, width / 3) || h < 1 || h > height || y < 0 || y+h > height ||
+                    x < 0 || x+w > width || (index ? width-x-w : x) > width / 4) throw new Error('Invalid rail location');
+                return [x*sx, y*sy, w*sx, h*sy];
+            });
+            if (!rects.length && this.compatOutput.wheel) this.compatOutput.cancel();
+            this.compatOutput.input(rects, false, rects);
+        }, () => {
+            if (this.scrollPeer !== peer) return;
+            this.scrollPeer = null;
+            this.compatOutput?.destroy(); this.compatOutput = null;
+        });
+        this.scrollPeer = peer;
+        const owner = {
+            active: () => this.enabled && this.scrollPeer === peer && !this.peer &&
+                !Main.sessionMode.isLocked && !Main.sessionMode.isGreeter && !Main.overview.visible && !Main.modalCount,
+            peer: {send: value => {
+                if (Number.isFinite(value.x)) value.x = Math.round(value.x / sx);
+                if (Number.isFinite(value.y)) value.y = Math.round(value.y / sy);
+                peer.send(value);
+            }},
+            generation: 0, later: callback => this.later(callback),
+        };
+        try {
+            owner.pointer = backend().get_default_seat().create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
+            this.compatOutput = new Output(owner, monitor);
+            this.compatOutput.ready = true;
+            peer.start();
+        } catch (error) { peer.close(); throw error; }
+    }
+
     connected(connection) {
         // A running instance owns the bridge until it exits or times out.
         if (this.peer) { connection.close(null); return; }
+        this.scrollPeer?.close();
         const peer = new Peer(connection, (message, tile) => this.packet(message, tile), () => {
             if (this.peer === peer) {
                 this.peer = null; this.clearOutputs(); this.unbindKeys();
@@ -508,7 +670,8 @@ export default class SideraNative extends Extension {
         switch (message.type) {
         case 'begin': output?.begin(message.width, message.height); break;
         case 'end': output?.end(); break;
-        case 'input': output?.input(message.rects, message.full); break;
+        case 'input': output?.input(message.rects, message.full, message.scrollRails); break;
+        case 'documentWheel': output?.wheelCommand(message); break;
         case 'text_input': output?.textInput(message.enabled); break;
         case 'screenshot': if (this.active()) this.screenshot(); break;
         case 'key': {
@@ -584,6 +747,8 @@ export default class SideraNative extends Extension {
         this.enabled = false;
         this.refreshSerial++;
         this.peer?.close(); this.peer = null;
+        this.scrollPeer?.close();
+        this.stopScrollListening?.(); this.stopScrollListening = null;
         this.clearOutputs();
         this.stopListening?.(); this.stopListening = null;
         this.clearFocus();

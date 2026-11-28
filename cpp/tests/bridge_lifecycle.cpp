@@ -217,6 +217,7 @@ static void snapshotsLifecycleQueueAndWhiteboard() {
   check(page == 5 && begins == beforeBegins + 1 && changes == beforeChanges,
         "duplicate sequence was applied again");
   get(bridge, "/poll?m=EVENT%20SlideShowState%20pos=-1");
+  check(ends == 0 && bridge.position() == 5, "transient missing position ended the show");
   get(bridge, "/push?m=EVENT%20SlideShowEnd%20pos=-1");
   check(ends == 1 && !bridge.enqueue("NEXT"), "end did not clear slideshow state");
   bridge.stop(); drainDeletes();

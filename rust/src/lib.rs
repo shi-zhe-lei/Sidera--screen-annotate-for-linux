@@ -15,6 +15,8 @@ pub mod clear_history;
 pub mod conic;
 pub mod clipboard;
 pub mod diag_log;
+pub mod document_scroll;
+#[cfg(unix)] mod linux_scroll;
 pub mod gesture;
 pub mod launch;
 pub mod page_cache;
@@ -213,6 +215,9 @@ pub struct Ip {
     pub last_touch_pos: (i32, i32),
     pub ignored_touch: HashSet<i32>,
     pub pending_ui: Option<ui::Control>,
+    document_drag: Option<document_scroll::Drag>,
+    // A swipe can scroll a single-column rail that is taller than its display.
+    sidebar_swipe_start: Option<(i32, i32)>,
     pub ui_touch: Option<i32>,
     pub rejected_touch: HashSet<i32>,
 }
@@ -250,6 +255,8 @@ impl Default for Ip {
             last_touch_pos: (0, 0),
             ignored_touch: HashSet::new(),
             pending_ui: None,
+            document_drag: None,
+            sidebar_swipe_start: None,
             ui_touch: None,
             rejected_touch: HashSet::new(),
         }
@@ -337,6 +344,23 @@ impl Rt {
         }
         let _ = sidebar_preview_dirty;
         self.redraw_full(app);
+    }
+    fn redraw_control(&self, app: &App, control: ui::Control) {
+        if let Some(r) = ui::control_rect(app, control) {
+            let bounds = match control {
+                ui::Control::Sidebar(..) | ui::Control::Popup(_) | ui::Control::PageCount(_) | ui::Control::Whiteboard(_)
+                | ui::Control::PagePicker(ui::PagePickerHit::Cancel | ui::PagePickerHit::Jump) => r.with_paint_margin(),
+                _ => r,
+            };
+            self.redraw(app, bounds);
+        }
+    }
+    fn redraw_press(&self, app: &App, control: ui::Control) {
+        if let Some((_, right)) = control.tool_segment() {
+            self.redraw(app, ui::tool_track_rect(app, right).with_paint_margin());
+        } else {
+            self.redraw_control(app, control);
+        }
     }
     fn redraw_overlay(&self, app: &App, r: R) {
         if self.batching.get() {
@@ -458,6 +482,14 @@ fn rect_of(app: &App, r: R, pad: i32) -> Option<IRect> {
 }
 
 pub fn apply_input_shape(rt: &Rt, app: &App) {
+    let rails_visible = app.wants_scroll_rail() && !app.collapsed && !ui::sidebar_animating(app)
+        && !app.settings_open && !app.process_block_open && !app.settings_ui.modal()
+        && !app.confirm_quit && !app.show_diag && !app.show_input_group_prompt
+        && !app.avoid_active && !app.launch.active() && !dismiss_capture(app);
+    rt.backend.set_scroll_rails(rails_visible.then(|| [false, true].map(|right| {
+        let r = ui::scroll_hit_rect(app, right);
+        [r.x, r.y, r.w, r.h]
+    })));
     if app.settings_ui.window_size().is_some() {
         rt.set_input_region(&[], false);
         return;
@@ -520,8 +552,8 @@ pub fn close_all_popups(rt: &Rt, app: &mut App) {
     // Capture the old bounds before hiding the panels. A stroke only redraws
     // its own small area; forgetting these bounds leaves a torn popup behind.
     let regions = [
-        app.pen_popup_visible.then(|| ui::pen_popup_rect(app)),
-        app.eraser_popup_visible.then(|| ui::eraser_popup_rect(app)),
+        app.pen_popup_visible.then(|| ui::pen_popup_rect(app).with_paint_margin()),
+        app.eraser_popup_visible.then(|| ui::eraser_popup_rect(app).with_paint_margin()),
         app.page_picker.as_ref().map(|_| ui::page_picker_rect(app)),
     ];
     app.pen_popup_visible = false;
@@ -603,7 +635,7 @@ pub fn switch_to_cursor(rt: &Rt, app: &mut App) {
     if app.launch.active() { return; }
     close_all_popups(rt, app);
     if app.floating.is_some() { crate::selection::commit(app); }
-    app.mode = 0;
+    app.set_tool_mode(0);
     if app.is_drawing {
         paint::commit_stroke(app);
     }
@@ -617,9 +649,11 @@ pub fn switch_to_cursor(rt: &Rt, app: &mut App) {
             app.coord_page = app.current_slide;
             app.coord_pages.insert(app.current_slide, *coord);
         }
-    } else {
-        app.request_drawing_tools_collapse();
     }
+    if app.can_restore_cleared() {
+        app.drawing_tools.set_layout_at(toolbar::DrawerLayout::RestoreOnly, Instant::now());
+        app.drawing_tools.settle();
+    } else { app.request_drawing_tools_collapse(); }
     apply_input_shape(rt, app);
     rt.redraw_full(app);
     log::info!("[INFO] 光标模式");
@@ -635,8 +669,7 @@ pub fn switch_to_draw(rt: &Rt, app: &mut App, mode: i32) {
         app.lasso.clear();
         app.conic_menu = None;
     }
-    app.mode = mode;
-    app.drawing_tools.set_expanded(true);
+    app.set_tool_mode(mode);
     if app.collapsed {
         expand_sidebars(rt, app);
     }
@@ -684,6 +717,18 @@ pub fn expand_sidebars(rt: &Rt, app: &mut App) {
     log::info!("[INFO] 侧边栏已展开");
 }
 
+fn tick_sidebar_countdown(rt: &Rt, app: &mut App, now: Instant) {
+    let Some(remaining) = app.sidebar_countdown_at(now) else { return };
+    let changed = std::mem::replace(&mut app.sidebar_countdown, remaining) != remaining;
+    if app.avoid_active { return; }
+    if remaining == 0 {
+        expand_sidebars(rt, app);
+    } else if changed && !ui::sidebar_animating(app) && !app.launch.active()
+        && !app.previewing_sidebars() && app.settings_ui.window_size().is_none() {
+        for right in [false, true] { rt.redraw_overlay(app, ui::sidebar_tab_face(app, right).with_paint_margin()); }
+    }
+}
+
 pub fn toggle_collapse(rt: &Rt, app: &mut App) {
     if app.avoid_active || app.whiteboard { return; }
     if app.collapsed {
@@ -726,6 +771,9 @@ fn external_navigation(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>, cmd: &st
                            rt.backend.can_inject_keys_without_prompt()) {
         NavigationRoute::Wps => {
             app.wps_navigation_ready = wps.is_some_and(|w| w.enqueue(cmd));
+            if app.wps_navigation_ready {
+                app.drawing_tools.navigation_queued_at(Instant::now());
+            }
         }
         NavigationRoute::DirectKeys => {
             app.wps_navigation_ready = true;
@@ -803,6 +851,7 @@ fn commit_page_picker(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>) {
 }
 
 pub fn on_scroll(rt: &Rt, app: &mut App, ip: &Ip, x: i32, y: i32, pages: f64) {
+    if pages.is_finite() && pages != 0.0 { wake_toolbar_at(rt, app, x, y); }
     if app.show_input_group_prompt || app.settings_ui.modal() || app.confirm_quit || ip.pending_ui.is_some()
         || ip.slider.is_some() || ip.dragging || ip.panel_scroll.is_some() || ip.picker_drag.is_some() { return; }
     if app.show_diag {
@@ -827,6 +876,17 @@ pub fn on_scroll(rt: &Rt, app: &mut App, ip: &Ip, x: i32, y: i32, pages: f64) {
         if pages.is_finite() && pages != 0.0 && ui::settings_rect(app).contains(x, y)
             && ui::settings_change_page(app, if pages > 0.0 { 1 } else { -1 }) {
             rt.redraw(app, ui::settings_rect(app));
+        }
+        return;
+    }
+    let height = app.sb_height();
+    if !app.collapsed && height > app.screen_h && pages.is_finite() && pages != 0.0 &&
+        [false, true].into_iter().any(|right| ui::sidebar_rect(app, right).contains(x, y)) {
+        let old_y = app.sidebar_y(height);
+        close_all_popups(rt, app);
+        let delta = (pages.clamp(-10.0, 10.0) * f64::from(app.sb_btn() + 6)).round() as i32;
+        if app.move_sidebar_to(old_y - delta, height) != old_y {
+            for right in [false, true] { rt.redraw(app, ui::sidebar_transition_rect(app, right)); }
         }
         return;
     }
@@ -889,6 +949,22 @@ fn presentation_action_for(
     }
 }
 
+fn finish_presentation(rt: &Rt, app: &mut App) {
+    app.presentation_fade.reset();
+    if !app.whiteboard { app.tool_selector.cancel_press(); }
+    app.clear_slide_pages();
+    app.wps_real_pos = -1;
+    if app.whiteboard {
+        // The board keeps its own tool; its return target is now the editor.
+        app.saved_mode = 0;
+        app.saved_drawing_tools = false;
+    } else if app.mode != 0 {
+        switch_to_cursor(rt, app);
+        return;
+    }
+    rt.redraw_full(app);
+}
+
 pub fn exit_presentation(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>) {
     if app.whiteboard {
         app.whiteboard_bg_index = (app.whiteboard_bg_index + 1) % app::WHITEBOARD_COLORS.len() as i32;
@@ -944,44 +1020,47 @@ pub fn exit_presentation(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>) {
     }
 }
 
-pub fn do_screenshot(rt: &Rt) {
+pub fn do_screenshot(rt: &Rt, app: &App) {
     if rt.backend.request_screenshot() { return; }
     match rt.backend.screenshot() {
         Some((rgba, w, h)) => {
-            save_and_clipboard(rgba, w, h);
+            if save_and_clipboard(rgba, w, h) {
+                app.screenshot_feedback.saved.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         None => {
             #[cfg(unix)]
             {
                 // Wayland（无 screencopy）走 xdg-desktop-portal，异步进行
                 log::info!("[INFO] 已提交门户截图任务");
-                portal::screenshot_nonblocking();
+                portal::screenshot_nonblocking(app.screenshot_feedback.saved.clone());
             }
         }
     }
 }
 
 /// 保存 PNG 并复制到剪贴板
-pub fn save_and_clipboard(rgba: Vec<u8>, w: u32, h: u32) {
+pub fn save_and_clipboard(rgba: Vec<u8>, w: u32, h: u32) -> bool {
     let Some(img) = image::RgbaImage::from_raw(w, h, rgba) else {
-        return;
+        return false;
     };
     let dir = dirs::picture_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(std::env::temp_dir);
     let _ = std::fs::create_dir_all(&dir);
     let fn_ = dir.join(format!("sidera_{}.png", now_ms()));
-    if img.save(&fn_).is_ok() {
+    let saved = img.save(&fn_).is_ok();
+    if saved {
         log::info!("[INFO] 截图已保存: {}", fn_.display());
     } else {
         log::warn!("[WARN] 截图保存失败: {}", fn_.display());
     }
     clipboard::copy_image(img.into_raw(), w, h);
+    saved
 }
 
 pub fn collect_system_info(rt: &Rt, app: &App) -> String {
     let mut s = String::new();
-    s.push_str("=== 系统环境诊断 ===\n");
     if let Ok(os) = std::fs::read_to_string("/etc/os-release") {
         for line in os.lines() {
             if let Some(v) = line.strip_prefix("PRETTY_NAME=") {
@@ -1003,10 +1082,9 @@ pub fn collect_system_info(rt: &Rt, app: &App) -> String {
         if rt.has_compositor() { "有" } else { "无" }
     ));
     s.push_str(&format!("显示后端: {}\n", rt.backend.description()));
-    s.push_str(&format!("界面主题: {}（当前{}）\n", app.theme.preference.label(),
-        if app.theme.dark() { "深色" } else { "浅色" }));
     s.push_str(&format!("直接翻页按键: {}\nCtrl+Shift+D: {}\n",
-        rt.backend.can_inject_keys_without_prompt(), app.hotkey_ok));
+        if rt.backend.can_inject_keys_without_prompt() { "可用" } else { "需要授权或不支持" },
+        if app.hotkey_ok { "可用" } else { "不可用" }));
     #[cfg(unix)]
     s.push_str(&format!("WPS 画笔快捷键: {}\n", if keyboard_evdev::active() {
         "evdev 键盘监听"
@@ -1016,9 +1094,9 @@ pub fn collect_system_info(rt: &Rt, app: &App) -> String {
     s.push_str(&format!(
         "点击区域控制: {}\n",
         if rt.shape_available() {
-            "扩展可用"
+            "可用"
         } else {
-            "扩展不可用!"
+            "不可用"
         }
     ));
     let (logical_w, logical_h) = rt.screen_size();
@@ -1045,15 +1123,17 @@ pub fn collect_system_info(rt: &Rt, app: &App) -> String {
         }
     ));
     s.push_str(&format!("WPS 全屏: {}\n希沃白板避让: {}\n",
-        app.wps_fullscreen, if app.avoid_active { "是" } else { "否" }));
-    s.push_str(&format!("WPS 已连接: {}\n", app.wps_connected));
+        if app.wps_fullscreen { "是" } else { "否" }, if app.avoid_active { "是" } else { "否" }));
+    s.push_str(&format!("WPS 联动: {}\n", if app.wps_connected { "已连接" } else { "未连接" }));
     s.push_str(&format!("WPS 模式: {}\n", if app.wps_test_mode { "测试（页码/跳页/开始）" } else { "默认（API 翻页 + 快捷键）" }));
     if let Some(path) = app::config_path() {
         s.push_str(&format!("设置文件: {}\n", path.display()));
     }
+    let appearance = if app.theme.preference == ui_theme::Preference::System {
+        format!("跟随系统（{}）", if app.theme.dark() { "深色" } else { "浅色" })
+    } else { app.theme.preference.label().to_owned() };
     s.push_str(&format!(
-        "主题: {} / {}（{}）\n启动延迟: {} 秒\n工具栏自动展开: {} 分钟\n",
-        app.theme.preference.label(),
+        "显示模式: {appearance}\n主题色: {}（{}）\n启动延迟: {} 秒\n工具栏自动展开: {} 分钟\n",
         app.theme.accent.label(),
         app.theme.accent.key(),
         app.startup_delay,
@@ -1184,6 +1264,7 @@ fn use_native_settings(force_overlay: bool, force_native: bool) -> bool {
 }
 
 pub fn open_settings(rt: &Rt, app: &mut App) {
+    app.tool_selector.cancel_press();
     #[cfg(unix)]
     if let Some(window) = &app.settings_ui.window {
         window.raise();
@@ -1357,13 +1438,13 @@ fn save_theme_selection(app: &mut App, next: ui_theme::Theme) -> bool {
                     *start = now_ms();
                 }
             }
-            app.settings_ui.notify("外观已保存");
+            app.settings_ui.toast_until = 0;
             true
         }
         Err(error) => {
             app.apply_theme(previous);
             app.settings_ui.recent = recent;
-            app.settings_ui.notify(format!("未保存：{error}"));
+            app.settings_ui.notify(format!("外观保存失败：{error}"));
             diag_log::warn(&format!("保存外观失败：{error}"));
             false
         }
@@ -1402,20 +1483,51 @@ pub fn handle_settings_hit(rt: &Rt, app: &mut App, hit: SetHit) {
             } else {
                 app.settings_ui.select(tab);
                 app.settings_page = 0;
+                #[cfg(unix)]
+                if tab == Tab::Experimental && app.document_scroll_enabled {
+                    app.settings_ui.scroll_access.request(false);
+                }
             }
         }
         SetHit::Theme(preference) => { save_theme_selection(app, ui_theme::Theme { preference, ..app.theme }); }
+        SetHit::FadeToolbarDuringShow => {
+            let old = app.fade_toolbar_during_show;
+            app.settings_ui.begin_toggle(ui::Control::Setting(hit), old);
+            app.fade_toolbar_during_show = !old;
+            app.presentation_fade.reset();
+            app::save_settings(app);
+        }
+        SetHit::ToolbarIconsOnly => {
+            let old = app.toolbar_icons_only;
+            app.settings_ui.begin_toggle(ui::Control::Setting(hit), old);
+            app.toolbar_icons_only = !old;
+            app::save_settings(app);
+        }
+        SetHit::DocumentScroll => {
+            let old = app.document_scroll_enabled;
+            app.settings_ui.begin_toggle(ui::Control::Setting(hit), old);
+            app.document_scroll_enabled = !old;
+            #[cfg(unix)]
+            if !old { app.settings_ui.scroll_access.request(false); }
+            app::save_settings(app);
+            apply_input_shape(rt, app);
+            rt.redraw_full(app);
+        }
+        #[cfg(unix)]
+        SetHit::EnableScrollAccess => {
+            if app.document_scroll_enabled { app.settings_ui.scroll_access.request(true); }
+        }
         SetHit::ResetSlider(id) => {
             apply_slider(app, id, id.default_value());
             app::save_settings(app);
-            app.settings_ui.notify("已恢复此项默认值");
+            app.settings_ui.notify("已恢复默认值");
         }
         SetHit::Autostart => {
             let old = ui::is_autostart();
             app.settings_ui.begin_toggle(ui::Control::Setting(hit), old);
             ui::set_autostart(!old);
             app.settings_ui.autostart = ui::is_autostart();
-            if app.settings_ui.autostart == old { app.settings_ui.notify("未能修改自动启动设置"); }
+            if app.settings_ui.autostart == old { app.settings_ui.notify("自动启动设置未保存"); }
         }
         SetHit::WpsRemove => app.settings_ui.show_dialog(Dialog::Remove),
         SetHit::WpsRegister => app.settings_ui.show_dialog(Dialog::Register),
@@ -1439,7 +1551,7 @@ pub fn handle_settings_hit(rt: &Rt, app: &mut App, hit: SetHit) {
         SetHit::ClearLog => app.settings_ui.show_dialog(Dialog::ClearLogs),
         SetHit::Logs => {
             let lines = diag_log::tail(400);
-            show_inspector(app, Inspector::Logs, if lines.is_empty() { "暂无运行日志。".into() } else { lines.join("\n") });
+            show_inspector(app, Inspector::Logs, if lines.is_empty() { "暂无日志".into() } else { lines.join("\n") });
         }
         SetHit::SysInfo => { let info = collect_system_info(rt, app); show_inspector(app, Inspector::Diagnostics, info); }
         SetHit::Repository => open_project_link(app, settings_state::REPOSITORY),
@@ -1459,7 +1571,7 @@ pub fn handle_settings_hit(rt: &Rt, app: &mut App, hit: SetHit) {
         SetHit::SettingsPage(delta) => { ui::settings_change_page(app, delta); }
     }
     apply_input_shape(rt, app);
-    let sidebar_preview_dirty = matches!(hit, SetHit::Tab(_) | SetHit::Theme(_) | SetHit::ResetSlider(_));
+    let sidebar_preview_dirty = matches!(hit, SetHit::Tab(_) | SetHit::Theme(_) | SetHit::ResetSlider(_) | SetHit::ToolbarIconsOnly);
     rt.redraw_preferences(app, sidebar_preview_dirty);
 }
 
@@ -1479,16 +1591,17 @@ fn handle_dialog(rt: &Rt, app: &mut App, hit: settings_state::DialogHit) {
                 let text = match result {
                     Ok(detail) => {
                         diag_log::info(&detail);
-                        format!("{}已完成。\n请重新打开 WPS 使改动生效。\n\n{detail}", if dialog == Dialog::Register { "加载项登记" } else { "加载项清除" })
+                        if dialog == Dialog::Register { "已重新登记。重新打开 WPS 后生效。" }
+                        else { "已清除登记。重新打开 WPS 后生效。" }.to_owned()
                     }
-                    Err(error) => { diag_log::error(&error.to_string()); format!("操作未完成：\n{error}\n\n可在“关于 → 运行日志”查看记录。") }
+                    Err(error) => { diag_log::error(&error); error }
                 };
                 show_inspector(app, Inspector::Notice, text);
             }
             Dialog::ClearLogs => {
                 let _ = std::fs::remove_file(wps::log_file());
                 diag_log::clear();
-                show_inspector(app, Inspector::Logs, "日志已清空。".into());
+                show_inspector(app, Inspector::Logs, "日志已清空".into());
             }
         }
     }
@@ -1516,10 +1629,6 @@ fn handle_picker(rt: &Rt, app: &mut App, ip: &mut Ip, hit: settings_state::Picke
         }
     }
     rt.redraw_preferences(app, hit == PickerHit::Apply && app.previewing_sidebars());
-}
-
-fn first_hit(r: R, x: i32, y: i32) -> bool {
-    r.contains(x, y)
 }
 
 fn set_sidebar_drag_feedback(rt: &Rt, app: &mut App, feedback: Option<ui::SidebarDragFeedback>) {
@@ -1683,6 +1792,7 @@ pub fn on_press(
     // The press that started a drag owns it until release. A second button
     // must not replace it with a pending click and consume that release.
     if ip.pending_ui.is_some() || ip.slider.is_some() || ip.dragging || ip.picker_drag.is_some() || ip.panel_scroll.is_some() { return; }
+    if button == 1 { wake_toolbar_at(rt, app, x, y); }
     if button==1 && !app.show_input_group_prompt && app.settings_ui.editor.is_some()
         && !value_input::controls(app).iter().any(|(_,r)|r.contains(x,y)) {
         value_input_key(rt,app,value_input::Key::Enter);
@@ -1700,11 +1810,32 @@ pub fn on_press(
             ip.panel_scroll=Some((y,app.settings_page,false));
         }
     }
-    if !app.settings_open && !app.confirm_quit && !app.show_diag
+    let hit = ui::control_at(app, x, y);
+    app.tool_selector.forget_opening_tap();
+    if hit.and_then(ui::Control::tool_segment).is_none() && !app.settings_open && !app.confirm_quit && !app.show_diag
         && ui::sidebar_animating(app) && [false, true].into_iter()
         .any(|right| ui::sidebar_input_rect(app, right).contains(x, y)) { return; }
-    if let Some(control) = ui::control_at(app, x, y) {
+    if let Some(control) = hit {
         if button != 1 || !ui::control_enabled(app, control) { return; }
+        if let ui::Control::DocumentScroll(right) = control {
+            // A tap can arrive before the next periodic foreground refresh.
+            // Consume that contact if the linked presentation just took focus.
+            if app.wps_debug && app.wps_connected && rt.wps_foreground() == Some(true) {
+                ip.pending_ui = Some(control);
+                return;
+            }
+            close_all_popups(rt, app);
+            let (centre, travel, height) = ui::scroll_thumb_geometry(app, right);
+            let mut drag = document_scroll::Drag::new(y, centre, travel, app.scroll_rail.thumb, height, Instant::now());
+            app.scroll_rail.begin(right);
+            app.scroll_rail.thumb = drag.position(y);
+            drag.target = rt.backend.document_scroll_target();
+            ip.document_drag = Some(drag);
+            ip.pending_ui = Some(control);
+            app.press = None;
+            redraw_document_rails(rt, app);
+            return;
+        }
         if let ui::Control::Setting(SetHit::InspectorPage(delta))=control {
             if !settings_panel::inspector_can_page(app,&rt.fonts,delta) {return;}
         }
@@ -1720,10 +1851,15 @@ pub fn on_press(
             return;
         }
         if let Some(old) = app.press.take() {
-            if let Some(r) = ui::control_rect(app, old.control) { rt.redraw(app, r); }
+            rt.redraw_press(app, old.control);
+        }
+        if let Some((button, right)) = control.tool_segment() { app.tool_selector.begin(button, right, x, y); }
+        else if !app.collapsed && app.sb_height() > app.screen_h
+            && matches!(control, ui::Control::Sidebar(_, _) | ui::Control::PageCount(_)) {
+            ip.sidebar_swipe_start = Some((x, y));
         }
         app.press = Some(ui::PressFeedback::new(control));
-        if let Some(r) = ui::control_rect(app, control) { rt.redraw(app, r); }
+        rt.redraw_press(app, control);
         if !matches!(control, ui::Control::Slider(_)
             | ui::Control::Picker(settings_state::PickerHit::Field | settings_state::PickerHit::Hue)) {
             ip.pending_ui = Some(control);
@@ -1839,51 +1975,58 @@ fn activate_press(
         }
         close_all_popups(rt, app);
     }
-    if let Some(right) = ui::page_count_at(app, x, y) {
-        if button == 1 { open_page_picker(rt, app, right); }
-        return;
-    }
-    if app.pen_popup_visible {
+    if app.pen_popup_visible && ui::pen_popup_rect(app).contains(x, y) {
         if let Some(hit) = ui::pen_popup_hit(app, x, y) {
             match hit {
                 PopupHit::Color(i) => {
                     app.cur_color = i;
+                    for right in [false, true] {
+                        rt.redraw_control(app, ui::Control::Sidebar(Btn::Pen, right));
+                    }
                 }
                 PopupHit::PenSize(i) => {
                     app.cur_pen = i;
                 }
                 _ => {}
             }
-            rt.redraw_full(app);
-            return;
+            rt.redraw(app, ui::pen_popup_rect(app).with_paint_margin());
         }
+        return;
     }
-    if app.eraser_popup_visible {
+    if app.eraser_popup_visible && ui::eraser_popup_rect(app).contains(x, y) {
         if let Some(hit) = ui::eraser_popup_hit(app, x, y) {
             match hit {
                 PopupHit::EraserSize(i) => {
-                    app.cur_eraser = i;
-                    app::save_settings(app);
+                    if app.cur_eraser != i {
+                        app.cur_eraser = i;
+                        app::save_settings(app);
+                        for right in [false, true] {
+                            rt.redraw_control(app, ui::Control::Sidebar(Btn::Eraser, right));
+                        }
+                        rt.redraw(app, ui::eraser_popup_rect(app).with_paint_margin());
+                    }
                 }
                 PopupHit::ClearAll => clear_drawing(rt, app),
                 _ => {}
             }
-            rt.redraw_full(app);
+        }
+        return;
+    }
+    if let Some(right) = ui::page_count_at(app, x, y) {
+        if button == 1 { open_page_picker(rt, app, right); }
+        return;
+    }
+
+    // Dispatch from the same touch targets used to capture and release a press.
+    // The tucked tab handles a tap and a drag through the shared background path.
+    if !app.collapsed {
+        if let Some((button, right)) = ui::sidebar_button_at(app, x, y) {
+            app.popup_on_right = right;
+            handle_btn(rt, app, wps, button, right);
             return;
         }
     }
-
-    // 侧边栏按钮
     for right in [false, true] {
-        for (k, r) in ui::sidebar_buttons(app, right) {
-            if app.collapsed && k == Btn::Collapse { continue; }
-            if first_hit(r, x, y) {
-                log::debug!("[INPUT] hit {:?} right={} rect=({},{} {}x{})", k, right, r.x, r.y, r.w, r.h);
-                app.popup_on_right = right;
-                handle_btn(rt, app, wps, k, right);
-                return;
-            }
-        }
         let sb = ui::sidebar_rect(app, right);
         if sb.contains(x, y) {
             // UI releases are left-button only, so right/wheel presses must
@@ -1894,7 +2037,7 @@ fn activate_press(
             app.press = None;
             ip.dragging = true;
             ip.moved = false;
-            app.sb_y = sb.y;
+            if sb.h <= app.screen_h { app.sb_y = sb.y; }
             ip.drag_start_y = app.sb_y;
             ip.drag_mouse_y0 = y;
             ip.collapse_press = app.collapsed;
@@ -1940,9 +2083,7 @@ fn activate_press(
         let _ = button;
         if restore_was_visible && !app.can_restore_cleared() {
             for right in [false, true] {
-                if let Some(r) = ui::control_rect(app, ui::Control::Sidebar(Btn::Clear, right)) {
-                    rt.redraw(app, r);
-                }
+                rt.redraw_control(app, ui::Control::Sidebar(Btn::Clear, right));
             }
         }
         rt.redraw(
@@ -1966,12 +2107,13 @@ pub fn clear_drawing(rt: &Rt, app: &mut App) {
     app.clear_current_strokes();
     if app.whiteboard {
         if let Some(coord) = app.coord.as_mut() { coord.editing = false; }
-        app.mode = 1;
+        app.set_tool_mode(1);
     } else {
-        app.mode = 0;
+        app.set_tool_mode(0);
+        let layout = toolbar::DrawerLayout::for_page(false, app.can_restore_cleared());
+        app.drawing_tools.set_layout_at(layout, Instant::now());
+        app.drawing_tools.settle();
     }
-    // Keep the tool group visible so the new restore action is reachable.
-    app.drawing_tools.set_expanded(app.whiteboard || app.can_restore_cleared());
     apply_input_shape(rt, app);
     rt.redraw_full(app);
 }
@@ -1991,6 +2133,7 @@ pub fn handle_btn(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>, k: Btn, right
                 }
             } else {
                 switch_to_draw(rt, app, 1);
+                return;
             }
             apply_input_shape(rt, app);
             rt.redraw_full(app);
@@ -2005,6 +2148,7 @@ pub fn handle_btn(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>, k: Btn, right
                 }
             } else {
                 switch_to_draw(rt, app, 2);
+                return;
             }
             apply_input_shape(rt, app);
             rt.redraw_full(app);
@@ -2012,6 +2156,7 @@ pub fn handle_btn(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>, k: Btn, right
         Btn::Clear => clear_drawing(rt, app),
         Btn::Restore => {
             if app.restore_cleared() {
+                app.drawing_tools.set_expanded(true);
                 rt.redraw_full(app);
                 apply_input_shape(rt, app);
             }
@@ -2030,12 +2175,87 @@ pub fn handle_btn(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>, k: Btn, right
             apply_input_shape(rt, app);
             rt.redraw_full(app);
         }
-        Btn::Screenshot => do_screenshot(rt),
+        Btn::Screenshot => do_screenshot(rt, app),
     }
     let _ = right;
 }
 
+fn redraw_tool_tracks(rt: &Rt, app: &App) {
+    if app.collapsed || app.avoid_active { return; }
+    for right in [false, true] {
+        rt.redraw(app, ui::tool_track_rect(app, right).with_paint_margin());
+    }
+}
+
+fn redraw_document_rails(rt: &Rt, app: &App) {
+    if app.collapsed || app.avoid_active { return; }
+    for right in [false, true] {
+        let track = ui::scroll_track_rect(app, right);
+        let sidebar = ui::sidebar_rect(app, right);
+        rt.redraw(app, R { x: sidebar.x, w: sidebar.w, ..track }.with_paint_margin());
+    }
+}
+
+fn stop_document_drag(rt: &Rt, app: &mut App, ip: &mut Ip) {
+    if let Some(drag) = ip.document_drag.take() {
+        let notice = drag.notice;
+        drop(drag);
+        app.scroll_rail.release(Instant::now());
+        if let Some(r) = notice { rt.redraw(app,r.with_paint_margin()); }
+        redraw_document_rails(rt, app);
+    }
+}
+
+fn tick_document_scroll(rt: &Rt, app: &mut App, ip: &mut Ip, now: Instant) {
+    let slider = app.wants_scroll_rail();
+    if app.sidebar_page_visible() {
+        app.scroll_rail.last_page = ui::sidebar_page_numbers(app);
+    }
+    if !slider || app.collapsed || app.avoid_active || app.settings_open || app.process_block_open
+        || app.show_diag || app.show_input_group_prompt || app.confirm_quit || app.launch.active() {
+        // Retain pending_ui until lift so that the same contact cannot click the
+        // newly revealed page counter, navigate, or begin a whiteboard stroke.
+        stop_document_drag(rt, app, ip);
+    }
+    let mut dirty = app.scroll_rail.advance(slider, now);
+    if let Some(drag) = ip.document_drag.as_mut() {
+        let pixels = drag.distance(app.scroll_rail.thumb, now);
+        if pixels != 0.0 && !app.scroll_rail.unavailable
+            && !drag.target.as_mut().is_some_and(|target| target.scroll_by(pixels)) {
+            app.scroll_rail.unavailable = true;
+            #[cfg(unix)]
+            app.settings_ui.scroll_access.request(false);
+            if let Some(right) = app.scroll_rail.held {
+                let r = ui::scroll_notice_rect(app, right);
+                drag.notice = Some(r);
+                rt.redraw(app,r.with_paint_margin());
+            }
+            dirty = true;
+        }
+    }
+    if dirty { redraw_document_rails(rt, app); }
+}
+
 pub fn on_motion(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
+    if matches!(ip.pending_ui, Some(ui::Control::DocumentScroll(_))) {
+        if let Some(drag) = ip.document_drag.as_mut() {
+            if !app.wants_scroll_rail() {
+                stop_document_drag(rt, app, ip);
+            } else if (x, y) != (-1, -1) {
+                // A pointer crossing can arrive during a captured touch or mouse drag.
+                // The owner's release or the backend's explicit cancel ends the gesture.
+                let position = drag.position(y);
+                if position.signum() != app.scroll_rail.thumb.signum() || position == 0.0 {
+                    if let Some(target) = &mut drag.target { target.clear_pending(); }
+                }
+                if position != app.scroll_rail.thumb {
+                    app.scroll_rail.thumb = position;
+                    redraw_document_rails(rt, app);
+                }
+            }
+        }
+        return;
+    }
     if ip.wb_before.is_some_and(|(page, _, _)| !app.whiteboard || page != app.current_slide
         || !app.coord.is_some_and(|g| g.editing)) {
         ip.wb_before = None;
@@ -2149,13 +2369,47 @@ pub fn on_motion(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
         rt.redraw(app, ui::page_picker_rect(app));
         return;
     }
+    // On short displays a vertical swipe on an action scrolls the rail. It
+    // owns the release even when it ends on Clear, Next, or the canvas.
+    if let Some((start_x, start_y)) = ip.sidebar_swipe_start {
+        let dy = start_y.abs_diff(y);
+        if (x, y) != (-1, -1) && dy >= 8 && dy >= start_x.abs_diff(x) {
+            let side = match ip.pending_ui {
+                Some(ui::Control::Sidebar(_, side) | ui::Control::PageCount(side)) => Some(side),
+                _ => None,
+            };
+            let still_visible = !app.collapsed && app.sb_height() > app.screen_h
+                && !app.avoid_active && !app.settings_open && !app.settings_ui.modal()
+                && !app.process_block_open && !app.show_diag && !app.confirm_quit && !app.show_input_group_prompt;
+            if let Some(right) = side.filter(|_| still_visible) {
+                ip.pending_ui = None;
+                app.press = None;
+                close_all_popups(rt, app);
+                ip.dragging = true;
+                ip.moved = true;
+                ip.collapse_press = false;
+                ip.drag_mouse_y0 = start_y;
+                ip.drag_start_y = app.sidebar_y(app.sb_height());
+                set_sidebar_drag_feedback(rt, app, Some(ui::SidebarDragFeedback { right }));
+            }
+            ip.sidebar_swipe_start = None;
+        }
+    }
     // Moving an idle mouse has no visual effect. Only an active press reacts.
     if let Some(control) = ip.pending_ui {
-        let active = ui::control_enabled(app, control) && ui::control_at(app, x, y) == Some(control);
+        let active = if let Some((button, right)) = control.tool_segment() {
+            let hit = ui::tool_track_hit(app, right, x, y);
+            if app.tool_selector.motion(y, hit) {
+                redraw_tool_tracks(rt, app);
+            }
+            hit.is_some_and(|(target, _)| target == button || app.tool_selector.dragged() == Some(true))
+        } else {
+            ui::control_enabled(app, control) && ui::control_at(app, x, y) == Some(control)
+        };
         if let Some(press) = app.press.as_mut() {
             if press.active != active {
                 press.active = active;
-                if let Some(r) = ui::control_rect(app, control) { rt.redraw(app, r); }
+                rt.redraw_press(app, control);
             }
         }
         return;
@@ -2188,13 +2442,12 @@ pub fn on_motion(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
             app.sb_height()
         };
         let old_y = app.sidebar_y(h);
-        let new_y = (ip.drag_start_y + dy).clamp(0, (app.screen_h - h).max(0));
+        let new_y = app.move_sidebar_to(ip.drag_start_y + dy, h);
         // Rebase at each sample, including a clamped edge. Reversing direction
         // must move immediately rather than requiring the pointer to retrace
         // the distance it travelled past the screen boundary.
         ip.drag_start_y = new_y;
         ip.drag_mouse_y0 = y;
-        app.sb_y = new_y;
         if new_y == old_y {
             return;
         }
@@ -2284,6 +2537,16 @@ pub fn on_motion(rt: &Rt, app: &mut App, ip: &mut Ip, x: i32, y: i32) {
 }
 
 pub fn on_release(rt: &Rt, app: &mut App, ip: &mut Ip, wps: Option<&WpsBridge>, x: i32, y: i32, button: u8) {
+    if matches!(ip.pending_ui, Some(ui::Control::DocumentScroll(_))) {
+        if button == 1 {
+            ip.pending_ui = None;
+            stop_document_drag(rt, app, ip);
+        }
+        return;
+    }
+    if button == 1 && (ip.dragging || matches!(ip.pending_ui, Some(ui::Control::Sidebar(..) | ui::Control::PageCount(_)))) {
+        wake_toolbar(rt, app);
+    }
     if button == 4 || button == 5 { return; }
     if button != 1 && (ip.panel_scroll.is_some() || ip.picker_drag.is_some()) { return; }
     if ip.picker_drag.take().is_some() { app.press=None; rt.redraw_full(app); return; }
@@ -2346,14 +2609,57 @@ pub fn on_release(rt: &Rt, app: &mut App, ip: &mut Ip, wps: Option<&WpsBridge>, 
         return;
     }
     if button != 1 && (ip.pending_ui.is_some() || ip.slider.is_some() || ip.dragging) { return; }
+    if ip.sidebar_swipe_start.is_some() {
+        on_motion(rt, app, ip, x, y);
+        ip.sidebar_swipe_start = None;
+    }
     if let Some(control) = ip.pending_ui.take() {
-        let activate = ui::control_enabled(app, control) && ui::control_at(app, x, y) == Some(control);
+        let activate = if let Some((start, right)) = control.tool_segment() {
+            let hit = ui::tool_track_hit(app, right, x, y);
+            // A compositor may deliver the final coordinates only on release.
+            app.tool_selector.motion(y, hit);
+            match app.tool_selector.dragged() {
+                Some(true) => {
+                    if let Some(press) = app.press.as_mut() {
+                        press.active = hit.is_some();
+                        press.release();
+                    }
+                    if let Some((target, _)) = hit.filter(|(b, _)| b.tool_mode() != Some(app.mode)) {
+                        app.popup_on_right = right;
+                        handle_btn(rt, app, wps, target, right);
+                    } else {
+                        app.set_tool_mode(app.mode);
+                    }
+                    redraw_tool_tracks(rt, app);
+                    return;
+                }
+                Some(false) => {
+                    app.tool_selector.cancel_press();
+                    hit.is_some_and(|(button, _)| button == start)
+                }
+                None => false, // A mode change or input cancellation invalidated this pointer.
+            }
+        } else {
+            ui::control_enabled(app, control) && ui::control_at(app, x, y) == Some(control)
+        };
         if let Some(press) = app.press.as_mut() {
             press.active = activate;
             press.release();
         }
-        if activate { activate_press(rt, app, ip, wps, x, y, 1); }
-        if let Some(r) = ui::control_rect(app, control) { rt.redraw(app, r); }
+        if activate {
+            if let Some((button, right)) = control.tool_segment() {
+                let was_folded = !app.drawing_tools.expanded();
+                app.popup_on_right = right;
+                handle_btn(rt, app, wps, button, right);
+                // At the bottom edge the drawer grows upwards past the first tap.
+                if was_folded && app.opening_sidebar_shift() != 0 {
+                    app.tool_selector.remember_opening_tap(button, right, x, y);
+                }
+            } else {
+                activate_press(rt, app, ip, wps, x, y, 1);
+            }
+        }
+        rt.redraw_press(app, control);
         return;
     }
     if ip.slider.is_some() {
@@ -2400,6 +2706,7 @@ pub fn on_release(rt: &Rt, app: &mut App, ip: &mut Ip, wps: Option<&WpsBridge>, 
 
 /// 触摸事件（X11 与 Wayland 共用）
 pub fn cancel_input(rt: &Rt, app: &mut App, ip: &mut Ip) {
+    stop_document_drag(rt, app, ip);
     if let Some((page, _, before)) = ip.wb_before {
         if app.whiteboard && page == app.current_slide && app.coord.is_some_and(|g| g.editing) {
             app.coord = Some(before);
@@ -2414,6 +2721,7 @@ pub fn cancel_input(rt: &Rt, app: &mut App, ip: &mut Ip) {
     app.touch_frame_contacts = 0;
     app.press = None;
     app.sidebar_drag = None;
+    app.tool_selector.cancel_press();
     *ip = Ip::default();
     apply_input_shape(rt, app);
     rt.redraw_full(app);
@@ -2521,6 +2829,7 @@ pub fn handle_touch(
 
 pub struct Timers {
     last_wps: Instant,
+    unlinked_wps_fullscreen: bool,
     last_foreground: Instant,
     last_avoid: Instant,
     foreground: Option<bool>,
@@ -2530,6 +2839,7 @@ impl Timers {
     pub fn new() -> Self {
         Timers {
             last_wps: Instant::now() - Duration::from_secs(10),
+            unlinked_wps_fullscreen: false,
             last_foreground: Instant::now() - Duration::from_secs(10),
             last_avoid: Instant::now() - Duration::from_secs(10),
             foreground: None,
@@ -2554,14 +2864,20 @@ pub fn tick(
 }
 
 pub fn set_drawing_tools_expanded(rt: &Rt, app: &mut App, expanded: bool) {
-    if app.drawing_tools.expanded() == expanded { return; }
+    let layout = toolbar::DrawerLayout::for_page(expanded, app.can_restore_cleared());
+    if app.drawing_tools.layout() == layout { return; }
     close_all_popups(rt, app);
-    app.drawing_tools.set_expanded(expanded);
+    app.drawing_tools.set_layout_at(layout, Instant::now());
     apply_input_shape(rt, app);
-    rt.redraw_full(app);
+    for right in [false, true] { rt.redraw(app, ui::sidebar_transition_rect(app, right)); }
 }
 
 pub fn resolve_drawing_tools_auto_update(rt: &Rt, app: &mut App) {
+    resolve_drawing_tools_at(rt, app, Instant::now());
+}
+
+fn resolve_drawing_tools_at(rt: &Rt, app: &mut App, now: Instant) {
+    if app.waiting_for_drawer(now) { return; }
     let Some(update) = app.drawing_tools.take_auto_update() else { return };
     let Some(has_ink) = app.drawing_tools_auto_state() else { return };
     if let Some(expanded) = update.expanded_for(has_ink) {
@@ -2605,8 +2921,12 @@ fn tick_launch(rt: &Rt, app: &mut App, bridge: Option<&WpsBridge>, connected: bo
         else { launch::LinkState::Unavailable };
     // poll_wps has completed a real service setup attempt before this call.
     let report_changed = app.launch.report_link(link, now);
-    app.launch.advance_at(now);
-    if report_changed || old_alpha != app.launch.panel_alpha() { rt.redraw(app, ui::launch_rect(app)); }
+    let frame_changed = app.launch.advance_at(now);
+    let card = ui::launch_rect(app);
+    if old_alpha != app.launch.panel_alpha() { rt.redraw(app, card); }
+    else if (report_changed || frame_changed) && old_alpha > 0.0 {
+        rt.redraw(app, splash_paint::activity_bounds(card));
+    }
     if old_reveal != app.launch.reveal() {
         for right in [false, true] { rt.redraw(app, ui::sidebar_transition_rect(app, right)); }
     }
@@ -2676,7 +2996,7 @@ fn load_thumbnail(path: &str) -> Option<tiny_skia::Pixmap> {
 /// page picker uses thumbnails; the file is read, decoded and deleted.
 fn tick_thumbnails(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>) {
     let now = now_ms();
-    if let Some(w) = wps {
+    if let Some(w) = wps.filter(|_| app.thumb_waiting.is_some()) {
         let (ok, failed) = {
             let mut state = w.shared.lock().unwrap();
             let result = (state.thumb_ok, state.thumb_failed);
@@ -2696,7 +3016,7 @@ fn tick_thumbnails(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>) {
                 }
                 let _ = std::fs::remove_file(&path);
                 if failed > 0 || (ok > 0 && !loaded) { app.thumb_target_at = now + 3000; }
-                if app.page_picker.is_some() { rt.redraw(app, ui::page_picker_rect(app)); }
+                if app.page_preview_enabled() && app.page_picker.is_some() { rt.redraw(app, ui::page_picker_rect(app)); }
             }
         }
     }
@@ -2708,12 +3028,12 @@ fn tick_thumbnails(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>) {
             app.thumb_target_at = now + 3000;
         }
     }
+    if !app.page_preview_enabled() || app.thumb_waiting.is_some() { return; }
     let Some(picker) = app.page_picker.as_ref() else { return };
     let page_picker::Source::Wps(epoch) = picker.source else { return };
     let page = picker.selected();
     let key = (epoch, page);
     if app.thumbs.contains_key(&key) { return; }
-    if app.thumb_waiting.as_ref().is_some_and(|(e, p, _)| *e == epoch && *p == page) { return; }
     if picker.dragging() { return; }
     if app.thumb_target != Some(key) {
         app.thumb_target = Some(key);
@@ -2730,7 +3050,30 @@ fn tick_thumbnails(rt: &Rt, app: &mut App, wps: Option<&WpsBridge>) {
     }
 }
 
-pub fn tick_shared(rt: &Rt, app: &mut App, _ip: &mut Ip,
+fn redraw_toolbar_opacity(rt: &Rt, app: &App) {
+    for right in [false, true] {
+        rt.redraw_overlay(app, ui::sidebar_input_rect(app, right).with_paint_margin());
+    }
+}
+
+fn wake_toolbar(rt: &Rt, app: &mut App) {
+    if app.presentation_fade.reset() { redraw_toolbar_opacity(rt, app); }
+}
+
+fn wake_toolbar_at(rt: &Rt, app: &mut App, x: i32, y: i32) {
+    if app.fade_toolbar_during_show && [false, true].into_iter()
+        .any(|right| ui::sidebar_input_rect(app, right).contains(x, y)) {
+        wake_toolbar(rt, app);
+    }
+}
+
+fn tick_toolbar_fade(rt: &Rt, app: &mut App, ip: &Ip, showing: bool, now: Instant) {
+    let eligible = showing && app.toolbar_can_fade()
+        && !ip.dragging && ip.pending_ui.is_none() && ip.ui_touch.is_none();
+    if app.presentation_fade.advance_at(eligible, now) { redraw_toolbar_opacity(rt, app); }
+}
+
+pub fn tick_shared(rt: &Rt, app: &mut App, ip: &mut Ip,
     wps_bridge: Option<&WpsBridge>, update: &WpsUpdate, t: &mut Timers, system_dark: bool) {
     // WPS presentation is reported by the add-in on Wayland (where there is
     // no X11 fullscreen state) and by fullscreen detection on X11/Windows.
@@ -2770,7 +3113,7 @@ pub fn tick_shared(rt: &Rt, app: &mut App, _ip: &mut Ip,
     if app.settings_ui.closing_at>0 && now-app.settings_ui.closing_at>=120 {
         #[cfg(unix)]
         {
-            settings_window::close(rt, app, _ip);
+            settings_window::close(rt, app, ip);
             app.settings_ui.closing_at=0;
             app.settings_open=false;
             apply_input_shape(rt,app);
@@ -2790,7 +3133,7 @@ pub fn tick_shared(rt: &Rt, app: &mut App, _ip: &mut Ip,
         app.settings_ui.overlay_closing_at=0;
         app.settings_ui.dialog=None;
         app.settings_ui.picker=None;
-        _ip.picker_drag=None;
+        ip.picker_drag=None;
         apply_input_shape(rt,app);
         rt.redraw_preferences(app, false);
     }
@@ -2803,12 +3146,22 @@ pub fn tick_shared(rt: &Rt, app: &mut App, _ip: &mut Ip,
         app.settings_ui.toggle=None;
         rt.redraw_preferences(app, false);
     }
+    #[cfg(unix)]
+    if let Some(requested) = app.settings_ui.scroll_access.poll() {
+        if requested && app.settings_ui.scroll_access.enabled != Some(true) {
+            app.settings_ui.notify("未能启用系统辅助功能接口");
+        }
+        if app.settings_open { rt.redraw_preferences(app, false); }
+        if let Some(right) = app.scroll_rail.held.filter(|_| app.scroll_rail.unavailable) {
+            rt.redraw(app, ui::scroll_notice_rect(app, right).with_paint_margin());
+        }
+    }
     if app.settings_ui.toast_until>0 && now>=app.settings_ui.toast_until {
         app.settings_ui.toast_until=0;
         if app.settings_open {rt.redraw(app,ui::settings_rect(app));}
     }
     tick_launch(rt, app, wps_bridge, update.connected);
-    if app.sidebar_expand_due() && !app.avoid_active { expand_sidebars(rt, app); }
+    tick_sidebar_countdown(rt, app, Instant::now());
     // Limit X11 round trips in the periodic repaint path. User actions also
     // check focus directly so they cannot use stale navigation availability.
     let was_visible = t.foreground != Some(false);
@@ -2826,6 +3179,8 @@ pub fn tick_shared(rt: &Rt, app: &mut App, _ip: &mut Ip,
         }
     }
     let wps_visible = t.foreground != Some(false);
+    app.scroll_rail.ppt_foreground = wps_visible;
+    if update.connected || !wps_visible { t.unlinked_wps_fullscreen = false; }
     let jump_epoch = if app.wps_debug && wps_visible { wps_bridge.and_then(WpsBridge::jump_epoch) } else { None };
     let jump_changed = app.wps_can_jump != jump_epoch.is_some() || app.wps_deck_epoch != jump_epoch.unwrap_or(-1);
     app.wps_can_jump = jump_epoch.is_some();
@@ -2876,6 +3231,7 @@ pub fn tick_shared(rt: &Rt, app: &mut App, _ip: &mut Ip,
             }
             match ev {
                 WpsEvent::SlideshowBegin(pos) => {
+                    app.presentation_fade.reset();
                     app.clear_slide_pages();
                     app.wps_real_pos = pos;
                     if app.whiteboard {
@@ -2886,9 +3242,8 @@ pub fn tick_shared(rt: &Rt, app: &mut App, _ip: &mut Ip,
                     rt.redraw_full(app);
                 }
                 WpsEvent::SlideshowEnd => {
-                    app.clear_slide_pages();
-                    app.wps_real_pos = -1;
-                    rt.redraw_full(app);
+                    t.unlinked_wps_fullscreen = false;
+                    finish_presentation(rt, app);
                 }
                 WpsEvent::RealPos(pos) => {
                     if app.whiteboard {
@@ -2930,18 +3285,23 @@ pub fn tick_shared(rt: &Rt, app: &mut App, _ip: &mut Ip,
         }
     }
 
-    tick_thumbnails(rt, app, wps_bridge);
-
     // 全屏检测（1s；始终扫描，避免加载项连着但已退出放映时状态变陈旧）
     if t.last_wps.elapsed() >= Duration::from_millis(1000) {
         t.last_wps = Instant::now();
         let fs = rt.is_fullscreen();
+        // Alt+Tab can change fullscreen before the periodic focus cache refreshes.
+        let unlinked_wps_focused = !update.connected && (fs || t.unlinked_wps_fullscreen)
+            && rt.wps_foreground() == Some(true);
+        let unlinked_show_ended = !fs && t.unlinked_wps_fullscreen && unlinked_wps_focused;
+        t.unlinked_wps_fullscreen = fs && unlinked_wps_focused;
         if fs != app.wps_fullscreen {
             app.wps_fullscreen = fs;
-            if !app.whiteboard && !app.wps_debug {
-                app.clear_slide_pages();
+            if unlinked_show_ended {
+                finish_presentation(rt, app);
+            } else {
+                if !app.whiteboard && !app.wps_debug { app.clear_slide_pages(); }
+                rt.redraw_full(app);
             }
-            rt.redraw_full(app);
         }
         if app.mode == 0 && !app.settings_open {
             apply_input_shape(rt, app);
@@ -2979,23 +3339,38 @@ pub fn tick_shared(rt: &Rt, app: &mut App, _ip: &mut Ip,
         app.wps_navigation_ready = navigation_ready;
         rt.redraw_full(app);
     }
+    let preview_changed = !app.whiteboard && (app.presentation_action == ui::PresentationAction::End)
+        != (action == ui::PresentationAction::End);
+    let old_picker = (preview_changed && app.page_picker.is_some()).then(|| ui::page_picker_rect(app));
     app.presentation_action = action;
+    if let Some(old) = old_picker {
+        rt.redraw(app, old.with_paint_margin());
+        rt.redraw(app, ui::page_picker_rect(app).with_paint_margin());
+        apply_input_shape(rt, app);
+    }
+    tick_thumbnails(rt, app, wps_bridge);
     let presentation_frame = Instant::now();
+    tick_document_scroll(rt, app, ip, presentation_frame);
+    if app.screenshot_feedback.advance_at(presentation_frame) && !app.collapsed {
+        for right in [false, true] { rt.redraw_control(app, ui::Control::Sidebar(Btn::Screenshot, right)); }
+    }
+    tick_toolbar_fade(rt, app, ip, linked_show || t.unlinked_wps_fullscreen, presentation_frame);
+    if app.tool_selector.advance_at(presentation_frame) && !ui::sidebar_animating(app) {
+        redraw_tool_tracks(rt, app);
+    }
     app.presentation_transition.set_action_at(action, presentation_frame);
     if app.presentation_transition.advance_at(presentation_frame)
         && !app.whiteboard && !ui::sidebar_animating(app) {
         // This visual transition does not change geometry, input regions or
         // click availability. Moving sidebars already repaint their full strip.
         for right in [false, true] {
-            if let Some(r) = ui::control_rect(app, ui::Control::Sidebar(Btn::Exit, right)) {
-                rt.redraw(app, r);
-            }
+            rt.redraw_control(app, ui::Control::Sidebar(Btn::Exit, right));
         }
     }
 
     if app.press.is_some_and(|p| p.expired()) {
         let old = app.press.take().unwrap();
-        if let Some(r) = ui::control_rect(app, old.control) { rt.redraw(app, r); }
+        rt.redraw_press(app, old.control);
     }
 
     // 白板上限提示到点重绘
@@ -3018,13 +3393,16 @@ pub fn tick_shared(rt: &Rt, app: &mut App, _ip: &mut Ip,
     }
 
     // 弹窗/菜单淡入动画期间持续重绘（只重绘对应弹窗区域）
-    if app.open_anim != 0 && now_ms() < app.open_anim + 180 {
+    if app.open_anim != 0 {
+        // Present the opaque frame even if the event loop missed the fade
+        // deadline, then let the idle loop sleep while the palette stays open.
+        if now_ms() - app.open_anim >= ui::POPUP_FADE_MS { app.open_anim = 0; }
         if app.page_picker.is_some() { rt.redraw(app, ui::page_picker_rect(app)); }
         if app.pen_popup_visible {
-            rt.redraw(app, ui::pen_popup_rect(app));
+            rt.redraw(app, ui::pen_popup_rect(app).with_paint_margin());
         }
         if app.eraser_popup_visible {
-            rt.redraw(app, ui::eraser_popup_rect(app));
+            rt.redraw(app, ui::eraser_popup_rect(app).with_paint_margin());
         }
     }
 }

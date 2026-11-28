@@ -2,8 +2,8 @@
     <ribbon startFromScratch="false">
         <tabs>
             <tab id="saBridgeTab" label="批注联动">
-				<group id="saBridgeGroup" label="桥">
-                    <button id="btnSaPing" label="状态" onAction="OnSaPing" size="large"/>
+				<group id="saBridgeGroup" label="Sidera">
+                    <button id="btnSaPing" label="连接状态" onAction="OnSaPing" size="large"/>
 				</group>
             </tab>
         </tabs>

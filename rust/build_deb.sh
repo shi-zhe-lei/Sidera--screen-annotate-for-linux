@@ -232,11 +232,8 @@ Maintainer: User <user@localhost>
 Depends: ${DEPENDS}
 Recommends: fonts-noto-cjk
 Suggests: gnome-shell (>= 46), libglib2.0-bin, xdg-desktop-portal
-Description: Sidera (Rust) 屏幕批注工具
- 纯 Rust 实现，不依赖 Qt / libX11；加载项安装工具使用 Python 3。
- 全屏透明画布批注，支持画笔/橡皮/白板，触控屏友好。
- 内置 WPS 演示联动（本地 HTTP 127.0.0.1:16666）。
- 安装后执行一次 sidera-wps-addin-install 注册加载项。
+Description: Sidera 屏幕批注与白板
+ 支持触屏书写和擦除，可与 WPS 演示同步页码。
 EOF
 
 # ---------- desktop 入口 ----------
@@ -244,7 +241,7 @@ cat > "$PKG_DIR/usr/share/applications/sidera.desktop" << EOF
 [Desktop Entry]
 Type=Application
 Name=Sidera
-Comment=Sidera软件
+Comment=屏幕批注与白板
 Exec=sidera
 Icon=$ICON_PATH
 Categories=Graphics;Utility;

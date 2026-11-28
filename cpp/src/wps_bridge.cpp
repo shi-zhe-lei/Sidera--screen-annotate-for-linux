@@ -79,6 +79,7 @@ void WpsBridge::stop() {
   }
   const bool wasConnected = connected_;
   connected_ = false; lastSeen_ = 0; realPos_ = -1; queue_.clear();
+  missingPosition_.invalidate();
   deck_ = -1;
   sequences_.clear();
   if (wasConnected && onConnectionChanged) onConnectionChanged(false);
@@ -156,6 +157,12 @@ void WpsBridge::handleLine(const QString& raw) {
   if (!valid) return;
   const auto deckMatch = QRegularExpression("(?:^| )deck=([0-9]+)(?: |$)").match(line);
   const int deck = deckMatch.hasMatch() ? deckMatch.captured(1).toInt() : -1;
+  if (name == "SlideShowState" && position < 1 && realPos_ > 0) {
+    // WPS can briefly lose the current slide during a transition.
+    if (!missingPosition_.isValid()) missingPosition_.start();
+    if (missingPosition_.elapsed() < 1200) return;
+  }
+  if (position > 0 || name == "SlideShowEnd") missingPosition_.invalidate();
   const bool changedDeck = name == "SlideShowState" && position > 0 && realPos_ > 0 && deck > 0 && deck_ > 0 && deck != deck_;
   if (name == "SlideShowState") deck_ = deck;
   if (name == "SlideShowEnd" || (name == "SlideShowState" && position < 1)) {

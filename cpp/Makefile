@@ -44,12 +44,16 @@ ifeq ($(HAVE_WL),1)
 endif
 
 C_OBJS   = $(WL_C:.c=.o)
-CPP_OBJS = $(CPP_SRC:.cpp=.o)
+CPP_OBJS = $(CPP_SRC:.cpp=.o) build/startup_art.o
 
 # 输出文件名（在 aarch64 容器里用 make OUT=annotate_aarch64）
 OUT ?= annotate_amd64
 
 all: $(OUT)
+
+build/startup_art.cpp: src/startup.qrc ../assets/source/startup-ink.png
+	@mkdir -p build
+	rcc -no-compress -name sidera_startup -o $@ $<
 
 build/wlr-layer-shell-unstable-v1-client-protocol.h: ../protocols/wlr-layer-shell-unstable-v1.xml
 	@mkdir -p build

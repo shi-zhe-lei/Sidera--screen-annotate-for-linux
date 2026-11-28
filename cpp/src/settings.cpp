@@ -19,7 +19,7 @@ static void setAutoStart(bool on) {
       ts << "[Desktop Entry]\n"
          << "Type=Application\n"
          << "Name=Sidera\n"
-         << "Comment=Sidera软件\n"
+         << "Comment=屏幕批注与白板\n"
          << "Exec=sidera\n"
          << "Icon=sidera\n"
          << "Terminal=false\n";
@@ -61,7 +61,7 @@ void openSettings() {
   // 关闭即销毁：标题栏 X 也会触发 destroyed，从而执行恢复画布的回调
   win->setAttribute(Qt::WA_DeleteOnClose, true);
   win->setWindowFlags(Qt::Window | Qt::WindowStaysOnTopHint);
-  win->setWindowTitle(QString::fromUtf8("Sidera - 设置"));
+  win->setWindowTitle(QString::fromUtf8("Sidera 设置"));
   win->setFixedWidth(300);
   win->setStyleSheet(
     "QWidget{background:#2b2b33;color:#eee;font-size:14px;}"
@@ -86,7 +86,7 @@ void openSettings() {
   }
 
   // 透明度
-  lay->addWidget(new QLabel(QString::fromUtf8("侧边栏透明度")));
+  lay->addWidget(new QLabel(QString::fromUtf8("工具栏不透明度")));
   QSlider* alphaSlider = new QSlider(Qt::Horizontal);
   alphaSlider->setRange(30, 255);
   alphaSlider->setValue(g.sidebarAlpha);
@@ -102,7 +102,7 @@ void openSettings() {
   lay->addLayout(makeSliderRow(alphaSlider, alphaVal));
 
   // 大小
-  lay->addWidget(new QLabel(QString::fromUtf8("侧边栏大小")));
+  lay->addWidget(new QLabel(QString::fromUtf8("工具栏大小")));
   QSlider* sizeSlider = new QSlider(Qt::Horizontal);
   sizeSlider->setRange(60, 140);
   sizeSlider->setValue(int(g.sbScale * 100));
@@ -121,7 +121,7 @@ void openSettings() {
   QPushButton* autoBtn = new QPushButton();
   auto updateAutoBtn = [autoBtn]() {
     bool on = isAutoStart();
-    autoBtn->setText(on ? QString::fromUtf8("开机自启动: 开") : QString::fromUtf8("开机自启动: 关"));
+    autoBtn->setText(on ? QString::fromUtf8("登录时自动启动：开") : QString::fromUtf8("登录时自动启动：关"));
     autoBtn->setStyleSheet(on ? "QPushButton{background:#2a6e3f;color:#fff;border:1px solid #3a8f55;border-radius:6px;padding:8px;}"
                               : "QPushButton{background:#444;color:#fff;border:1px solid #666;border-radius:6px;padding:8px;}");
   };
@@ -135,7 +135,7 @@ void openSettings() {
   lay->addSpacing(6);
 
   // 系统诊断按钮（用于定位旧驱动下的侧边栏/XShape 问题）
-  QPushButton* infoBtn = new QPushButton(QString::fromUtf8("系统诊断信息"));
+  QPushButton* infoBtn = new QPushButton(QString::fromUtf8("系统诊断"));
   infoBtn->setStyleSheet("QPushButton{background:#444;color:#ccc;padding:8px;border-radius:6px;}"
                          "QPushButton:hover{background:#555;}");
   QObject::connect(infoBtn, &QPushButton::clicked, []() { showSystemInfo(); });
@@ -150,12 +150,11 @@ void openSettings() {
   wpsHint->setStyleSheet("color:#667;font-size:11px;");
   auto updateWpsBtn = [wpsBtn, wpsHint]() {
     bool on = g.wpsDebug;
-    wpsBtn->setText(on ? QString::fromUtf8("WPS 接口调试: 开") : QString::fromUtf8("WPS 接口调试: 关"));
+    wpsBtn->setText(on ? QString::fromUtf8("同步 WPS 页码：开") : QString::fromUtf8("同步 WPS 页码：关"));
     wpsBtn->setStyleSheet(on ? "QPushButton{background:#6a3f2a;color:#fff;border:1px solid #aa7a4a;border-radius:6px;padding:8px;}"
                              : "QPushButton{background:#444;color:#fff;border:1px solid #666;border-radius:6px;padding:8px;}");
-    wpsHint->setText(on ? QString::fromUtf8("开启中：按钮仍发虚拟键推进放映，但缓存改为按 WPS 加载项回传的"
-                        "真实页号驱动——动画步不动缓存，只有真换页才存/载批注。日志: %1").arg(wpsLogFile())
-                        : QString::fromUtf8("关闭=点击一次存一页（原逻辑，兼容无加载项环境）。默认开启，状态会保存。"));
+    wpsHint->setText(on ? QString::fromUtf8("按幻灯片页码保存批注，页内动画共用同一页。")
+                        : QString::fromUtf8("每次翻页操作都切换批注页。"));
   };
   updateWpsBtn();
   QObject::connect(wpsBtn, &QPushButton::clicked, [wpsBtn, updateWpsBtn]() {
@@ -169,7 +168,7 @@ void openSettings() {
   QPushButton* rcBtn = new QPushButton();
   auto updateRcBtn = [rcBtn]() {
     bool on = g.rightClickCursorOn;
-    rcBtn->setText(on ? QString::fromUtf8("右键归位光标(试验): 开") : QString::fromUtf8("右键归位光标(试验): 关"));
+    rcBtn->setText(on ? QString::fromUtf8("右键切回光标（试验）：开") : QString::fromUtf8("右键切回光标（试验）：关"));
     rcBtn->setStyleSheet(on ? "QPushButton{background:#2a5a6a;color:#fff;border:1px solid #4dd0e1;border-radius:6px;padding:8px;}"
                             : "QPushButton{background:#444;color:#fff;border:1px solid #666;border-radius:6px;padding:8px;}");
   };
@@ -180,7 +179,7 @@ void openSettings() {
     updateRcBtn();
   });
   lay->addWidget(rcBtn);
-  QLabel* rcHint = new QLabel(QString::fromUtf8("画笔/橡皮模式下：鼠标右键 → 在指针处向 PPT 发虚拟右键并回光标模式（触摸长按不处理，交给系统）。"));
+  QLabel* rcHint = new QLabel(QString::fromUtf8("批注时右击也会打开演示窗口的右键菜单。"));
   rcHint->setWordWrap(true);
   rcHint->setStyleSheet("color:#667;font-size:11px;");
   lay->addWidget(rcHint);
@@ -229,7 +228,7 @@ void openSettings() {
     updateTrigBtn();
   });
   lay->addWidget(trigBtn);
-  QLabel* trigHint = new QLabel(QString::fromUtf8("二选一：手背=大触点当橡皮（默认）；多指=两指及以上当橡皮，多余触点忽略。"));
+  QLabel* trigHint = new QLabel(QString::fromUtf8("手背模式按触点大小识别，多指模式用两指或更多手指擦除。"));
   trigHint->setWordWrap(true);
   trigHint->setStyleSheet("color:#667;font-size:11px;");
   lay->addWidget(trigHint);
@@ -265,12 +264,12 @@ void openSettings() {
   lay->addWidget(doneBtn);
 
   // 退出软件（独立按键 + 确认弹窗；窗口右上角 X 只关闭设置、不会退出）
-  QPushButton* quitBtn = new QPushButton(QString::fromUtf8("退出软件"));
+  QPushButton* quitBtn = new QPushButton(QString::fromUtf8("退出 Sidera"));
   quitBtn->setStyleSheet("QPushButton{background:#8a2f2f;color:#fff;padding:10px;border-radius:6px;}"
                          "QPushButton:hover{background:#a83a3a;}");
   QObject::connect(quitBtn, &QPushButton::clicked, [win]() {
-    QMessageBox box(QMessageBox::Question, QString::fromUtf8("退出"),
-                    QString::fromUtf8("确定要退出 Sidera 吗？"),
+    QMessageBox box(QMessageBox::Question, QString::fromUtf8("退出 Sidera？"),
+                    QString::fromUtf8("退出会清除当前批注。需要保留的内容请先截图。"),
                     QMessageBox::Yes | QMessageBox::No, win);
     box.setDefaultButton(QMessageBox::No);
     if (box.exec() == QMessageBox::Yes) QApplication::quit();
@@ -300,7 +299,6 @@ void closeSettings() {
 // ============================================================
 static QString collectSystemInfo() {
   QString s;
-  s += "=== 系统环境诊断 ===\n";
   QFile osf("/etc/os-release");
   if (osf.open(QIODevice::ReadOnly)) {
     while (!osf.atEnd()) {
@@ -354,7 +352,7 @@ static QString collectSystemInfo() {
 
 void showSystemInfo() {
   QDialog* dlg = new QDialog(g.settingsWin);
-  dlg->setWindowTitle(QString::fromUtf8("系统诊断信息"));
+  dlg->setWindowTitle(QString::fromUtf8("系统诊断"));
   dlg->resize(500, 360);
   QVBoxLayout* lay = new QVBoxLayout(dlg);
   QTextEdit* te = new QTextEdit(dlg);

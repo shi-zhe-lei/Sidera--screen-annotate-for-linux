@@ -306,7 +306,11 @@ bool WlBackend::init() {
   wps_->onSlideshowBegin = [this](int pos) { wpsOnBegin(pos); };
   wps_->onSlideshowEnd = [this]() {
     pageCache_.clear(); savedNormalPage_ = 1;
-    if (!whiteboard_) { currentPage_ = 1; loadPage(1); renderAndCommit(); }
+    if (whiteboard_) { cursorAfterWhiteboard_ = true; return; }
+    currentPage_ = 1;
+    loadPage(1);
+    if (mode_ != 0) setMode(0);
+    else renderAndCommit();
   };
   wps_->start();
 
@@ -940,6 +944,7 @@ bool WlBackend::inMenu(const QPoint& p) const { return menu_ != 0 && menuRect_.c
 // 动作
 // ============================================================
 void WlBackend::setMode(int m) {
+  if (m != mode_) cancelInput();
   mode_ = m;
   closePopup();
   if (mode_ == 0) setInputRegionSidebar();
@@ -1098,7 +1103,12 @@ void WlBackend::toggleWhiteboard() {
     loadPage(currentPage_);
   }
   if (wps_) wps_->setWhiteboard(whiteboard_);
-  renderAndCommit();
+  if (!whiteboard_ && cursorAfterWhiteboard_) {
+    cursorAfterWhiteboard_ = false;
+    setMode(0);
+  } else {
+    renderAndCommit();
+  }
 }
 
 int WlBackend::timedWidth() {

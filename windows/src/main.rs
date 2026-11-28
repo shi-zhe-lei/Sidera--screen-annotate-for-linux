@@ -389,6 +389,7 @@ fn run() -> Result<(), String> {
             || app.press.is_some()
             || app.launch.active()
             || sidera_core::ui::sidebar_animating(&app)
+            || app.tool_selector.animating()
             || app.settings_ui.animating()
             || app.settings_ui.native_dirty.get()
             || app.open_anim != 0

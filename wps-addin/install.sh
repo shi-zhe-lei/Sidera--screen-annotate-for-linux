@@ -131,6 +131,7 @@ def install(source, destination, repair):
     print(f"已更新本项目登记：{destination}")
     if backup:
         print(f"原文件备份：{backup}")
+    print("重新打开 WPS 演示后生效。")
 
 
 try:
@@ -147,8 +148,6 @@ try:
 except (OSError, ValueError, ExpatError) as error:
     print(f"错误：WPS 加载项登记失败，原文件未替换：{error}", file=sys.stderr)
     sys.exit(1)
-print("提示：请先启动“Sidera”并开启 设置→WPS联动，再重新打开 WPS 演示。")
-print("      放映时加载项会把真实页号回传，批注缓存随真实换页切换。")
 PY
 
 # 同一加载项目录里还残留 2.6/更早版本的登记与授权时一并清理。

@@ -298,7 +298,9 @@ pub fn register_addin() -> Result<String, String> {
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
-        Err(format!("加载项登记失败：{}", String::from_utf8_lossy(&output.stderr).trim()))
+        let detail = String::from_utf8_lossy(&output.stderr);
+        Err(if detail.trim().is_empty() { format!("加载项登记失败（{}）", output.status) }
+            else { detail.trim().to_owned() })
     }
 }
 
@@ -324,7 +326,9 @@ pub fn remove_addin_registration() -> Result<String, String> {
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
-        Err(format!("加载项清除失败：{}", String::from_utf8_lossy(&output.stderr).trim()))
+        let detail = String::from_utf8_lossy(&output.stderr);
+        Err(if detail.trim().is_empty() { format!("清除加载项登记失败（{}）", output.status) }
+            else { detail.trim().to_owned() })
     }
 }
 
@@ -889,8 +893,9 @@ fn handle_line(shared: &Arc<Mutex<WpsShared>>, raw: &str) {
         s.queue.retain(|(_, cmd)| (can_start && cmd == "START") || (can_jump && cmd.starts_with("GOTO ")));
         return;
     }
-    if pos > 0 && (pos != s.real_pos || changed_deck) {
-        s.negative_since = 0;
+    if pos < 1 { return; }
+    s.negative_since = 0;
+    if pos != s.real_pos || changed_deck {
         s.can_start = false;
         s.start_pending_until = 0;
         s.queue.retain(|(_, cmd)| cmd != "START");
@@ -1837,6 +1842,11 @@ mod tests {
         handle_line(&shared, "EVENT SlideShowState pos=5 click=0 page=5 total=30");
         handle_line(&shared, "EVENT SlideShowState pos=-1 click=-1 page=1 total=30");
         assert_eq!(shared.lock().unwrap().page_index, 5);
+        // Returning to the same slide also interrupts a run of negative samples.
+        shared.lock().unwrap().negative_since -= 1500;
+        handle_line(&shared, "EVENT SlideShowState pos=5 click=0 page=5 total=30");
+        handle_line(&shared, "EVENT SlideShowState pos=-1 click=-1 page=1 total=30");
+        assert_eq!(shared.lock().unwrap().real_pos, 5);
         handle_line(&shared, "EVENT SlideShowEnd pos=-1 click=-1 page=1 total=30");
         handle_line(&shared, "EVENT SlideShowState pos=-1 click=-1 page=1 total=30");
         assert_eq!(shared.lock().unwrap().page_index, 1);

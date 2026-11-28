@@ -3,6 +3,7 @@
 #include "app.h"
 #include "widget.h"
 #include <QLockFile>
+#include <QPointer>
 #ifdef SIDERA_HAVE_WAYLAND
 #include "backend_wayland.h"
 #endif
@@ -140,8 +141,12 @@ int main(int argc, char* argv[]) {
   }
 #endif
 
-  // 启动闪屏：延后 2 秒主界面初始化，期间显示进度动画
-  showSplashFor(app);
+  QPointer<StartupSplash> splash;
+  if (!qEnvironmentVariableIsSet("SIDERA_NO_SPLASH")) {
+    splash = new StartupSplash;
+    splash->show();
+    app.processEvents(QEventLoop::ExcludeUserInputEvents);
+  }
 
   // 载入持久化设置（透明度/大小/wpsDebug），须在构建侧边栏前
   wpsLoadSettings();
@@ -200,5 +205,6 @@ int main(int argc, char* argv[]) {
     else                setWpsDebug(g.wpsDebug, false);
   }
 
+  if (splash) splash->reportReady();
   return app.exec();
 }

@@ -31,6 +31,9 @@ type Props = HashMap<String, OwnedValue>;
 type Child = (i32, Props, Vec<OwnedValue>);
 type Layout = (i32, Props, Vec<Child>);
 type ToolTip = (String, Vec<(i32, i32, Vec<u8>)>, String, String);
+const MENU: [(i32, &str); 5] = [
+    (1, "设置"), (2, "切换画笔和光标"), (3, "白板"), (4, "显示工具栏"), (5, "退出"),
+];
 
 fn owned(value: Value<'_>) -> OwnedValue {
     OwnedValue::try_from(value).expect("owned tray value")
@@ -49,13 +52,7 @@ fn layout() -> (u32, Layout) {
     let root = (
         0,
         HashMap::new(),
-        vec![
-            (1, item_props("打开设置"), Vec::new()),
-            (2, item_props("切换批注/光标"), Vec::new()),
-            (3, item_props("白板"), Vec::new()),
-            (4, item_props("显示 Sidera"), Vec::new()),
-            (5, item_props("退出"), Vec::new()),
-        ],
+        MENU.into_iter().map(|(id, label)| (id, item_props(label), Vec::new())).collect(),
     );
     (1, root)
 }
@@ -177,14 +174,7 @@ impl Menu {
         ids: Vec<i32>,
         _property_names: Vec<String>,
     ) -> Vec<(i32, HashMap<String, OwnedValue>)> {
-        let labels = [
-            (1, "打开设置"),
-            (2, "切换批注/光标"),
-            (3, "白板"),
-            (4, "显示 Sidera"),
-            (5, "退出"),
-        ];
-        labels
+        MENU
             .into_iter()
             .filter(|(id, _)| ids.is_empty() || ids.contains(id))
             .map(|(id, label)| (id, item_props(label)))
@@ -193,14 +183,7 @@ impl Menu {
 
     #[zbus(name = "GetProperty")]
     fn get_property(&self, id: i32, name: String) -> OwnedValue {
-        let label = match id {
-            1 => "打开设置",
-            2 => "切换批注/光标",
-            3 => "白板",
-            4 => "显示 Sidera",
-            5 => "退出",
-            _ => "",
-        };
+        let label = MENU.into_iter().find(|(item, _)| *item == id).map_or("", |(_, label)| label);
         item_props(label)
             .remove(&name)
             .unwrap_or_else(|| owned(Value::from(false)))

@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="/sidera">
+    <file alias="startup-ink.png">../../assets/source/startup-ink.png</file>
+  </qresource>
+</RCC>

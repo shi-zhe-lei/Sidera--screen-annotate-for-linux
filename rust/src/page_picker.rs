@@ -16,6 +16,8 @@ pub struct PagePicker {
     pub source: Source,
     pub total: i32,
     pub position: f64,
+    /// Unsaved ink from the live board, reduced once while browsing this picker.
+    pub(crate) live_ink: std::cell::OnceCell<Option<tiny_skia::Pixmap>>,
     drag: Option<Drag>,
     snap: Option<Snap>,
     scroll_goal: f64,
@@ -26,7 +28,7 @@ impl PagePicker {
     pub fn new(page: i32, total: i32, source: Source) -> Self {
         let total = total.max(1);
         let position = page.clamp(1, total) as f64;
-        Self { source, total, position, drag: None, snap: None,
+        Self { source, total, position, live_ink: Default::default(), drag: None, snap: None,
             scroll_goal: position, last_scroll: None }
     }
     pub fn dragging(&self) -> bool { self.drag.is_some() }

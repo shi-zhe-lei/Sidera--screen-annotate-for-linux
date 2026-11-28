@@ -117,6 +117,7 @@ public:
   int   currentPage_ = 1;
   int   savedNormalPage_ = 1;
   bool  whiteboard_  = false;
+  bool  cursorAfterWhiteboard_ = false;
   int   wbBgIndex_   = 1;       // 0=墨绿 1=白
 
   // 截图（zwlr_screencopy 异步）
